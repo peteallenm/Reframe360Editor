@@ -1,0 +1,64 @@
+cmake_minimum_required(VERSION 3.19)
+project(render360 VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 ShaderTools OpenGL)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
+
+qt_add_executable(render360
+    src/main.cpp
+    src/app.cpp
+    src/videodecoder.cpp
+    src/imuparser.cpp
+    src/gyroscopeintegrator.cpp
+    src/lensviewer.cpp
+    src/viewermaterial.cpp
+    src/calibration.cpp
+    src/exporter.cpp
+)
+
+qt_add_qml_module(render360
+    URI Render360
+    VERSION 1.0
+    QML_FILES
+        qml/main.qml
+        qml/ViewerPane.qml
+        qml/ControlPanel.qml
+        qml/Timeline.qml
+        qml/CalibrationDialog.qml
+    RESOURCES
+        resources/presets/yi360_default.json
+)
+
+qt_add_shaders(render360 "shaders"
+    PREFIX "/"
+    BATCHABLE
+    FILES
+        shaders/quad.vert
+        shaders/project.frag
+    GLSL "100 es,120,330,440,450,460"
+)
+
+target_include_directories(render360 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${FFMPEG_INCLUDE_DIRS}
+)
+
+target_link_libraries(render360 PRIVATE
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::OpenGL
+    ${FFMPEG_LIBRARIES}
+    OpenGL::GL
+)
+
+target_compile_definitions(render360 PRIVATE
+    QT_DEPRECATED_WARNINGS
+    QT_DISABLE_DEPRECATED_BEFORE=0x060000
+)

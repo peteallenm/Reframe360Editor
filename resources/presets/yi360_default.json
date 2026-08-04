@@ -1,0 +1,22 @@
+{
+    "name": "YI 360 Default",
+    "front": {
+        "centerX": 0.5,
+        "centerY": 0.5,
+        "radius": 0.5,
+        "k1": 0.0,
+        "k2": 0.0,
+        "rotation": 0.0,
+        "hflip": false
+    },
+    "rear": {
+        "centerX": 0.5,
+        "centerY": 0.5,
+        "radius": 0.5,
+        "k1": 0.0,
+        "k2": 0.0,
+        "rotation": 180.0,
+        "hflip": false
+    },
+    "blendStart": 0.9
+}
