@@ -11,7 +11,8 @@ struct ViewerUniforms {
     float roll;           // offset 76
     float fov;            // offset 80
     int activeLens;       // offset 84
-    float videoSize[2];   // offset 88
+    float viewAspect;     // offset 88
+    float _padA;          // offset 92
     int fullRange;        // offset 96
     int projection;       // offset 100
     float frontCenter[2]; // offset 104
@@ -32,7 +33,7 @@ static_assert(sizeof(ViewerUniforms) == 224, "ViewerUniforms must match std140 l
 
 ViewerMaterial::ViewerMaterial()
     : m_yTex(nullptr), m_uTex(nullptr), m_vTex(nullptr)
-    , m_videoWidth(0), m_videoHeight(0), m_fullRange(true)
+    , m_viewAspect(1.0f), m_fullRange(true)
     , m_yaw(0.0f), m_pitch(0.0f), m_roll(0.0f), m_fov(90.0f)
     , m_activeLens(2)
     , m_projection(0)
@@ -94,8 +95,7 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.fov = m_fov;
     u.activeLens = m_activeLens;
     u.projection = m_projection;
-    u.videoSize[0] = (float)m_videoWidth;
-    u.videoSize[1] = (float)m_videoHeight;
+    u.viewAspect = m_viewAspect;
     u.fullRange = m_fullRange ? 1 : 0;
     u.frontCenter[0] = m_frontCenterX;
     u.frontCenter[1] = m_frontCenterY;

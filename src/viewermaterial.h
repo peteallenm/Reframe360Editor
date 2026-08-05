@@ -24,7 +24,7 @@ public:
     void setActiveLens(int v) { m_activeLens = v; }
     void setProjection(int v) { m_projection = v; }
     void setImuMatrix(const QMatrix4x4 &m) { m_imuMatrix = m; }
-    void setVideoSize(int w, int h) { m_videoWidth = w; m_videoHeight = h; }
+    void setViewAspect(float aspect) { m_viewAspect = aspect; }
     void setFullRange(bool v) { m_fullRange = v; }
     void setCalibration(float fcx, float fcy, float fr, float fk1, float fk2, float frot,
                         float rcx, float rcy, float rr, float rk1, float rk2, float rrot,
@@ -44,8 +44,6 @@ public:
     float fov() const { return m_fov; }
     int activeLens() const { return m_activeLens; }
     QMatrix4x4 imuMatrix() const { return m_imuMatrix; }
-    int videoWidth() const { return m_videoWidth; }
-    int videoHeight() const { return m_videoHeight; }
     bool fullRange() const { return m_fullRange; }
     float frontCenterX() const { return m_frontCenterX; }
     float frontCenterY() const { return m_frontCenterY; }
@@ -63,7 +61,7 @@ public:
 
 private:
     QSGTexture *m_yTex, *m_uTex, *m_vTex;
-    int m_videoWidth, m_videoHeight;
+    float m_viewAspect;
     bool m_fullRange;
     float m_yaw, m_pitch, m_roll, m_fov;
     int m_activeLens;

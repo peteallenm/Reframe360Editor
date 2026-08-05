@@ -15,7 +15,8 @@ layout(std140, binding = 0) uniform Uniforms {
     float u_roll;
     float u_fov;
     int u_activeLens;
-    vec2 u_videoSize;
+    float u_viewAspect;
+    float u_padA;
     int u_fullRange;
     int u_projection;
     vec2 u_frontCenter;
@@ -79,7 +80,7 @@ void main() {
     } else {
         vec2 ndc = v_texCoord * 2.0 - 1.0;
         float fovScale = tan(radians(u_fov * 0.5));
-        float aspect = u_videoSize.x / max(u_videoSize.y, 1.0);
+        float aspect = u_viewAspect;
         ray = normalize(vec3(ndc.x * fovScale * aspect, -ndc.y * fovScale, -1.0));
     }
 

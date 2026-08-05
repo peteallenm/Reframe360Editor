@@ -137,7 +137,9 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             m_vTexture = window()->createTextureFromImage(vImg);
         }
 
-        material->setVideoSize(m_decoder->videoWidth(), m_decoder->videoHeight());
+        QRectF r = boundingRect();
+        float aspect = (r.height() > 1.0) ? (float)(r.width() / r.height()) : 1.0f;
+        material->setViewAspect(aspect);
         material->setFullRange(m_decoder->isFullRange());
         material->setTextures(m_yTexture, m_uTexture, m_vTexture);
     }
