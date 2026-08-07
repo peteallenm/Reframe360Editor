@@ -1,5 +1,10 @@
 #include "keyframe.h"
 
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+
 KeyframeModel::KeyframeModel(QObject *parent) : QAbstractListModel(parent) {}
 
 int KeyframeModel::rowCount(const QModelIndex &) const { return (int)m_keyframes.size(); }
@@ -35,6 +40,7 @@ void KeyframeModel::addKeyframe(double time, double yaw, double pitch, double ro
             m_keyframes[i].roll = roll;
             m_keyframes[i].fov = fov;
             emit dataChanged(index(i), index(i));
+            emit keyframesChanged();
             return;
         }
     }
@@ -43,6 +49,7 @@ void KeyframeModel::addKeyframe(double time, double yaw, double pitch, double ro
     beginInsertRows(QModelIndex(), pos, pos);
     m_keyframes.insert(pos, Keyframe{time, yaw, pitch, roll, fov});
     endInsertRows();
+    emit keyframesChanged();
 }
 
 void KeyframeModel::removeKeyframe(int i)
@@ -51,6 +58,7 @@ void KeyframeModel::removeKeyframe(int i)
     beginRemoveRows(QModelIndex(), i, i);
     m_keyframes.removeAt(i);
     endRemoveRows();
+    emit keyframesChanged();
 }
 
 void KeyframeModel::updateKeyframe(int i, double time, double yaw, double pitch, double roll, double fov)
@@ -62,6 +70,7 @@ void KeyframeModel::updateKeyframe(int i, double time, double yaw, double pitch,
     m_keyframes[i].roll = roll;
     m_keyframes[i].fov = fov;
     sortAndNotify();
+    emit keyframesChanged();
 }
 
 Keyframe KeyframeModel::keyframeAt(int i) const
@@ -100,18 +109,95 @@ void KeyframeModel::interpolate(double time, double &yaw, double &pitch, double 
         return;
     }
 
-    // Between two keyframes — linear interpolation
+    // Between two keyframes — linear interpolation. Yaw/roll are angles, so
+    // interpolate along the *shortest* path: a 350° -> 10° move must sweep the
+    // 20° across the 360/0 wrap, not spin 340° the long way around.
     for (int i = 0; i < (int)m_keyframes.size() - 1; i++) {
         if (time >= m_keyframes[i].time && time <= m_keyframes[i + 1].time) {
             double t1 = m_keyframes[i].time;
             double t2 = m_keyframes[i + 1].time;
             double alpha = (time - t1) / (t2 - t1);
 
-            yaw   = m_keyframes[i].yaw   + (m_keyframes[i + 1].yaw   - m_keyframes[i].yaw)   * alpha;
+            // Wrap the delta into [-180, 180] and keep the result in range.
+            auto lerpAngle = [](double a, double b, double t) {
+                double d = b - a;
+                if (d > 180.0) d -= 360.0;
+                else if (d < -180.0) d += 360.0;
+                double r = a + d * t;
+                if (r > 180.0) r -= 360.0;
+                else if (r < -180.0) r += 360.0;
+                return r;
+            };
+
+            yaw   = lerpAngle(m_keyframes[i].yaw,   m_keyframes[i + 1].yaw,   alpha);
+            roll  = lerpAngle(m_keyframes[i].roll,  m_keyframes[i + 1].roll,  alpha);
+            // Pitch is bounded to [-89.5, 89.5] (never wraps) — plain lerp is fine.
             pitch = m_keyframes[i].pitch + (m_keyframes[i + 1].pitch - m_keyframes[i].pitch) * alpha;
-            roll  = m_keyframes[i].roll  + (m_keyframes[i + 1].roll  - m_keyframes[i].roll)  * alpha;
             fov   = m_keyframes[i].fov   + (m_keyframes[i + 1].fov   - m_keyframes[i].fov)   * alpha;
             return;
         }
     }
+}
+
+void KeyframeModel::saveToFile(const QString &path) const
+{
+    QJsonArray arr;
+    for (const auto &k : m_keyframes) {
+        arr.append(QJsonObject{
+            {"time", k.time}, {"yaw", k.yaw}, {"pitch", k.pitch},
+            {"roll", k.roll}, {"fov", k.fov},
+        });
+    }
+    QJsonObject root{{"version", 1}, {"keyframes", arr}};
+
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly))
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+void KeyframeModel::loadFromFile(const QString &path)
+{
+    QVector<Keyframe> loaded;
+
+    QFile f(path);
+    if (f.open(QIODevice::ReadOnly)) {
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+        if (err.error == QJsonParseError::NoError && doc.isObject()) {
+            const QJsonArray arr = doc.object().value("keyframes").toArray();
+            for (const QJsonValue &v : arr) {
+                const QJsonObject o = v.toObject();
+                Keyframe k;
+                k.time  = o.value("time").toDouble(0.0);
+                k.yaw   = o.value("yaw").toDouble(0.0);
+                k.pitch = o.value("pitch").toDouble(0.0);
+                k.roll  = o.value("roll").toDouble(0.0);
+                k.fov   = o.value("fov").toDouble(90.0);
+                loaded.append(k);
+            }
+        }
+    }
+    std::sort(loaded.begin(), loaded.end());
+
+    // Keep the same invariant addKeyframe() maintains: at most one keyframe
+    // per time (hand-edited sidecars could contain duplicates).
+    if (loaded.size() > 1) {
+        int write = 1;
+        for (int i = 1; i < loaded.size(); ++i) {
+            if (!qFuzzyCompare(loaded[i].time, loaded[write - 1].time))
+                loaded[write++] = loaded[i];
+        }
+        loaded.resize(write);
+    }
+
+    // No-op load (same contents, or a missing file with an empty model): skip
+    // the model reset so opening videos doesn't churn the timeline.
+    if (loaded == m_keyframes)
+        return;
+
+    // Replace the model contents (empty if the file is missing/invalid) so
+    // switching videos never leaks the previous video's keyframes.
+    beginResetModel();
+    m_keyframes = loaded;
+    endResetModel();
 }

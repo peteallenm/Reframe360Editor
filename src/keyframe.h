@@ -43,6 +43,16 @@ public:
     void interpolate(double time, double &yaw, double &pitch, double &roll, double &fov) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }
 
+    // Persistence: write/read the whole keyframe set as JSON. loadFromFile()
+    // replaces the current contents (clearing them if the file is missing).
+    void saveToFile(const QString &path) const;
+    void loadFromFile(const QString &path);
+
+signals:
+    // Emitted after any keyframe is added, removed or updated, so callers can
+    // persist the (possibly new) state.
+    void keyframesChanged();
+
 private:
     void sortAndNotify();
     QVector<Keyframe> m_keyframes;

@@ -105,6 +105,7 @@ private:
 
     void loadSettings();
     void saveSettings() const;
+    void saveKeyframes();
     void computeGravityAlignment();
 
 signals:

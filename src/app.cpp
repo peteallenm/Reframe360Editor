@@ -16,6 +16,14 @@ extern "C" {
 // Euler decomposition becomes degenerate and the sliders would swap yaw/roll.
 static const double kMaxPitch = 89.5;
 
+// Keyframes are persisted per-video as a JSON sidecar next to the source file
+// (same convention as the .imu files), so re-opening a video restores its
+// keyframe set automatically.
+static QString keyframesPathFor(const QString &videoPath)
+{
+    return videoPath + QStringLiteral(".keyframes.json");
+}
+
 App::App(QObject *parent)
     : QObject(parent)
     , m_decoder(new VideoDecoder(this))
@@ -47,6 +55,10 @@ App::App(QObject *parent)
             emit imuOrientationChanged();
     });
     connect(m_decoder, &VideoDecoder::errorOccurred, this, &App::errorOccurred);
+
+    // Keep the per-video keyframe sidecar file in sync whenever the user adds,
+    // edits or deletes keyframes.
+    connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::saveKeyframes);
 
     m_viewQuat = viewQuatFromEuler();
 
@@ -82,7 +94,17 @@ void App::setVideoPath(const QString &path)
     emit usePreviewThumbnailChanged();
 
     if (!path.isEmpty()) {
+        // Restore this video's saved keyframes (or clear the model if the
+        // video has no sidecar yet).
+        m_keyframes->loadFromFile(keyframesPathFor(path));
+
         m_decoder->loadVideo(path);
+
+        // loadVideo() resets the decoder clock to 0 without emitting
+        // currentTimeChanged, so sync our clock and apply the restored
+        // keyframes right away instead of waiting for the next seek/play tick.
+        m_currentTime = m_decoder->currentTime();
+        applyKeyframeInterpolation();
 
         QString imuPath = path + ".imu";
         if (QFileInfo::exists(imuPath)) {
@@ -541,6 +563,13 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("imu/stabilize"), m_imuStabilize);
     s.setValue(QStringLiteral("imu/smoothing"), m_imuSmoothing);
     s.setValue(QStringLiteral("imu/syncOffset"), m_imuSyncOffset);
+}
+
+void App::saveKeyframes()
+{
+    if (m_videoPath.isEmpty())
+        return;
+    m_keyframes->saveToFile(keyframesPathFor(m_videoPath));
 }
 
 QString App::grabStill(int lens)
