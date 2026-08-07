@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QSettings>
 #include <QDateTime>
+#include <QTimer>
 #include <QQuaternion>
 #include <QMatrix4x4>
 #include <QtMath>
@@ -32,6 +33,7 @@ App::App(QObject *parent)
     , m_calibrationPresets(new CalibrationPresetModel(this))
     , m_currentCalibration(new CalibrationProfile(this))
     , m_keyframes(new KeyframeModel(this))
+    , m_exporter(new Exporter(this))
     , m_isPlaying(false)
     , m_currentTime(0.0)
     , m_yaw(0.0)
@@ -44,7 +46,9 @@ App::App(QObject *parent)
     , m_usePreview(false)
     , m_activeLens(2)
     , m_projection(0)
-    , m_gravityAlign()
+    , m_exportRunning(false)
+    , m_exportProgress(0.0)
+    , m_exportStatus()
 {
     connect(m_decoder, &VideoDecoder::durationChanged, this, &App::durationChanged);
     connect(m_decoder, &VideoDecoder::currentTimeChanged, this, [this]() {
@@ -59,6 +63,23 @@ App::App(QObject *parent)
     // Keep the per-video keyframe sidecar file in sync whenever the user adds,
     // edits or deletes keyframes.
     connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::saveKeyframes);
+
+    // Surface export progress / completion to the UI.
+    connect(m_exporter, &Exporter::exportProgress, this, [this](double p) {
+        setExportProgress(p);
+        m_exportStatus = tr("Rendering… %1%").arg((int)qRound(p * 100.0));
+        emit exportStatusChanged();
+    });
+    connect(m_exporter, &Exporter::exportFinished, this, [this](const QString &path) {
+        m_exportStatus = tr("Export complete: %1").arg(QFileInfo(path).fileName());
+        emit exportStatusChanged();
+        QTimer::singleShot(1500, this, [this]() { setExportRunning(false); });
+    });
+    connect(m_exporter, &Exporter::exportError, this, [this](const QString &message) {
+        m_exportStatus = tr("Export failed: %1").arg(message);
+        emit exportStatusChanged();
+        QTimer::singleShot(2500, this, [this]() { setExportRunning(false); });
+    });
 
     m_viewQuat = viewQuatFromEuler();
 
@@ -109,8 +130,12 @@ void App::setVideoPath(const QString &path)
         QString imuPath = path + ".imu";
         if (QFileInfo::exists(imuPath)) {
             m_imuParser->loadFile(imuPath);
-            m_gyroIntegrator->integrate(m_imuParser->samples(), m_imuParser->imuSampleRate());
-            computeGravityAlignment();
+            // integrate() now fuses the accelerometer with the gyro, so the
+            // orientations are already gravity-aligned (+Y = up); no separate
+            // static per-clip gravity alignment is needed any more.
+            m_gyroIntegrator->integrate(m_imuParser->samples(),
+                                        m_imuParser->imuSampleRate(),
+                                        m_imuParser->initialQuaternion());
         }
 
         emit videoLoaded();
@@ -469,84 +494,117 @@ VideoDecoder* App::videoDecoder() const
 
 QQuaternion App::imuOrientation() const
 {
+    return imuOrientationAt(m_currentTime);
+}
+
+QQuaternion App::imuOrientationAt(double time) const
+{
     if (m_imuStabilize && m_gyroIntegrator) {
-        QQuaternion q = m_gyroIntegrator->orientationAtTime(m_currentTime + m_imuSyncOffset);
-        // Bake in the gravity alignment: LensViewer passes the conjugate of
-        // this quaternion to the shader, so passing A^-1 * Q makes the shader
-        // sample Q^-1 * A * euler * ray and the displayed (stabilized) world
-        // direction A * euler * ray lives in a gravity-aligned frame. The
-        // yaw/pitch/roll look angles are therefore relative to gravity (not to
-        // the camera's start pose) and the default 0/0/0 view is level.
-        return m_gravityAlign.conjugated() * q;
+        // The integrator fuses the accelerometer with the gyro, so its output
+        // is already gravity-aligned. LensViewer passes the conjugate of this
+        // quaternion to the shader, so the displayed (stabilized) world
+        // direction lives in a gravity-aligned frame and the default 0/0/0
+        // view is level.
+        return m_gyroIntegrator->orientationAtTime(time + m_imuSyncOffset);
     }
     return QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
 }
 
-void App::computeGravityAlignment()
-{
-    m_gravityAlign = QQuaternion();  // identity: no correction
-    if (!m_imuParser)
-        return;
-
-    const QVector<ImuSample> &samples = m_imuParser->samples();
-    if (samples.isEmpty())
-        return;
-
-    // The accelerometer at rest reads the specific force (~1g, pointing away
-    // from gravity). Rotating every sample into camera axes with the inverse
-    // of the header's IMU->camera quaternion (config[4..7], exposed as
-    // ImuParser::initialQuaternion) and taking the per-axis median over the
-    // whole clip gives a robust estimate of gravity-up in camera axes: linear
-    // accelerations average out, and it survives a pose change between IMU
-    // power-on and recording start. Empirically q^-1 * accel == +Y (up) for a
-    // level camera on all test files (JustYaw/Pitch/Roll, YIVR_0807/0771).
-    const QQuaternion qInv = m_imuParser->initialQuaternion().conjugated();
-
-    QVector<QVector3D> up;
-    up.reserve(samples.size());
-    for (const ImuSample &s : samples) {
-        QVector3D v = qInv.rotatedVector(s.accel);
-        float len = v.length();
-        if (len > 0.1f)
-            up.append(v / len);
-    }
-    if (up.isEmpty())
-        return;
-
-    auto medianComp = [&up](int axis) {
-        QVector<float> vals;
-        vals.reserve(up.size());
-        for (const QVector3D &v : up)
-            vals.append(v[axis]);
-        std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
-        return vals[vals.size() / 2];
-    };
-    QVector3D gUp(medianComp(0), medianComp(1), medianComp(2));
-    float gl = gUp.length();
-    if (gl < 0.1f)
-        return;
-    gUp /= gl;
-
-    // A maps the display up axis (+Y) onto the true gravity-up direction, so
-    // the leveled default view has "up" = gravity up and roll = 0.
-    m_gravityAlign = QQuaternion::rotationTo(QVector3D(0.0f, 1.0f, 0.0f), gUp);
-}
 
 void App::exportFrame(const QString &path, int width, int height)
 {
-    Q_UNUSED(path);
-    Q_UNUSED(width);
-    Q_UNUSED(height);
+    if (m_videoPath.isEmpty()) {
+        m_exportStatus = tr("Export failed: no video loaded");
+        emit exportStatusChanged();
+        return;
+    }
+    if (m_exporter->isRunning())
+        return;
+
+    setExportProgress(0.0);
+    setExportRunning(true);
+    m_exportStatus = tr("Rendering frame…");
+    emit exportStatusChanged();
+
+    ExportSnapshot snap = buildExportSnapshot();
+    m_exporter->exportFrame(m_videoPath, path, width, height, m_currentTime,
+                            snap.stateAt(m_currentTime));
 }
 
 void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime)
 {
-    Q_UNUSED(path);
-    Q_UNUSED(width);
-    Q_UNUSED(height);
-    Q_UNUSED(fps);
-    Q_UNUSED(startTime);
-    Q_UNUSED(endTime);
+    if (m_videoPath.isEmpty()) {
+        m_exportStatus = tr("Export failed: no video loaded");
+        emit exportStatusChanged();
+        return;
+    }
+    if (m_exporter->isRunning())
+        return;
+
+    setExportProgress(0.0);
+    setExportRunning(true);
+    m_exportStatus = tr("Preparing export…");
+    emit exportStatusChanged();
+
+    ExportSnapshot snap = buildExportSnapshot();
+    m_exporter->exportVideo(m_videoPath, path, width, height, fps, startTime, endTime,
+                            [snap](double t) { return snap.stateAt(t); });
+}
+
+void App::setExportRunning(bool running)
+{
+    if (m_exportRunning == running)
+        return;
+    m_exportRunning = running;
+    if (!running)
+        setExportProgress(0.0);
+    emit exportRunningChanged();
+}
+
+void App::setExportProgress(double progress)
+{
+    progress = qBound(0.0, progress, 1.0);
+    if (qFuzzyCompare(m_exportProgress, progress))
+        return;
+    m_exportProgress = progress;
+    emit exportProgressChanged();
+}
+
+ExportSnapshot App::buildExportSnapshot() const
+{
+    ExportSnapshot s;
+    s.base.yaw = m_yaw;
+    s.base.pitch = m_pitch;
+    s.base.roll = m_roll;
+    s.base.fov = m_fov;
+    s.base.activeLens = m_activeLens;
+    s.base.projection = m_projection;
+    s.base.fullRange = m_decoder ? m_decoder->isFullRange() : true;
+    if (m_currentCalibration) {
+        s.base.frontCenterX = (float)m_currentCalibration->frontCenterX();
+        s.base.frontCenterY = (float)m_currentCalibration->frontCenterY();
+        s.base.frontRadius = (float)m_currentCalibration->frontRadius();
+        s.base.frontK1 = (float)m_currentCalibration->frontK1();
+        s.base.frontK2 = (float)m_currentCalibration->frontK2();
+        s.base.frontRotation = (float)m_currentCalibration->frontRotation();
+        s.base.frontHFlip = m_currentCalibration->frontHFlip();
+        s.base.rearCenterX = (float)m_currentCalibration->rearCenterX();
+        s.base.rearCenterY = (float)m_currentCalibration->rearCenterY();
+        s.base.rearRadius = (float)m_currentCalibration->rearRadius();
+        s.base.rearK1 = (float)m_currentCalibration->rearK1();
+        s.base.rearK2 = (float)m_currentCalibration->rearK2();
+        s.base.rearRotation = (float)m_currentCalibration->rearRotation();
+        s.base.rearHFlip = m_currentCalibration->rearHFlip();
+        s.base.blendStart = (float)m_currentCalibration->blendStart();
+    }
+    s.keyframes = m_keyframes->keyframes();
+    s.imuStabilize = m_imuStabilize;
+    if (m_gyroIntegrator) {
+        s.imuOrientations = m_gyroIntegrator->orientations();
+        s.imuTimestamps = m_gyroIntegrator->timestamps();
+    }
+    s.syncOffset = m_imuSyncOffset;
+    return s;
 }
 
 void App::loadSettings()

@@ -89,33 +89,39 @@ void KeyframeModel::sortAndNotify()
 
 void KeyframeModel::interpolate(double time, double &yaw, double &pitch, double &roll, double &fov) const
 {
-    if (m_keyframes.isEmpty()) return;
+    interpolate(m_keyframes, time, yaw, pitch, roll, fov);
+}
+
+void KeyframeModel::interpolate(const QVector<Keyframe> &kfs, double time,
+                                double &yaw, double &pitch, double &roll, double &fov)
+{
+    if (kfs.isEmpty()) return;
 
     // Before first keyframe
-    if (time <= m_keyframes.first().time) {
-        yaw = m_keyframes.first().yaw;
-        pitch = m_keyframes.first().pitch;
-        roll = m_keyframes.first().roll;
-        fov = m_keyframes.first().fov;
+    if (time <= kfs.first().time) {
+        yaw = kfs.first().yaw;
+        pitch = kfs.first().pitch;
+        roll = kfs.first().roll;
+        fov = kfs.first().fov;
         return;
     }
 
     // After last keyframe
-    if (time >= m_keyframes.last().time) {
-        yaw = m_keyframes.last().yaw;
-        pitch = m_keyframes.last().pitch;
-        roll = m_keyframes.last().roll;
-        fov = m_keyframes.last().fov;
+    if (time >= kfs.last().time) {
+        yaw = kfs.last().yaw;
+        pitch = kfs.last().pitch;
+        roll = kfs.last().roll;
+        fov = kfs.last().fov;
         return;
     }
 
     // Between two keyframes — linear interpolation. Yaw/roll are angles, so
     // interpolate along the *shortest* path: a 350° -> 10° move must sweep the
     // 20° across the 360/0 wrap, not spin 340° the long way around.
-    for (int i = 0; i < (int)m_keyframes.size() - 1; i++) {
-        if (time >= m_keyframes[i].time && time <= m_keyframes[i + 1].time) {
-            double t1 = m_keyframes[i].time;
-            double t2 = m_keyframes[i + 1].time;
+    for (int i = 0; i < (int)kfs.size() - 1; i++) {
+        if (time >= kfs[i].time && time <= kfs[i + 1].time) {
+            double t1 = kfs[i].time;
+            double t2 = kfs[i + 1].time;
             double alpha = (time - t1) / (t2 - t1);
 
             // Wrap the delta into [-180, 180] and keep the result in range.
@@ -129,11 +135,11 @@ void KeyframeModel::interpolate(double time, double &yaw, double &pitch, double 
                 return r;
             };
 
-            yaw   = lerpAngle(m_keyframes[i].yaw,   m_keyframes[i + 1].yaw,   alpha);
-            roll  = lerpAngle(m_keyframes[i].roll,  m_keyframes[i + 1].roll,  alpha);
+            yaw   = lerpAngle(kfs[i].yaw,   kfs[i + 1].yaw,   alpha);
+            roll  = lerpAngle(kfs[i].roll,  kfs[i + 1].roll,  alpha);
             // Pitch is bounded to [-89.5, 89.5] (never wraps) — plain lerp is fine.
-            pitch = m_keyframes[i].pitch + (m_keyframes[i + 1].pitch - m_keyframes[i].pitch) * alpha;
-            fov   = m_keyframes[i].fov   + (m_keyframes[i + 1].fov   - m_keyframes[i].fov)   * alpha;
+            pitch = kfs[i].pitch + (kfs[i + 1].pitch - kfs[i].pitch) * alpha;
+            fov   = kfs[i].fov   + (kfs[i + 1].fov   - kfs[i].fov)   * alpha;
             return;
         }
     }

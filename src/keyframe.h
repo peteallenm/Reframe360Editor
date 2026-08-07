@@ -43,6 +43,16 @@ public:
     void interpolate(double time, double &yaw, double &pitch, double &roll, double &fov) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }
 
+    // Snapshot of the keyframe set, safe to hand to a worker thread (e.g. the
+    // exporter) without racing against GUI-thread edits.
+    QVector<Keyframe> keyframes() const { return m_keyframes; }
+
+    // Pure interpolation over a snapshot, so it can be evaluated from another
+    // thread. Mirrors the member interpolate() exactly (incl. shortest-path
+    // wrapping for yaw/roll).
+    static void interpolate(const QVector<Keyframe> &kfs, double time,
+                            double &yaw, double &pitch, double &roll, double &fov);
+
     // Persistence: write/read the whole keyframe set as JSON. loadFromFile()
     // replaces the current contents (clearing them if the file is missing).
     void saveToFile(const QString &path) const;

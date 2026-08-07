@@ -11,7 +11,16 @@
 
 int main(int argc, char *argv[])
 {
-    qputenv("QT_QUICK_CONTROLS_NATIVE_DIALOGS", "0");
+    // Qt's default platform theme provides no native file-dialog helper, so
+    // FileDialog silently falls back to a non-native dialog that ignores
+    // fileMode: SaveFile (it always shows "Open"). The GTK3 platform theme
+    // supplies a real save-as dialog helper, so prefer it when available
+    // (Qt falls back gracefully if the theme plugin is missing).
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORMTHEME"))
+        qputenv("QT_QPA_PLATFORMTHEME", "gtk3");
+
+    // We also deliberately do NOT set QT_QUICK_CONTROLS_NATIVE_DIALOGS=0:
+    // the non-native Qt Quick dialog implementation ignores SaveFile mode.
     QGuiApplication app(argc, argv);
     app.setApplicationName("render360");
     app.setOrganizationName("render360");

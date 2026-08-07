@@ -10,6 +10,44 @@
 #include "gyroscopeintegrator.h"
 #include "calibration.h"
 #include "keyframe.h"
+#include "exporter.h"
+
+// Immutable snapshot of everything the exporter needs, captured at export
+// start so the export worker thread never touches live GUI state. Per-time
+// variation (keyframes, IMU) is folded into stateAt().
+struct ExportSnapshot {
+    ExportFrameState base;
+    QVector<Keyframe> keyframes;
+    bool imuStabilize = false;
+    // Copied IMU samples (by value) so the worker never reads the live
+    // integrator, which the GUI thread may re-populate by loading a video
+    // while an export is running.
+    QVector<QQuaternion> imuOrientations;
+    QVector<double> imuTimestamps;
+    double syncOffset = 0.0;
+
+    ExportFrameState stateAt(double t) const
+    {
+        ExportFrameState s = base;
+        if (!keyframes.isEmpty()) {
+            double y, p, r, f;
+            KeyframeModel::interpolate(keyframes, t, y, p, r, f);
+            s.yaw = y;
+            s.pitch = p;
+            s.roll = r;
+            s.fov = f;
+        }
+        if (imuStabilize && !imuOrientations.isEmpty()) {
+            QQuaternion q = GyroscopeIntegrator::orientationAt(imuOrientations,
+                                                               imuTimestamps,
+                                                               t + syncOffset);
+            s.imuOrientation = q;
+        } else {
+            s.imuOrientation = QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+        return s;
+    }
+};
 
 class App : public QObject
 {
@@ -34,6 +72,9 @@ class App : public QObject
     Q_PROPERTY(CalibrationProfile* currentCalibration READ currentCalibration NOTIFY currentCalibrationChanged)
     Q_PROPERTY(QQuaternion imuOrientation READ imuOrientation NOTIFY imuOrientationChanged)
     Q_PROPERTY(KeyframeModel* keyframes READ keyframes CONSTANT)
+    Q_PROPERTY(bool exportRunning READ exportRunning NOTIFY exportRunningChanged)
+    Q_PROPERTY(double exportProgress READ exportProgress NOTIFY exportProgressChanged)
+    Q_PROPERTY(QString exportStatus READ exportStatus NOTIFY exportStatusChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -90,6 +131,10 @@ public:
 
     KeyframeModel* keyframes() const { return m_keyframes; }
 
+    bool exportRunning() const { return m_exportRunning; }
+    double exportProgress() const { return m_exportProgress; }
+    QString exportStatus() const { return m_exportStatus; }
+
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
     Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime);
     Q_INVOKABLE QString grabStill(int lens);
@@ -106,7 +151,13 @@ private:
     void loadSettings();
     void saveSettings() const;
     void saveKeyframes();
-    void computeGravityAlignment();
+    void setExportRunning(bool running);
+    void setExportProgress(double progress);
+    ExportSnapshot buildExportSnapshot() const;
+
+    // IMU-stabilized view quaternion at an arbitrary time (thread-safe: only
+    // reads fixed integrator data).
+    QQuaternion imuOrientationAt(double time) const;
 
 signals:
     void videoPathChanged();
@@ -127,6 +178,9 @@ signals:
     void imuOrientationChanged();
     void videoLoaded();
     void errorOccurred(const QString &message);
+    void exportRunningChanged();
+    void exportProgressChanged();
+    void exportStatusChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -135,6 +189,11 @@ private:
     CalibrationPresetModel *m_calibrationPresets;
     CalibrationProfile *m_currentCalibration;
     KeyframeModel *m_keyframes;
+    Exporter *m_exporter;
+
+    bool m_exportRunning;
+    double m_exportProgress;
+    QString m_exportStatus;
 
     QString m_videoPath;
     bool m_isPlaying;
@@ -150,7 +209,6 @@ private:
     int m_activeLens;
     int m_projection;
     QQuaternion m_viewQuat;
-    QQuaternion m_gravityAlign;
 };
 
 #endif // APP_H
