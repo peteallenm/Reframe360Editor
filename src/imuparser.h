@@ -8,9 +8,8 @@
 
 struct ImuSample {
     double timestamp;
-    QVector3D gyro;
-    QVector3D accel;
-    QVector3D mag;
+    QVector3D gyro;   // deg/s
+    QVector3D accel;  // g
 };
 
 class ImuParser : public QObject
@@ -22,12 +21,19 @@ public:
     bool loadFile(const QString &path);
 
     QQuaternion initialQuaternion() const { return m_initialQuaternion; }
-    double sampleRate() const { return m_sampleRate; }
-    QVector<ImuSample> rawGyroData() const { return m_rawData; }
+    double imuSampleRate() const { return m_imuSampleRate; }
+    QVector<ImuSample> samples() const { return m_rawData; }
+
+    double gyroScaleX() const { return m_gyroScaleX; }
+    double gyroScaleY() const { return m_gyroScaleY; }
+    double gyroScaleZ() const { return m_gyroScaleZ; }
 
 private:
     QQuaternion m_initialQuaternion;
-    double m_sampleRate;
+    double m_imuSampleRate;
+    double m_gyroScaleX;
+    double m_gyroScaleY;
+    double m_gyroScaleZ;
     QVector<ImuSample> m_rawData;
 };
 

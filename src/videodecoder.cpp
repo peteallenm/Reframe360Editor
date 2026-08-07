@@ -147,6 +147,11 @@ double VideoDecoder::duration() const
     return m_duration;
 }
 
+double VideoDecoder::currentTime() const
+{
+    return m_currentTime;
+}
+
 DecodedFrame VideoDecoder::currentFrame() const
 {
     QMutexLocker lock(&m_mutex);
@@ -174,37 +179,54 @@ void VideoDecoder::decodeLoop()
             continue;
         }
 
-        decodeFrame();
+        DecodeResult result = decodeFrame();
 
-        double startTime, currentTime;
-        {
-            QMutexLocker lock(&m_mutex);
-            double elapsed = getTimeSeconds() - m_startTime;
-            if (elapsed >= m_currentTime) {
-                m_currentTime += 1.0 / 30.0;
-            }
-            if (m_currentTime >= m_duration && m_duration > 0.0) {
+        if (result == DecodeResult::Eof) {
+            // The stream reached the end and rewound to the start (loop-back).
+            // Reset the playback clock here, otherwise the throttle below
+            // compares against the original start time and the next lap
+            // decodes as fast as possible ("plays really fast").
+            {
+                QMutexLocker lock(&m_mutex);
                 m_currentTime = 0.0;
                 m_startTime = getTimeSeconds();
             }
-            startTime = m_startTime;
-            currentTime = m_currentTime;
+            emit currentTimeChanged();
+            continue;
+        }
+
+        double frameTimestamp;
+        {
+            QMutexLocker lock(&m_mutex);
+            frameTimestamp = m_currentFrame.timestamp;
+
+            // Use actual frame PTS, not a fixed delta
+            if (frameTimestamp >= 0.0) {
+                m_currentTime = frameTimestamp;
+            }
+
+            if (m_currentTime >= m_duration && m_duration > 0.0) {
+                m_playing = false;
+                m_currentTime = m_duration;
+            }
         }
         emit currentTimeChanged();
 
-        double due = currentTime - (getTimeSeconds() - startTime);
-        if (due > 0.0) {
-            long long sleepMs = (long long)(due * 1000.0);
-            sleepMs = qBound(1LL, sleepMs, 200LL);
-            QThread::msleep(sleepMs);
+        // Throttle to real-time: sleep until the next frame is due
+        if (frameTimestamp >= 0.0) {
+            double wallElapsed = getTimeSeconds() - m_startTime;
+            double due = m_currentTime - wallElapsed;
+            if (due > 0.0 && due < 1.0) {
+                QThread::msleep((unsigned long)(due * 1000.0));
+            }
         }
     }
 }
 
-void VideoDecoder::decodeFrame()
+VideoDecoder::DecodeResult VideoDecoder::decodeFrame()
 {
     QMutexLocker ffmpegLock(&m_ffmpegMutex);
-    if (!m_formatCtx || !m_codecCtx) return;
+    if (!m_formatCtx || !m_codecCtx) return DecodeResult::NoData;
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
@@ -213,22 +235,23 @@ void VideoDecoder::decodeFrame()
     if (ret < 0) {
         av_packet_free(&pkt);
         av_frame_free(&frame);
+        // End of stream: rewind so the next read starts at the beginning (loop).
         av_seek_frame(m_formatCtx, m_videoStreamIndex, 0, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(m_codecCtx);
-        return;
+        return DecodeResult::Eof;
     }
 
     if (pkt->stream_index != m_videoStreamIndex) {
         av_packet_free(&pkt);
         av_frame_free(&frame);
-        return;
+        return DecodeResult::NoData;
     }
 
     ret = avcodec_send_packet(m_codecCtx, pkt);
     av_packet_free(&pkt);
     if (ret < 0) {
         av_frame_free(&frame);
-        return;
+        return DecodeResult::NoData;
     }
 
     ret = avcodec_receive_frame(m_codecCtx, frame);
@@ -260,7 +283,10 @@ void VideoDecoder::decodeFrame()
         }
 
         emit frameReady();
+        av_frame_free(&frame);
+        return DecodeResult::Frame;
     }
 
     av_frame_free(&frame);
+    return DecodeResult::NoData;
 }

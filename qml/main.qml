@@ -30,6 +30,15 @@ ApplicationWindow {
             ToolSeparator {}
 
             ToolButton {
+                text: app.usePreviewThumbnail ? qsTr("Full Video") : qsTr("Thumbnail")
+                icon.name: "view-preview"
+                enabled: app.previewThumbnailPath !== ""
+                ToolTip.text: qsTr("Preview using the low-res *_thm video — export always uses the full video")
+                ToolTip.visible: hovered
+                onClicked: app.usePreviewThumbnail = !app.usePreviewThumbnail
+            }
+
+            ToolButton {
                 text: qsTr("Export Frame")
                 icon.name: "camera-photo"
                 onClicked: exportFrameDialog.open()
@@ -78,7 +87,7 @@ ApplicationWindow {
     FileDialog {
         id: fileDialog
         title: qsTr("Open 360 Video")
-        nameFilters: ["Video files (*.mp4 *.mov *.mkv)", "All files (*)"]
+        nameFilters: ["Video files (*.mp4 *.MP4 *.mov *.MOV *.mkv *.MKV)", "All files (*)"]
         onAccepted: {
             app.videoPath = selectedFile.toString().replace("file://", "")
         }

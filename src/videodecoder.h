@@ -37,6 +37,7 @@ public:
     void stopPlayback();
     void seekTo(double time);
     double duration() const;
+    double currentTime() const;
 
     DecodedFrame currentFrame() const;
     bool hasFrame() const;
@@ -54,7 +55,8 @@ private slots:
     void decodeLoop();
 
 private:
-    void decodeFrame();
+    enum class DecodeResult { Frame, Eof, NoData };
+    DecodeResult decodeFrame();
 
     AVFormatContext *m_formatCtx;
     AVCodecContext *m_codecCtx;

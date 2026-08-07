@@ -14,14 +14,13 @@ public:
 
     void integrate(const QVector<ImuSample> &samples, double sampleRate);
     QQuaternion orientationAtTime(double time) const;
-    void setSmoothing(double factor) { m_smoothing = factor; }
 
 private:
+    QVector3D computeGyroBias(const QVector<ImuSample> &samples) const;
+
     QVector<QQuaternion> m_orientations;
     QVector<double> m_timestamps;
-    QQuaternion m_initialOrientation;
     double m_sampleRate;
-    double m_smoothing;
 };
 
 #endif // GYROSCOPEINTEGRATOR_H

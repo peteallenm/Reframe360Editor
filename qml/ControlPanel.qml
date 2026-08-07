@@ -38,7 +38,9 @@ ScrollView {
                     Slider {
                         id: pitchSlider
                         Layout.fillWidth: true
-                        from: -180; to: 180; stepSize: 1
+                        // Pitch is clamped away from the vertical poles to keep
+                        // yaw/roll from swapping (see App::setPitch).
+                        from: -89.5; to: 89.5; stepSize: 1
                         value: app.pitch
                         onValueChanged: if (pressed) app.pitch = value
                     }
@@ -92,7 +94,7 @@ ScrollView {
                     ComboBox {
                         id: projectionCombo
                         Layout.fillWidth: true
-                        model: [qsTr("Perspective"), qsTr("Equirectangular")]
+                        model: [qsTr("Perspective"), qsTr("Equirectangular"), qsTr("Stereographic"), qsTr("SportsView")]
                         currentIndex: app.projection
                         onCurrentIndexChanged: app.projection = currentIndex
                     }
@@ -121,8 +123,9 @@ ScrollView {
                     Slider {
                         id: smoothingSlider
                         Layout.fillWidth: true
-                        from: 0.0; to: 1.0; value: 0.5
-                        onValueChanged: app.imuSmoothing = value
+                        from: 0.0; to: 1.0
+                        value: app.imuSmoothing
+                        onMoved: app.imuSmoothing = value
                     }
                     Label { text: smoothingSlider.value.toFixed(2); Layout.preferredWidth: 40 }
                 }
@@ -133,9 +136,10 @@ ScrollView {
                     Slider {
                         id: syncSlider
                         Layout.fillWidth: true
-                        from: -1.0; to: 1.0; value: 0.0
+                        from: 0; to: 0.3
+                        value: app.imuSyncOffset
                         stepSize: 0.01
-                        onValueChanged: app.imuSyncOffset = value
+                        onMoved: app.imuSyncOffset = value
                     }
                     Label { text: syncSlider.value.toFixed(2) + "s"; Layout.preferredWidth: 50 }
                 }
@@ -155,7 +159,11 @@ ScrollView {
                     Layout.fillWidth: true
                     model: app.calibrationPresets
                     textRole: "name"
-                    onActivated: app.calibrationPresets.loadPreset(currentIndex, app.currentCalibration)
+                    onActivated: {
+                        app.calibrationPresets.loadPreset(currentIndex, app.currentCalibration)
+                        // Keep the loaded profile's name in the field so Save updates it.
+                        presetNameField.text = presetCombo.currentText
+                    }
                 }
 
                 RowLayout {

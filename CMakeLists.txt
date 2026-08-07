@@ -20,6 +20,7 @@ qt_add_executable(render360
     src/lensviewer.cpp
     src/viewermaterial.cpp
     src/calibration.cpp
+    src/keyframe.cpp
     src/exporter.cpp
 )
 

@@ -74,16 +74,52 @@ mat3 eulerRotation(float yaw, float pitch, float roll) {
 void main() {
     vec3 ray;
     if (u_projection == 1) {
+        // Equirectangular: maps the full 360x180 sphere onto the viewport.
         float lon = (v_texCoord.x - 0.5) * 2.0 * PI;
         float lat = (0.5 - v_texCoord.y) * PI;
         ray = vec3(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon));
+    } else if (u_projection == 2) {
+        // Stereographic projection: conformal, so wide FOVs don't stretch the
+        // edges the way a rectilinear tan() projection does (which also blows
+        // up as the FOV approaches 180 deg). It matches a rectilinear view for
+        // small angles and maps the whole sphere smoothly. fovScale is chosen
+        // so the vertical FOV still equals u_fov: 2*atan(fovScale/2) = fov/2.
+        vec2 ndc = v_texCoord * 2.0 - 1.0;
+        float fovScale = 2.0 * tan(radians(u_fov * 0.25));
+        float aspect = u_viewAspect;
+        vec2 p = vec2(ndc.x * fovScale * aspect, -ndc.y * fovScale);
+        float rho = length(p);
+        vec2 n = (rho > 1e-6) ? (p / rho) : vec2(0.0);
+        float ang = 2.0 * atan(rho * 0.5);
+        ray = vec3(n * sin(ang), -cos(ang));
+    } else if (u_projection == 3) {
+        // SportsView (GoPro SuperView style): the perspective view of the full
+        // 4:3 sensor field of view, stretched vertically to fill the 16:9
+        // frame. The centre of the frame and the horizon stay natural while
+        // the top and bottom show more of the scene, stretched, for an
+        // immersive ultra-wide feel. Vertical FOV is ~4/3 x u_fov.
+        vec2 ndc = v_texCoord * 2.0 - 1.0;
+        float fovScale = tan(radians(u_fov * 0.5));
+        float aspect = u_viewAspect;
+        float sensorAspect = 4.0 / 3.0;
+        float verticalStretch = (16.0 / 9.0) / sensorAspect; // 4/3
+        ray = normalize(vec3(ndc.x * fovScale * aspect, -ndc.y * fovScale * verticalStretch, -1.0));
     } else {
+        // Perspective (rectilinear): straight lines stay straight, at the
+        // cost of edge stretching as the FOV widens (the tan() mapping blows
+        // up approaching 180 deg). Vertical FOV still equals u_fov.
         vec2 ndc = v_texCoord * 2.0 - 1.0;
         float fovScale = tan(radians(u_fov * 0.5));
         float aspect = u_viewAspect;
         ray = normalize(vec3(ndc.x * fovScale * aspect, -ndc.y * fovScale, -1.0));
     }
 
+    // Apply the user's manual look rotation first, then the IMU
+    // counter-rotation. The sampled video direction is imuMatrix * euler * ray
+    // (euler = user look, imuMatrix = Q_imu^-1), so the stabilized world
+    // direction Q_imu * sampled = euler * ray is fully described by the euler
+    // angles; doing it the other way round makes the view drift as the camera
+    // rotates whenever yaw/pitch/roll are non-zero.
     ray = eulerRotation(u_yaw, u_pitch, u_roll) * ray;
 
     vec4 imuRay = u_imuMatrix * vec4(ray, 0.0);

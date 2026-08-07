@@ -32,11 +32,14 @@ int main(int argc, char *argv[])
     QCommandLineOption grabOption("grab", "Grab the window after a short delay and save to FILE", "file");
     parser.addOption(grabOption);
     
-    QCommandLineOption projectionOption("projection", "Rendering projection: 0 perspective, 1 equirectangular", "mode");
+    QCommandLineOption projectionOption("projection", "Rendering projection: 0 perspective, 1 equirectangular, 2 stereographic, 3 sportsview", "mode");
     parser.addOption(projectionOption);
     
     QCommandLineOption lensOption("lens", "Lens mode: 0 front, 1 rear, 2 auto stitch", "mode");
     parser.addOption(lensOption);
+
+    QCommandLineOption imuOption("imu", "Enable IMU stabilization");
+    parser.addOption(imuOption);
     
     parser.process(app);
 
@@ -91,6 +94,9 @@ int main(int argc, char *argv[])
         appController.setProjection(parser.value(projectionOption).toInt());
     if (parser.isSet(lensOption))
         appController.setActiveLens(parser.value(lensOption).toInt());
+
+    if (parser.isSet(imuOption))
+        appController.setImuStabilize(true);
 
     if (parser.isSet(grabOption)) {
         QString grabPath = parser.value(grabOption);

@@ -146,12 +146,14 @@ bool ViewerMaterialShader::updateUniformData(RenderState &state,
         changed = true;
     }
 
+    // Always re-upload the custom block: the material instance stays the same
+    // across frames, so the oldMaterial != newMaterial check would only upload
+    // once (at first paint), freezing yaw/pitch/roll/fov/imuMatrix/calibration.
+    Q_UNUSED(oldMaterial);
     ViewerMaterial *m = static_cast<ViewerMaterial*>(newMaterial);
-    if (oldMaterial != newMaterial) {
-        QByteArray data = m->compileUniformData();
-        memcpy(buf->data() + 68, data.constData() + 68, sizeof(ViewerUniforms) - 68);
-        changed = true;
-    }
+    QByteArray data = m->compileUniformData();
+    memcpy(buf->data() + 68, data.constData() + 68, sizeof(ViewerUniforms) - 68);
+    changed = true;
 
     return changed;
 }

@@ -115,7 +115,7 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     material->setProjection(m_projection);
 
     QMatrix4x4 imuMat;
-    imuMat.rotate(m_imuOrientation);
+    imuMat.rotate(m_imuOrientation.conjugated());
     material->setImuMatrix(imuMat);
 
     if (m_decoder && m_decoder->hasFrame()) {

@@ -43,7 +43,7 @@ Item {
                 var dy = mouse.y - dragOrigin.y
                 if (dx === 0 && dy === 0) return
                 var sens = app.fov / Math.max(height, 1)
-                app.dragLook(-dx * sens, dy * sens)
+                app.dragLook(dx * sens, -dy * sens);
                 dragOrigin = Qt.point(mouse.x, mouse.y)
             }
         }
