@@ -245,10 +245,44 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                     b = bf + (br - bf) * blend;
                 }
 
+                // ---- Colour grading (mirror of project.frag) ----
+                {
+                    const double lumaN = clampUnit((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
+                    const double wL = (1.0 - lumaN) * (1.0 - lumaN);
+                    const double wH = lumaN * lumaN;
+                    const double wM = 1.0 - wL - wH;
+
+                    r += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                                + s.redLows * wL + s.redMids * wM + s.redHighs * wH);
+                    g += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                                + s.greenLows * wL + s.greenMids * wM + s.greenHighs * wH);
+                    b += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                                + s.blueLows * wL + s.blueMids * wM + s.blueHighs * wH);
+
+                    const double lumaN2 = clampUnit((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
+                    const double midW = 1.0 - std::abs(lumaN2 * 2.0 - 1.0);
+                    r += s.pop * 0.2 * midW * (r - 127.5);
+                    g += s.pop * 0.2 * midW * (g - 127.5);
+                    b += s.pop * 0.2 * midW * (b - 127.5);
+
+                    const double luma255 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    r = luma255 + (r - luma255) * s.saturation;
+                    g = luma255 + (g - luma255) * s.saturation;
+                    b = luma255 + (b - luma255) * s.saturation;
+
+                    r = (r - 127.5) * s.contrast + 127.5;
+                    g = (g - 127.5) * s.contrast + 127.5;
+                    b = (b - 127.5) * s.contrast + 127.5;
+
+                    r += s.brightness * 255.0;
+                    g += s.brightness * 255.0;
+                    b += s.brightness * 255.0;
+                }
+
                 quint8 *px3 = line + px * 3;
-                px3[0] = (quint8)qRound(r);
-                px3[1] = (quint8)qRound(g);
-                px3[2] = (quint8)qRound(b);
+                px3[0] = (quint8)qRound(qBound(0.0, r, 255.0));
+                px3[1] = (quint8)qRound(qBound(0.0, g, 255.0));
+                px3[2] = (quint8)qRound(qBound(0.0, b, 255.0));
             }
         }
     };

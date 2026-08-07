@@ -22,6 +22,7 @@ Item {
             activeLens: app.activeLens
             projection: app.projection
             calibration: app.currentCalibration
+            colorGrade: app.colorGrade
             imuOrientation: app.imuStabilize ? app.imuOrientation : Qt.quaternion(1, 0, 0, 0)
         }
 

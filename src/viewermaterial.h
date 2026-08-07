@@ -32,6 +32,13 @@ public:
     void setHFlip(bool front, bool rear) { m_frontHFlip = front; m_rearHFlip = rear; }
     void setTextures(QSGTexture *y, QSGTexture *u, QSGTexture *v);
 
+    // Colour grading values (see ColorGrade / project.frag for semantics).
+    void setColorGrade(float brightness, float contrast, float saturation, float pop,
+                       float brightLows, float brightMids, float brightHighs,
+                       float redLows, float redMids, float redHighs,
+                       float greenLows, float greenMids, float greenHighs,
+                       float blueLows, float blueMids, float blueHighs);
+
     QSGTexture *yTexture() const { return m_yTex; }
     QSGTexture *uTexture() const { return m_uTex; }
     QSGTexture *vTexture() const { return m_vTex; }
@@ -74,6 +81,11 @@ private:
     float m_rearRotation;
     bool m_rearHFlip;
     float m_blendStart;
+    float m_brightness, m_contrast, m_saturation, m_pop;
+    float m_brightLows, m_brightMids, m_brightHighs;
+    float m_redLows, m_redMids, m_redHighs;
+    float m_greenLows, m_greenMids, m_greenHighs;
+    float m_blueLows, m_blueMids, m_blueHighs;
 };
 
 class ViewerMaterialShader : public QSGMaterialShader

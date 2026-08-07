@@ -22,6 +22,7 @@ qt_add_executable(render360
     src/calibration.cpp
     src/keyframe.cpp
     src/exporter.cpp
+    src/colorgrade.cpp
 )
 
 qt_add_qml_module(render360

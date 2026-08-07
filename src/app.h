@@ -9,6 +9,7 @@
 #include "imuparser.h"
 #include "gyroscopeintegrator.h"
 #include "calibration.h"
+#include "colorgrade.h"
 #include "keyframe.h"
 #include "exporter.h"
 
@@ -70,6 +71,7 @@ class App : public QObject
     Q_PROPERTY(VideoDecoder* videoDecoder READ videoDecoder CONSTANT)
     Q_PROPERTY(CalibrationPresetModel* calibrationPresets READ calibrationPresets CONSTANT)
     Q_PROPERTY(CalibrationProfile* currentCalibration READ currentCalibration NOTIFY currentCalibrationChanged)
+    Q_PROPERTY(ColorGrade* colorGrade READ colorGrade CONSTANT)
     Q_PROPERTY(QQuaternion imuOrientation READ imuOrientation NOTIFY imuOrientationChanged)
     Q_PROPERTY(KeyframeModel* keyframes READ keyframes CONSTANT)
     Q_PROPERTY(bool exportRunning READ exportRunning NOTIFY exportRunningChanged)
@@ -126,6 +128,7 @@ public:
 
     CalibrationPresetModel* calibrationPresets() const;
     CalibrationProfile* currentCalibration() const;
+    ColorGrade* colorGrade() const { return m_colorGrade; }
 
     QQuaternion imuOrientation() const;
 
@@ -188,6 +191,7 @@ private:
     GyroscopeIntegrator *m_gyroIntegrator;
     CalibrationPresetModel *m_calibrationPresets;
     CalibrationProfile *m_currentCalibration;
+    ColorGrade *m_colorGrade;
     KeyframeModel *m_keyframes;
     Exporter *m_exporter;
 

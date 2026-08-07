@@ -15,6 +15,7 @@ LensViewer::LensViewer(QQuickItem *parent)
     , m_projection(0)
     , m_frontHFlip(false), m_rearHFlip(false)
     , m_calibration(nullptr)
+    , m_colorGrade(nullptr)
     , m_imuOrientation(1.0f, 0.0f, 0.0f, 0.0f)
     , m_yTexture(nullptr)
     , m_uTexture(nullptr)
@@ -73,6 +74,34 @@ void LensViewer::setCalibration(CalibrationProfile *cal)
     update();
 }
 void LensViewer::setImuOrientation(const QQuaternion &q) { if (m_imuOrientation == q) return; m_imuOrientation = q; emit imuOrientationChanged(); update(); }
+
+void LensViewer::setColorGrade(ColorGrade *grade)
+{
+    if (m_colorGrade == grade)
+        return;
+    m_colorGrade = grade;
+    if (grade) {
+        connect(grade, &QObject::destroyed, this, [this]() { m_colorGrade = nullptr; update(); });
+        connect(grade, &ColorGrade::brightnessChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::contrastChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::saturationChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::popChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::brightLowsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::brightMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::brightHighsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::redLowsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::redMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::redHighsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::greenLowsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::greenMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::greenHighsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::blueLowsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::blueMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::blueHighsChanged, this, [this]() { update(); });
+    }
+    emit colorGradeChanged();
+    update();
+}
 
 QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
@@ -142,6 +171,20 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         material->setViewAspect(aspect);
         material->setFullRange(m_decoder->isFullRange());
         material->setTextures(m_yTexture, m_uTexture, m_vTexture);
+    }
+
+    if (m_colorGrade) {
+        material->setColorGrade(
+            (float)m_colorGrade->brightness(), (float)m_colorGrade->contrast(),
+            (float)m_colorGrade->saturation(), (float)m_colorGrade->pop(),
+            (float)m_colorGrade->brightLows(), (float)m_colorGrade->brightMids(),
+            (float)m_colorGrade->brightHighs(),
+            (float)m_colorGrade->redLows(), (float)m_colorGrade->redMids(),
+            (float)m_colorGrade->redHighs(),
+            (float)m_colorGrade->greenLows(), (float)m_colorGrade->greenMids(),
+            (float)m_colorGrade->greenHighs(),
+            (float)m_colorGrade->blueLows(), (float)m_colorGrade->blueMids(),
+            (float)m_colorGrade->blueHighs());
     }
 
     if (m_calibration) {

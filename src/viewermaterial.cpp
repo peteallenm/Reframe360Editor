@@ -28,8 +28,24 @@ struct ViewerUniforms {
     float frontRotation;  // offset 152
     float rearRotation;   // offset 156
     float imuMatrix[16];  // offset 160 (16-aligned)
+    float brightness;     // offset 224
+    float contrast;       // offset 228
+    float saturation;     // offset 232
+    float pop;            // offset 236
+    float brightLows;     // offset 240
+    float brightMids;     // offset 244
+    float brightHighs;    // offset 248
+    float redLows;        // offset 252
+    float redMids;        // offset 256
+    float redHighs;       // offset 260
+    float greenLows;      // offset 264
+    float greenMids;      // offset 268
+    float greenHighs;     // offset 272
+    float blueLows;       // offset 276
+    float blueMids;       // offset 280
+    float blueHighs;      // offset 284
 };
-static_assert(sizeof(ViewerUniforms) == 224, "ViewerUniforms must match std140 layout");
+static_assert(sizeof(ViewerUniforms) == 288, "ViewerUniforms must match std140 layout");
 
 ViewerMaterial::ViewerMaterial()
     : m_yTex(nullptr), m_uTex(nullptr), m_vTex(nullptr)
@@ -42,6 +58,11 @@ ViewerMaterial::ViewerMaterial()
     , m_rearCenterX(0.5f), m_rearCenterY(0.5f), m_rearRadius(0.5f), m_rearK1(0.0f), m_rearK2(0.0f)
     , m_rearRotation(180.0f), m_rearHFlip(false)
     , m_blendStart(0.9f)
+    , m_brightness(0.0f), m_contrast(1.0f), m_saturation(1.0f), m_pop(0.0f)
+    , m_brightLows(0.0f), m_brightMids(0.0f), m_brightHighs(0.0f)
+    , m_redLows(0.0f), m_redMids(0.0f), m_redHighs(0.0f)
+    , m_greenLows(0.0f), m_greenMids(0.0f), m_greenHighs(0.0f)
+    , m_blueLows(0.0f), m_blueMids(0.0f), m_blueHighs(0.0f)
 {
 }
 
@@ -85,6 +106,30 @@ void ViewerMaterial::setTextures(QSGTexture *y, QSGTexture *u, QSGTexture *v)
     m_vTex = v;
 }
 
+void ViewerMaterial::setColorGrade(float brightness, float contrast, float saturation, float pop,
+                                   float brightLows, float brightMids, float brightHighs,
+                                   float redLows, float redMids, float redHighs,
+                                   float greenLows, float greenMids, float greenHighs,
+                                   float blueLows, float blueMids, float blueHighs)
+{
+    m_brightness = brightness;
+    m_contrast = contrast;
+    m_saturation = saturation;
+    m_pop = pop;
+    m_brightLows = brightLows;
+    m_brightMids = brightMids;
+    m_brightHighs = brightHighs;
+    m_redLows = redLows;
+    m_redMids = redMids;
+    m_redHighs = redHighs;
+    m_greenLows = greenLows;
+    m_greenMids = greenMids;
+    m_greenHighs = greenHighs;
+    m_blueLows = blueLows;
+    m_blueMids = blueMids;
+    m_blueHighs = blueHighs;
+}
+
 QByteArray ViewerMaterial::compileUniformData() const
 {
     ViewerUniforms u;
@@ -111,6 +156,22 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.blendStart = m_blendStart;
     u.frontRotation = m_frontRotation;
     u.rearRotation = m_rearRotation;
+    u.brightness = m_brightness;
+    u.contrast = m_contrast;
+    u.saturation = m_saturation;
+    u.pop = m_pop;
+    u.brightLows = m_brightLows;
+    u.brightMids = m_brightMids;
+    u.brightHighs = m_brightHighs;
+    u.redLows = m_redLows;
+    u.redMids = m_redMids;
+    u.redHighs = m_redHighs;
+    u.greenLows = m_greenLows;
+    u.greenMids = m_greenMids;
+    u.greenHighs = m_greenHighs;
+    u.blueLows = m_blueLows;
+    u.blueMids = m_blueMids;
+    u.blueHighs = m_blueHighs;
 
     const float *mat = m_imuMatrix.constData();
     for (int i = 0; i < 16; i++) u.imuMatrix[i] = mat[i];

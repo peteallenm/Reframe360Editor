@@ -41,6 +41,17 @@ struct ExportFrameState {
 
     float blendStart = 0.9f;
 
+    // Colour grading (mirrors the ColorGrade properties and project.frag
+    // uniforms, so exported frames match the viewer).
+    float brightness = 0.0f;   // additive offset (-1..1)
+    float contrast = 1.0f;     // scale about 0.5 (0..2)
+    float saturation = 1.0f;   // mix with luma (0..2)
+    float pop = 0.0f;          // midtone contrast / clarity (-1..1)
+    float brightLows = 0.0f, brightMids = 0.0f, brightHighs = 0.0f;
+    float redLows = 0.0f, redMids = 0.0f, redHighs = 0.0f;
+    float greenLows = 0.0f, greenMids = 0.0f, greenHighs = 0.0f;
+    float blueLows = 0.0f, blueMids = 0.0f, blueHighs = 0.0f;
+
     // Same quaternion App::imuOrientation() reports; the exporter applies its
     // conjugate to the view ray, exactly like LensViewer does.
     QQuaternion imuOrientation{1.0f, 0.0f, 0.0f, 0.0f};

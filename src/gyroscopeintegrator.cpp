@@ -9,8 +9,12 @@ static const float kAccelKp    = 0.35f;   // proportional gain, rad/s per rad of
 static const float kGyroGate   = 60.0f;   // deg/s: below this the accel is trusted
 static const float kMagLow     = 0.9f;    // |accel| window (g) for "camera still"
 static const float kMagHigh    = 1.1f;
-// World frame convention: -Y is gravity-up (inverted display "up" axis).
-static const QVector3D kWorldUp(0.0f, -1.0f, 0.0f);
+// World frame convention: +Y is up (the display "up" axis).
+// For a level camera the accelerometer reads specific-force ≈ +Y in camera
+// axes (after the IMU→camera quaternion), so the seed rotationTo(accel, +Y)
+// produces identity — no rotation — which is what the shader expects for a
+// level, unrotated view.
+static const QVector3D kWorldUp(0.0f, 1.0f, 0.0f);
 
 GyroscopeIntegrator::GyroscopeIntegrator(QObject *parent)
     : QObject(parent)
@@ -66,22 +70,52 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
     // (~1 g, pointing away from gravity), which gives an absolute "which way is
     // up" reference that the gyro integration (which drifts) lacks. The raw
     // sensor accel is rotated into camera axes with the header's IMU->camera
-    // quaternion: q^-1 * accel == +Y (up) for a level camera. The world frame
-    // is fixed so that -Y is gravity-up (the display "up" axis), matching what
-    // LensViewer/the shader feed on. The first accelerometer reading seeds the
-    // orientation so the default 0/0/0 view is level, and a Mahony-style
-    // proportional correction continuously nudges the predicted gravity
-    // direction toward the measured one (gated to only trust the accel while
+    // quaternion: q^-1 * accel ≈ +Y (up) for a level camera. The world frame
+    // is fixed so that +Y is up, matching the display convention (the shader
+    // sees the conjugate of the integrator's quaternion, so identity orientation
+    // = level view). The first accelerometer reading seeds the orientation and
+    // a Mahony-style proportional correction continuously nudges the predicted
+    // up direction toward the measured one (gated to only trust the accel while
     // the camera is nearly still, so linear/centripetal acceleration during
     // fast motion does not corrupt the estimate).
     const QQuaternion qInv = imuToCamera.conjugated();
 
+    // Seed the orientation from the first camera-still sample (|accel| near 1g
+    // and |gyro| low). Scan up to 1 second of samples so that recordings which
+    // start while the camera is being picked up / moved don't corrupt the seed.
+    // The gate mirrors the Mahony correction gate: 0.9-1.1 g + gyro < 60 deg/s.
     QQuaternion current;
     {
-        QVector3D a0 = qInv.rotatedVector(samples[0].accel);
-        float m0 = a0.length();
-        if (m0 > 0.5f && m0 < 2.0f)
+        bool seeded = false;
+        const int seedWindow = qMin((int)m_sampleRate, samples.size()); // 1 s
+        for (int k = 0; k < seedWindow && !seeded; k++) {
+            QVector3D a0 = qInv.rotatedVector(samples[k].accel);
+            float m0 = a0.length();
+            if (m0 < kMagLow || m0 > kMagHigh)
+                continue;
+            // Also require the gyro to be low so we don't seed mid-motion.
+            float gRaw = samples[k].gyro.length();
+            if (gRaw >= kGyroGate)
+                continue;
             current = QQuaternion::rotationTo(a0 / m0, kWorldUp);
+            qDebug() << "IMU seed: sample" << k << "accel_cam"
+                     << a0.x() << a0.y() << a0.z() << "mag" << m0;
+            seeded = true;
+        }
+        if (!seeded) {
+            // Fallback: no still moment found in first second; use the first
+            // sample with any reasonable accel magnitude (avoids all-zeros).
+            for (int k = 0; k < qMin(10, samples.size()); k++) {
+                QVector3D a0 = qInv.rotatedVector(samples[k].accel);
+                float m0 = a0.length();
+                if (m0 > 0.3f) {
+                    current = QQuaternion::rotationTo(a0 / m0, kWorldUp);
+                    qDebug() << "IMU seed (fallback): sample" << k
+                             << "accel_cam" << a0.x() << a0.y() << a0.z();
+                    break;
+                }
+            }
+        }
     }
 
     for (int i = 0; i < samples.size(); i++) {
@@ -113,7 +147,25 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
             // reads specific force (up), so up is +accel in camera axes.
             QVector3D upPred = current.conjugated().rotatedVector(kWorldUp);
             QVector3D upMeas = accel / accelMag;
-            QVector3D err = QVector3D::crossProduct(upPred, upMeas); // rad
+
+            // cross(upPred, upMeas) is the body-frame axis to rotate around to
+            // align them. Its magnitude ≈ sin(angle) which is zero for both 0°
+            // (already aligned) and 180° (anti-parallel, singularity) errors.
+            // Handle the 180° case: pick any perpendicular axis and apply a
+            // finite correction kick to escape the singularity.
+            float dotPU = QVector3D::dotProduct(upPred, upMeas);
+            QVector3D err;
+            if (dotPU < -0.999f) {
+                // Nearly anti-parallel: kick toward alignment using a
+                // perpendicular axis (choose the axis least aligned with upPred
+                // to avoid a near-zero cross product here too).
+                QVector3D perp = (std::abs(upPred.x()) < 0.9f)
+                                 ? QVector3D(1, 0, 0) : QVector3D(0, 1, 0);
+                err = QVector3D::crossProduct(upPred, perp).normalized();
+            } else {
+                err = QVector3D::crossProduct(upPred, upMeas); // rad (≈ sin θ)
+            }
+
             // Add the correction to the body-frame rate (rad/s -> deg/s).
             const float radToDeg = 180.0f / M_PI;
             cx += err.x() * kAccelKp * radToDeg;

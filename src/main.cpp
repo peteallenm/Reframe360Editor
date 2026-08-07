@@ -40,6 +40,9 @@ int main(int argc, char *argv[])
     
     QCommandLineOption grabOption("grab", "Grab the window after a short delay and save to FILE", "file");
     parser.addOption(grabOption);
+
+    QCommandLineOption tabOption("tab", "Start on the given side-panel tab (0 View, 1 Colour Grading, 2 Calibration)", "index");
+    parser.addOption(tabOption);
     
     QCommandLineOption projectionOption("projection", "Rendering projection: 0 perspective, 1 equirectangular, 2 stereographic, 3 sportsview", "mode");
     parser.addOption(projectionOption);
@@ -106,6 +109,16 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(imuOption))
         appController.setImuStabilize(true);
+
+    if (parser.isSet(tabOption)) {
+        QTimer::singleShot(0, [&engine, tabIdx = parser.value(tabOption).toInt()]() {
+            QObject *root = engine.rootObjects().value(0);
+            if (root) {
+                if (QObject *tabs = root->findChild<QObject*>(QStringLiteral("panelTabs")))
+                    tabs->setProperty("currentIndex", qBound(0, tabIdx, 2));
+            }
+        });
+    }
 
     if (parser.isSet(grabOption)) {
         QString grabPath = parser.value(grabOption);

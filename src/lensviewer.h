@@ -7,6 +7,7 @@
 #include <QSGTexture>
 #include "videodecoder.h"
 #include "calibration.h"
+#include "colorgrade.h"
 
 class ViewerMaterial;
 
@@ -24,6 +25,7 @@ class LensViewer : public QQuickItem
     Q_PROPERTY(bool frontHFlip READ frontHFlip WRITE setFrontHFlip NOTIFY frontHFlipChanged)
     Q_PROPERTY(bool rearHFlip READ rearHFlip WRITE setRearHFlip NOTIFY rearHFlipChanged)
     Q_PROPERTY(CalibrationProfile* calibration READ calibration WRITE setCalibration NOTIFY calibrationChanged)
+    Q_PROPERTY(ColorGrade* colorGrade READ colorGrade WRITE setColorGrade NOTIFY colorGradeChanged)
     Q_PROPERTY(QQuaternion imuOrientation READ imuOrientation WRITE setImuOrientation NOTIFY imuOrientationChanged)
 
 public:
@@ -51,6 +53,8 @@ public:
     void setRearHFlip(bool v);
     CalibrationProfile* calibration() const { return m_calibration; }
     void setCalibration(CalibrationProfile *cal);
+    ColorGrade* colorGrade() const { return m_colorGrade; }
+    void setColorGrade(ColorGrade *grade);
     QQuaternion imuOrientation() const { return m_imuOrientation; }
     void setImuOrientation(const QQuaternion &q);
 
@@ -68,6 +72,7 @@ signals:
     void frontHFlipChanged();
     void rearHFlipChanged();
     void calibrationChanged();
+    void colorGradeChanged();
     void imuOrientationChanged();
 
 private:
@@ -77,6 +82,7 @@ private:
     int m_projection;
     bool m_frontHFlip, m_rearHFlip;
     CalibrationProfile *m_calibration;
+    ColorGrade *m_colorGrade;
     QQuaternion m_imuOrientation;
 
     QSGTexture *m_yTexture;

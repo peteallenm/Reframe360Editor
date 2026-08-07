@@ -32,6 +32,22 @@ layout(std140, binding = 0) uniform Uniforms {
     float u_frontRotation;
     float u_rearRotation;
     mat4 u_imuMatrix;
+    float u_brightness;
+    float u_contrast;
+    float u_saturation;
+    float u_pop;
+    float u_brightLows;
+    float u_brightMids;
+    float u_brightHighs;
+    float u_redLows;
+    float u_redMids;
+    float u_redHighs;
+    float u_greenLows;
+    float u_greenMids;
+    float u_greenHighs;
+    float u_blueLows;
+    float u_blueMids;
+    float u_blueHighs;
 };
 
 const float PI = 3.14159265359;
@@ -131,7 +147,9 @@ void main() {
     float r_front = theta / (PI * 0.5);
     float r_front_dist = r_front * (1.0 + u_frontK1 * r_front * r_front + u_frontK2 * r_front * r_front * r_front * r_front);
     vec2 frontOff = rotateVec2(vec2(cos(phi), sin(phi)), radians(u_frontRotation)) * r_front_dist * u_frontRadius;
-    if ((u_hflipFlags & 1) != 0)
+    // mod() instead of '&' so the shader also compiles under GLSL ES 1.00
+    // (GLES2), where bitwise operators need GL_EXT_gpu_shader4.
+    if (mod(float(u_hflipFlags), 2.0) != 0.0)
         frontOff.x = -frontOff.x;
     vec2 uv_front = u_frontCenter + frontOff;
 
@@ -139,7 +157,7 @@ void main() {
     float r_rear = theta_rear / (PI * 0.5);
     float r_rear_dist = r_rear * (1.0 + u_rearK1 * r_rear * r_rear + u_rearK2 * r_rear * r_rear * r_rear * r_rear);
     vec2 rearOff = rotateVec2(vec2(cos(phi), sin(phi)), radians(u_rearRotation)) * r_rear_dist * u_rearRadius;
-    if ((u_hflipFlags & 2) != 0)
+    if (mod(float(u_hflipFlags), 4.0) >= 2.0)
         rearOff.x = -rearOff.x;
     vec2 uv_rear = u_rearCenter + rearOff;
 
@@ -175,5 +193,34 @@ void main() {
         rgb = mix(rgb_f, rgb_r, blend);
     }
 
-    fragColor = vec4(rgb, qt_Opacity);
+    // ---- Colour grading ----
+    // 3-way corrector first (weights from the ungraded luma). Each slider
+    // shifts its channel in the shadows (wL), midtones (wM) or highlights
+    // (wH); the weights are luma-based so the same values match the C++
+    // exporter's per-pixel math exactly.
+    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    float wL = (1.0 - luma) * (1.0 - luma);
+    float wH = luma * luma;
+    float wM = 1.0 - wL - wH;
+
+    rgb += vec3(u_brightLows * wL + u_brightMids * wM + u_brightHighs * wH);
+    rgb.r += u_redLows * wL + u_redMids * wM + u_redHighs * wH;
+    rgb.g += u_greenLows * wL + u_greenMids * wM + u_greenHighs * wH;
+    rgb.b += u_blueLows * wL + u_blueMids * wM + u_blueHighs * wH;
+
+    // Pop: midtone contrast ("clarity") — pushes midtones toward black/white
+    // for extra depth while leaving pure black/white untouched.
+    luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    float midW = 1.0 - abs(luma * 2.0 - 1.0);
+    rgb += u_pop * 0.2 * midW * (rgb - 0.5);
+
+    // Saturation: mix each channel toward luma (1 = neutral, 0 = greyscale).
+    luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb = mix(vec3(luma), rgb, u_saturation);
+
+    // Contrast about 0.5 (1 = neutral) then brightness offset (0 = neutral).
+    rgb = (rgb - 0.5) * u_contrast + 0.5;
+    rgb += u_brightness;
+
+    fragColor = vec4(clamp(rgb, 0.0, 1.0), qt_Opacity);
 }

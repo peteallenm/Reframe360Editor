@@ -32,6 +32,7 @@ App::App(QObject *parent)
     , m_gyroIntegrator(new GyroscopeIntegrator(this))
     , m_calibrationPresets(new CalibrationPresetModel(this))
     , m_currentCalibration(new CalibrationProfile(this))
+    , m_colorGrade(new ColorGrade(this))
     , m_keyframes(new KeyframeModel(this))
     , m_exporter(new Exporter(this))
     , m_isPlaying(false)
@@ -87,12 +88,33 @@ App::App(QObject *parent)
     if (defaultIdx >= 0)
         m_calibrationPresets->loadPreset(defaultIdx, m_currentCalibration);
 
-    // Restore the saved stabilization/gyro settings, then keep them persisted
-    // automatically whenever the user changes them.
+    // Restore the saved view/settings, then keep them persisted automatically
+    // whenever the user changes them.
     loadSettings();
     connect(this, &App::imuStabilizeChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSmoothingChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSyncOffsetChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::projectionChanged, this, [this]() { saveSettings(); });
+
+    // Colour grade changes persist automatically (same convention as the
+    // projection / IMU settings).
+    auto saveGrade = [this]() { saveSettings(); };
+    connect(m_colorGrade, &ColorGrade::brightnessChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::contrastChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::saturationChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::popChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::brightLowsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::brightMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::brightHighsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::redLowsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::redMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::redHighsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::greenLowsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::greenMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::greenHighsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::blueLowsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::blueMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::blueHighsChanged, this, saveGrade);
 }
 
 App::~App()
@@ -128,11 +150,27 @@ void App::setVideoPath(const QString &path)
         applyKeyframeInterpolation();
 
         QString imuPath = path + ".imu";
+        if (!QFileInfo::exists(imuPath)) {
+            // Thumbnail videos (e.g. YIVR_0807_360_thm.MP4) rarely have their
+            // own .imu sidecar. Try the parent full-resolution video's .imu
+            // file by stripping a trailing "_thm" before the extension.
+            QFileInfo fi(path);
+            QString base = fi.completeBaseName(); // e.g. "YIVR_0807_360_thm"
+            if (base.endsWith(QStringLiteral("_thm"), Qt::CaseInsensitive)) {
+                base.chop(4); // remove "_thm"
+                QString parentImu = fi.absolutePath() + QLatin1Char('/')
+                                  + base + QLatin1Char('.') + fi.suffix()
+                                  + QStringLiteral(".imu");
+                if (QFileInfo::exists(parentImu))
+                    imuPath = parentImu;
+            }
+        }
         if (QFileInfo::exists(imuPath)) {
             m_imuParser->loadFile(imuPath);
-            // integrate() now fuses the accelerometer with the gyro, so the
-            // orientations are already gravity-aligned (+Y = up); no separate
-            // static per-clip gravity alignment is needed any more.
+            // integrate() seeds the orientation from the accelerometer (so the
+            // default view is level, +Y = up) and then tracks the camera with
+            // the gyro, so the orientations are already gravity-aligned; no
+            // separate static per-clip gravity alignment is needed.
             m_gyroIntegrator->integrate(m_imuParser->samples(),
                                         m_imuParser->imuSampleRate(),
                                         m_imuParser->initialQuaternion());
@@ -597,6 +635,24 @@ ExportSnapshot App::buildExportSnapshot() const
         s.base.rearHFlip = m_currentCalibration->rearHFlip();
         s.base.blendStart = (float)m_currentCalibration->blendStart();
     }
+    if (m_colorGrade) {
+        s.base.brightness = (float)m_colorGrade->brightness();
+        s.base.contrast = (float)m_colorGrade->contrast();
+        s.base.saturation = (float)m_colorGrade->saturation();
+        s.base.pop = (float)m_colorGrade->pop();
+        s.base.brightLows = (float)m_colorGrade->brightLows();
+        s.base.brightMids = (float)m_colorGrade->brightMids();
+        s.base.brightHighs = (float)m_colorGrade->brightHighs();
+        s.base.redLows = (float)m_colorGrade->redLows();
+        s.base.redMids = (float)m_colorGrade->redMids();
+        s.base.redHighs = (float)m_colorGrade->redHighs();
+        s.base.greenLows = (float)m_colorGrade->greenLows();
+        s.base.greenMids = (float)m_colorGrade->greenMids();
+        s.base.greenHighs = (float)m_colorGrade->greenHighs();
+        s.base.blueLows = (float)m_colorGrade->blueLows();
+        s.base.blueMids = (float)m_colorGrade->blueMids();
+        s.base.blueHighs = (float)m_colorGrade->blueHighs();
+    }
     s.keyframes = m_keyframes->keyframes();
     s.imuStabilize = m_imuStabilize;
     if (m_gyroIntegrator) {
@@ -613,6 +669,31 @@ void App::loadSettings()
     setImuStabilize(s.value(QStringLiteral("imu/stabilize"), m_imuStabilize).toBool());
     setImuSmoothing(s.value(QStringLiteral("imu/smoothing"), m_imuSmoothing).toDouble());
     setImuSyncOffset(s.value(QStringLiteral("imu/syncOffset"), m_imuSyncOffset).toDouble());
+    // Clamp to the valid projection ids so a stale/corrupt settings value can
+    // never put the QML combo box out of range.
+    setProjection(qBound(0, s.value(QStringLiteral("projection"), m_projection).toInt(), 3));
+
+    if (m_colorGrade) {
+        auto load = [this, &s](const char *key, double def, void (ColorGrade::*setter)(double)) {
+            (m_colorGrade->*setter)(s.value(QLatin1String(key), def).toDouble());
+        };
+        load("grade/brightness", m_colorGrade->brightness(), &ColorGrade::setBrightness);
+        load("grade/contrast", m_colorGrade->contrast(), &ColorGrade::setContrast);
+        load("grade/saturation", m_colorGrade->saturation(), &ColorGrade::setSaturation);
+        load("grade/pop", m_colorGrade->pop(), &ColorGrade::setPop);
+        load("grade/brightLows", m_colorGrade->brightLows(), &ColorGrade::setBrightLows);
+        load("grade/brightMids", m_colorGrade->brightMids(), &ColorGrade::setBrightMids);
+        load("grade/brightHighs", m_colorGrade->brightHighs(), &ColorGrade::setBrightHighs);
+        load("grade/redLows", m_colorGrade->redLows(), &ColorGrade::setRedLows);
+        load("grade/redMids", m_colorGrade->redMids(), &ColorGrade::setRedMids);
+        load("grade/redHighs", m_colorGrade->redHighs(), &ColorGrade::setRedHighs);
+        load("grade/greenLows", m_colorGrade->greenLows(), &ColorGrade::setGreenLows);
+        load("grade/greenMids", m_colorGrade->greenMids(), &ColorGrade::setGreenMids);
+        load("grade/greenHighs", m_colorGrade->greenHighs(), &ColorGrade::setGreenHighs);
+        load("grade/blueLows", m_colorGrade->blueLows(), &ColorGrade::setBlueLows);
+        load("grade/blueMids", m_colorGrade->blueMids(), &ColorGrade::setBlueMids);
+        load("grade/blueHighs", m_colorGrade->blueHighs(), &ColorGrade::setBlueHighs);
+    }
 }
 
 void App::saveSettings() const
@@ -621,6 +702,26 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("imu/stabilize"), m_imuStabilize);
     s.setValue(QStringLiteral("imu/smoothing"), m_imuSmoothing);
     s.setValue(QStringLiteral("imu/syncOffset"), m_imuSyncOffset);
+    s.setValue(QStringLiteral("projection"), m_projection);
+
+    if (m_colorGrade) {
+        s.setValue(QStringLiteral("grade/brightness"), m_colorGrade->brightness());
+        s.setValue(QStringLiteral("grade/contrast"), m_colorGrade->contrast());
+        s.setValue(QStringLiteral("grade/saturation"), m_colorGrade->saturation());
+        s.setValue(QStringLiteral("grade/pop"), m_colorGrade->pop());
+        s.setValue(QStringLiteral("grade/brightLows"), m_colorGrade->brightLows());
+        s.setValue(QStringLiteral("grade/brightMids"), m_colorGrade->brightMids());
+        s.setValue(QStringLiteral("grade/brightHighs"), m_colorGrade->brightHighs());
+        s.setValue(QStringLiteral("grade/redLows"), m_colorGrade->redLows());
+        s.setValue(QStringLiteral("grade/redMids"), m_colorGrade->redMids());
+        s.setValue(QStringLiteral("grade/redHighs"), m_colorGrade->redHighs());
+        s.setValue(QStringLiteral("grade/greenLows"), m_colorGrade->greenLows());
+        s.setValue(QStringLiteral("grade/greenMids"), m_colorGrade->greenMids());
+        s.setValue(QStringLiteral("grade/greenHighs"), m_colorGrade->greenHighs());
+        s.setValue(QStringLiteral("grade/blueLows"), m_colorGrade->blueLows());
+        s.setValue(QStringLiteral("grade/blueMids"), m_colorGrade->blueMids());
+        s.setValue(QStringLiteral("grade/blueHighs"), m_colorGrade->blueHighs());
+    }
 }
 
 void App::saveKeyframes()
