@@ -52,6 +52,22 @@ void KeyframeModel::addKeyframe(double time, double yaw, double pitch, double ro
     emit keyframesChanged();
 }
 
+void KeyframeModel::setTrimIn(double t)
+{
+    if (qFuzzyCompare(m_trimIn, t))
+        return;
+    m_trimIn = t;
+    emit trimChanged();
+}
+
+void KeyframeModel::setTrimOut(double t)
+{
+    if (qFuzzyCompare(m_trimOut, t))
+        return;
+    m_trimOut = t;
+    emit trimChanged();
+}
+
 void KeyframeModel::removeKeyframe(int i)
 {
     if (i < 0 || i >= (int)m_keyframes.size()) return;
@@ -154,7 +170,12 @@ void KeyframeModel::saveToFile(const QString &path) const
             {"roll", k.roll}, {"fov", k.fov},
         });
     }
-    QJsonObject root{{"version", 1}, {"keyframes", arr}};
+    QJsonObject root{
+        {"version", 2},
+        {"in", m_trimIn},        // export trim start marker
+        {"out", m_trimOut},      // export trim end marker
+        {"keyframes", arr},
+    };
 
     QFile f(path);
     if (f.open(QIODevice::WriteOnly))
@@ -164,13 +185,16 @@ void KeyframeModel::saveToFile(const QString &path) const
 void KeyframeModel::loadFromFile(const QString &path)
 {
     QVector<Keyframe> loaded;
+    double trimIn = 0.0;
+    double trimOut = 0.0;
 
     QFile f(path);
     if (f.open(QIODevice::ReadOnly)) {
         QJsonParseError err;
         QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
         if (err.error == QJsonParseError::NoError && doc.isObject()) {
-            const QJsonArray arr = doc.object().value("keyframes").toArray();
+            const QJsonObject root = doc.object();
+            const QJsonArray arr = root.value("keyframes").toArray();
             for (const QJsonValue &v : arr) {
                 const QJsonObject o = v.toObject();
                 Keyframe k;
@@ -181,6 +205,9 @@ void KeyframeModel::loadFromFile(const QString &path)
                 k.fov   = o.value("fov").toDouble(90.0);
                 loaded.append(k);
             }
+            // Optional export trim markers (absent in v1 sidecars -> 0/0).
+            trimIn  = root.value("in").toDouble(0.0);
+            trimOut = root.value("out").toDouble(0.0);
         }
     }
     std::sort(loaded.begin(), loaded.end());
@@ -196,9 +223,13 @@ void KeyframeModel::loadFromFile(const QString &path)
         loaded.resize(write);
     }
 
-    // No-op load (same contents, or a missing file with an empty model): skip
-    // the model reset so opening videos doesn't churn the timeline.
-    if (loaded == m_keyframes)
+    // No-op load (same contents + trim, or a missing file with an empty
+    // model): skip the model reset so opening videos doesn't churn the
+    // timeline. The trim check matters too: two videos can share identical
+    // keyframes but different in/out markers.
+    if (loaded == m_keyframes
+        && qFuzzyCompare(trimIn, m_trimIn)
+        && qFuzzyCompare(trimOut, m_trimOut))
         return;
 
     // Replace the model contents (empty if the file is missing/invalid) so
@@ -206,4 +237,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     beginResetModel();
     m_keyframes = loaded;
     endResetModel();
+    m_trimIn = trimIn;
+    m_trimOut = trimOut;
+    emit trimChanged();
 }

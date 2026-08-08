@@ -47,6 +47,100 @@ Pane {
                 }
             }
 
+            // ---- Export trim range (in/out markers) ----
+            // A shaded band with two draggable handles at the top of the
+            // timeline marks the section that will be exported. The handles
+            // are positioned by Binding so external changes (loading a new
+            // clip, restoring the sidecar's in/out markers) always re-sync
+            // them; dragging writes back to app.exportStart/exportEnd, which
+            // are persisted in the per-video keyframe sidecar.
+            Item {
+                id: trimStrip
+                anchors.top: parent.top
+                anchors.topMargin: 2
+                height: 12
+                anchors.left: parent.left
+                anchors.right: parent.right
+                visible: app.videoPath !== ""
+
+                Rectangle {
+                    id: rangeShade
+                    y: 1
+                    height: 6
+                    radius: 2
+                    color: Material.accent
+                    opacity: 0.35
+                    Binding {
+                        target: rangeShade
+                        property: "x"
+                        value: trimStrip.width * (app.exportStart / Math.max(app.duration, 0.001))
+                    }
+                    Binding {
+                        target: rangeShade
+                        property: "width"
+                        value: Math.max(0, trimStrip.width * ((app.exportEnd - app.exportStart) / Math.max(app.duration, 0.001)))
+                    }
+                }
+
+                Rectangle {
+                    id: inHandle
+                    objectName: "trimInHandle"
+                    width: 7
+                    height: 12
+                    radius: 2
+                    color: Material.accent
+                    border.color: "white"
+                    border.width: 1
+                    onXChanged: {
+                        if (dragIn.active)
+                            app.exportStart = Math.max(0, Math.min(app.exportEnd, (x + 3) / trimStrip.width * app.duration))
+                    }
+                    Binding {
+                        target: inHandle
+                        property: "x"
+                        value: trimStrip.width * (app.exportStart / Math.max(app.duration, 0.001)) - 3
+                    }
+                    MouseArea {
+                        id: dragIn
+                        anchors.fill: parent
+                        drag.target: parent
+                        drag.axis: Drag.XAxis
+                        drag.minimumX: -3
+                        drag.maximumX: trimStrip.width - 4
+                        cursorShape: Qt.SizeHorCursor
+                    }
+                }
+
+                Rectangle {
+                    id: outHandle
+                    objectName: "trimOutHandle"
+                    width: 7
+                    height: 12
+                    radius: 2
+                    color: Material.accent
+                    border.color: "white"
+                    border.width: 1
+                    onXChanged: {
+                        if (dragOut.active)
+                            app.exportEnd = Math.max(app.exportStart, Math.min(app.duration, (x + 3) / trimStrip.width * app.duration))
+                    }
+                    Binding {
+                        target: outHandle
+                        property: "x"
+                        value: trimStrip.width * (app.exportEnd / Math.max(app.duration, 0.001)) - 3
+                    }
+                    MouseArea {
+                        id: dragOut
+                        anchors.fill: parent
+                        drag.target: parent
+                        drag.axis: Drag.XAxis
+                        drag.minimumX: -3
+                        drag.maximumX: trimStrip.width - 4
+                        cursorShape: Qt.SizeHorCursor
+                    }
+                }
+            }
+
             // Keyframe markers
             Repeater {
                 model: app.keyframes
@@ -127,12 +221,14 @@ Pane {
 
         function openFor(idx) {
             editIndex = idx
-            var kf = app.keyframes.data(app.keyframes.index(idx, 0), 0x0101)  // TimeRole
-            timeField.text = (kfTime !== undefined ? kfTime : 0).toFixed(2)
-            yawField.text = (kfYaw !== undefined ? kfYaw : 0).toFixed(1)
-            pitchField.text = (kfPitch !== undefined ? kfPitch : 0).toFixed(1)
-            rollField.text = (kfRoll !== undefined ? kfRoll : 0).toFixed(1)
-            fovField.text = (kfFov !== undefined ? kfFov : 90).toFixed(0)
+            // Fetch each value by role: the role context properties (kfTime,
+            // kfYaw, ...) only exist inside the Repeater delegate scope, not
+            // here, so read them through the model's data().
+            timeField.text = app.keyframes.data(app.keyframes.index(idx, 0), 0x0101).toFixed(2)   // TimeRole
+            yawField.text = app.keyframes.data(app.keyframes.index(idx, 0), 0x0102).toFixed(1)     // YawRole
+            pitchField.text = app.keyframes.data(app.keyframes.index(idx, 0), 0x0103).toFixed(1)   // PitchRole
+            rollField.text = app.keyframes.data(app.keyframes.index(idx, 0), 0x0104).toFixed(1)    // RollRole
+            fovField.text = app.keyframes.data(app.keyframes.index(idx, 0), 0x0105).toFixed(0)     // FovRole
             open()
         }
 

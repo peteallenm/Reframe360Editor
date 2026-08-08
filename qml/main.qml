@@ -178,7 +178,7 @@ ApplicationWindow {
         defaultSuffix: "mp4"
         nameFilters: ["MP4 video (*.mp4)"]
         onAccepted: {
-            app.exportVideo(ensureSuffix(selectedFile.toString().replace("file://", ""), "mp4"), 1920, 1080, 30.0, 0, app.duration)
+            app.exportVideo(ensureSuffix(selectedFile.toString().replace("file://", ""), "mp4"), 1920, 1080, 30.0, app.exportStart, app.exportEnd)
         }
     }
 }

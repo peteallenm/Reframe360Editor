@@ -14,11 +14,14 @@ public:
 
     // Integrate gyro+accel samples into a gravity-aligned orientation chain.
     // The accelerometer is fused (Mahony-style complementary filter) while the
-    // camera is nearly still, so the world frame is fixed with +Y = up
-    // (the display "up" axis). For a level camera the raw accel rotated into
-    // camera axes by imuToCamera^-1 ≈ +Y, so the seed quaternion is identity
-    // and the shader (which receives the conjugate) shows a level view.
-    // imuToCamera is the header's IMU->camera quaternion (config[4..7]).
+    // camera is nearly still. The integration runs in the camera frame, where
+    // the level-camera accel rotated by imuToCamera^-1 ≈ +Y, so the seed is
+    // near-identity and the gyro/Mahony correction share one frame (no axis
+    // flip). Each stored orientation is post-multiplied by a constant 180° roll
+    // about the forward axis (kFlipRoll) to un-flip the YI camera's inherently
+    // 180°-flipped fisheye video for display; the shader applies the conjugate,
+    // so it samples kFlipRoll * Q_cam^-1 * ray. imuToCamera is the header's
+    // IMU->camera quaternion (config[4..7]).
     void integrate(const QVector<ImuSample> &samples, double sampleRate,
                    const QQuaternion &imuToCamera);
     QQuaternion orientationAtTime(double time) const;

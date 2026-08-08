@@ -5,6 +5,8 @@
 #include <QString>
 #include <QUrl>
 #include <QQuaternion>
+
+class QTimer;
 #include "videodecoder.h"
 #include "imuparser.h"
 #include "gyroscopeintegrator.h"
@@ -77,6 +79,8 @@ class App : public QObject
     Q_PROPERTY(bool exportRunning READ exportRunning NOTIFY exportRunningChanged)
     Q_PROPERTY(double exportProgress READ exportProgress NOTIFY exportProgressChanged)
     Q_PROPERTY(QString exportStatus READ exportStatus NOTIFY exportStatusChanged)
+    Q_PROPERTY(double exportStart READ exportStart WRITE setExportStart NOTIFY exportStartChanged)
+    Q_PROPERTY(double exportEnd READ exportEnd WRITE setExportEnd NOTIFY exportEndChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -137,6 +141,10 @@ public:
     bool exportRunning() const { return m_exportRunning; }
     double exportProgress() const { return m_exportProgress; }
     QString exportStatus() const { return m_exportStatus; }
+    double exportStart() const { return m_exportStart; }
+    void setExportStart(double time);
+    double exportEnd() const { return m_exportEnd; }
+    void setExportEnd(double time);
 
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
     Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime);
@@ -184,6 +192,8 @@ signals:
     void exportRunningChanged();
     void exportProgressChanged();
     void exportStatusChanged();
+    void exportStartChanged();
+    void exportEndChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -194,10 +204,13 @@ private:
     ColorGrade *m_colorGrade;
     KeyframeModel *m_keyframes;
     Exporter *m_exporter;
+    QTimer *m_trimSaveTimer;  // coalesces sidecar writes while dragging trim
 
     bool m_exportRunning;
     double m_exportProgress;
     QString m_exportStatus;
+    double m_exportStart;
+    double m_exportEnd;
 
     QString m_videoPath;
     bool m_isPlaying;

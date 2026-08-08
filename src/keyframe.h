@@ -37,6 +37,14 @@ public:
     Q_INVOKABLE void removeKeyframe(int index);
     Q_INVOKABLE void updateKeyframe(int index, double time, double yaw, double pitch, double roll, double fov);
 
+    // Export trim range (in/out markers). Stored in the same sidecar file as
+    // the keyframes so each video remembers where its exported range starts
+    // and ends, independent of any keyframes.
+    Q_INVOKABLE double trimIn() const { return m_trimIn; }
+    Q_INVOKABLE double trimOut() const { return m_trimOut; }
+    Q_INVOKABLE void setTrimIn(double t);
+    Q_INVOKABLE void setTrimOut(double t);
+
     Keyframe keyframeAt(int index) const;
     int count() const { return (int)m_keyframes.size(); }
 
@@ -62,10 +70,14 @@ signals:
     // Emitted after any keyframe is added, removed or updated, so callers can
     // persist the (possibly new) state.
     void keyframesChanged();
+    // Emitted after the export trim in/out markers change.
+    void trimChanged();
 
 private:
     void sortAndNotify();
     QVector<Keyframe> m_keyframes;
+    double m_trimIn = 0.0;
+    double m_trimOut = 0.0;
 };
 
 #endif // KEYFRAME_H

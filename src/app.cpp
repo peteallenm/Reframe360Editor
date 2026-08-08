@@ -35,6 +35,7 @@ App::App(QObject *parent)
     , m_colorGrade(new ColorGrade(this))
     , m_keyframes(new KeyframeModel(this))
     , m_exporter(new Exporter(this))
+    , m_trimSaveTimer(nullptr)
     , m_isPlaying(false)
     , m_currentTime(0.0)
     , m_yaw(0.0)
@@ -50,7 +51,25 @@ App::App(QObject *parent)
     , m_exportRunning(false)
     , m_exportProgress(0.0)
     , m_exportStatus()
+    , m_exportStart(0.0)
+    , m_exportEnd(0.0)
 {
+    connect(m_decoder, &VideoDecoder::durationChanged, this, [this]() {
+        // Keep the export trim range inside the newly known clip length. Skip
+        // while the low-res preview thumbnail is loaded: its shorter duration
+        // would clamp the trim end (and then persist the wrong marker), while
+        // exports always read the full-resolution m_videoPath.
+        if (m_usePreview)
+            return;
+        const double dur = m_decoder->duration();
+        if (dur > 0.0) {
+            if (m_exportEnd <= 0.0 || m_exportEnd > dur)
+                m_exportEnd = dur;
+            m_exportStart = qBound(0.0, m_exportStart, m_exportEnd);
+            emit exportStartChanged();
+            emit exportEndChanged();
+        }
+    });
     connect(m_decoder, &VideoDecoder::durationChanged, this, &App::durationChanged);
     connect(m_decoder, &VideoDecoder::currentTimeChanged, this, [this]() {
         m_currentTime = m_decoder->currentTime();
@@ -64,6 +83,23 @@ App::App(QObject *parent)
     // Keep the per-video keyframe sidecar file in sync whenever the user adds,
     // edits or deletes keyframes.
     connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::saveKeyframes);
+
+    // The export in/out markers live in the same sidecar file, so persist them
+    // too. The timeline handles drag continuously, so coalesce the writes
+    // rather than rewriting the file on every pixel of movement.
+    m_trimSaveTimer = new QTimer(this);
+    m_trimSaveTimer->setSingleShot(true);
+    m_trimSaveTimer->setInterval(300);
+    // Only write the sidecar when the trim actually moved away from the state
+    // that was loaded from it — otherwise merely opening a video would
+    // rewrite (and reformat/version-bump) the file on every open.
+    connect(m_trimSaveTimer, &QTimer::timeout, this, [this]() {
+        if (!qFuzzyCompare(m_exportStart, m_keyframes->trimIn())
+            || !qFuzzyCompare(m_exportEnd, m_keyframes->trimOut()))
+            saveKeyframes();
+    });
+    connect(this, &App::exportStartChanged, this, [this]() { m_trimSaveTimer->start(); });
+    connect(this, &App::exportEndChanged, this, [this]() { m_trimSaveTimer->start(); });
 
     // Surface export progress / completion to the UI.
     connect(m_exporter, &Exporter::exportProgress, this, [this](double p) {
@@ -136,10 +172,21 @@ void App::setVideoPath(const QString &path)
     emit videoPathChanged();
     emit usePreviewThumbnailChanged();
 
+    // A new clip resets the export trim range; durationChanged will set the
+    // end point once the decoder reports the clip length.
+    m_exportStart = 0.0;
+    m_exportEnd = 0.0;
+    emit exportStartChanged();
+    emit exportEndChanged();
+
     if (!path.isEmpty()) {
-        // Restore this video's saved keyframes (or clear the model if the
-        // video has no sidecar yet).
+        // Restore this video's saved keyframes and export in/out markers (or
+        // clear both when the video has no sidecar yet).
         m_keyframes->loadFromFile(keyframesPathFor(path));
+        m_exportStart = m_keyframes->trimIn();
+        m_exportEnd = m_keyframes->trimOut();
+        emit exportStartChanged();
+        emit exportEndChanged();
 
         m_decoder->loadVideo(path);
 
@@ -589,6 +636,28 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
                             [snap](double t) { return snap.stateAt(t); });
 }
 
+void App::setExportStart(double time)
+{
+    const double dur = m_decoder ? m_decoder->duration() : 0.0;
+    double hi = (dur > 0.0) ? qMin(m_exportEnd, dur) : m_exportEnd;
+    time = qBound(0.0, time, hi);
+    if (qFuzzyCompare(m_exportStart, time))
+        return;
+    m_exportStart = time;
+    emit exportStartChanged();
+}
+
+void App::setExportEnd(double time)
+{
+    const double dur = m_decoder ? m_decoder->duration() : 0.0;
+    double hi = (dur > 0.0) ? dur : time;
+    time = qBound(m_exportStart, time, hi);
+    if (qFuzzyCompare(m_exportEnd, time))
+        return;
+    m_exportEnd = time;
+    emit exportEndChanged();
+}
+
 void App::setExportRunning(bool running)
 {
     if (m_exportRunning == running)
@@ -728,6 +797,10 @@ void App::saveKeyframes()
 {
     if (m_videoPath.isEmpty())
         return;
+    // Sync the live trim range into the model so the sidecar always records
+    // the current in/out markers (the model keeps them only as loaded state).
+    m_keyframes->setTrimIn(m_exportStart);
+    m_keyframes->setTrimOut(m_exportEnd);
     m_keyframes->saveToFile(keyframesPathFor(m_videoPath));
 }
 
