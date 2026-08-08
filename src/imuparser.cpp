@@ -73,15 +73,17 @@ bool ImuParser::loadFile(const QString &path)
     const int16_t *rec = reinterpret_cast<const int16_t*>(data.constData() + dataOffset);
 
     // 1) Locate the start of the real sensor cycle. Files begin with a
-    //    variable-length pre-roll region (up to ~2000 records in real camera
-    //    files, 0-350 in the hand-made test files) of counter-less records
-    //    shaped [0,0,X,Y] and/or [X,Y,0,0]. The real t2/t3/t1 cycle is the
-    //    first place where the 32-bit counter in the t2 position (fields
-    //    [2]/[3]) increases monotonically (~2500 counts per sample).
+    //    variable-length pre-roll region (a few hundred to >10,000 records in
+    //    real camera files, 0-350 in the hand-made test files) of counter-less
+    //    records shaped [0,0,X,Y] and/or [X,Y,0,0]. The real t2/t3/t1 cycle is
+    //    the first place where the 32-bit counter in the t2 position (fields
+    //    [2]/[3]) increases monotonically (~2500 counts per sample). The scan
+    //    covers the whole file because the pre-roll length is unbounded in
+    //    practice (a real YIVR_0847 file had a 10452-record pre-roll).
     const int kNeed = 50;             // consecutive monotonic counters
     const uint32_t kMaxDelta = 20000; // sane per-sample counter step
     int t2 = -1;
-    const int scanMax = qMin(n - 3 * (kNeed - 1), 5000);
+    const int scanMax = n - 3 * (kNeed - 1); // scan whole file (early-exits at first cycle)
     for (int s = 0; s < scanMax && t2 < 0; s++) {
         uint32_t prev = 0;
         bool first = true, ok = true;
