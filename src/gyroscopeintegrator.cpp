@@ -57,7 +57,7 @@ QVector3D GyroscopeIntegrator::computeGyroBias(const QVector<ImuSample> &samples
 }
 
 void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sampleRate,
-                                    const QQuaternion &imuToCamera)
+                                    const QQuaternion &imuToCamera, float smoothing)
 {
     m_sampleRate = sampleRate;
     m_orientations.clear();
@@ -161,9 +161,21 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         QVector3D accel = qInv.rotatedVector(samples[i].accel);  // camera axes
         float accelMag = accel.length();
         float spinRate = std::sqrt(cx * cx + cy * cy + cz * cz);
-        bool still = (accelMag > kMagLow && accelMag < kMagHigh
-                      && spinRate < kGyroGate);
-        if (still) {
+        // Soft/adaptive gating instead of a hard on/off cutoff: the accel is
+        // trusted fully below kGyroGate, fades to zero across the next
+        // kGyroGate degrees/s, and is disabled above that. This avoids the
+        // discontinuity a hard threshold causes when a quick roll decelerates
+        // through the gate (the correction popping in/out every sample).
+        // The magnitude window (0.9-1.1 g) still rejects linear/centripetal
+        // acceleration.
+        float gateFactor = 0.0f;
+        if (accelMag > kMagLow && accelMag < kMagHigh) {
+            if (spinRate < kGyroGate)
+                gateFactor = 1.0f;
+            else if (spinRate < 2.0f * kGyroGate)
+                gateFactor = 1.0f - (spinRate - kGyroGate) / kGyroGate;
+        }
+        if (gateFactor > 0.0f) {
             // Predicted gravity-up in the body frame vs measured. The accel
             // reads specific force (up), so up is +accel in camera axes.
             QVector3D upPred = current.conjugated().rotatedVector(kWorldUp);
@@ -187,11 +199,12 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
                 err = QVector3D::crossProduct(upPred, upMeas); // rad (≈ sin θ)
             }
 
-            // Add the correction to the body-frame rate (rad/s -> deg/s).
+            // Add the (scaled) correction to the body-frame rate (rad/s -> deg/s).
             const float radToDeg = 180.0f / M_PI;
-            cx += err.x() * kAccelKp * radToDeg;
-            cy += err.y() * kAccelKp * radToDeg;
-            cz += err.z() * kAccelKp * radToDeg;
+            const float gain = kAccelKp * gateFactor * radToDeg;
+            cx += err.x() * gain;
+            cy += err.y() * gain;
+            cz += err.z() * gain;
         }
 
         float gxRad = qDegreesToRadians(cx);
@@ -207,7 +220,50 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         current = (current * delta).normalized();
     }
 
+    if (smoothing > 0.0f)
+        smoothOrientations(smoothing);
+
     qDebug() << "Gyro integrator:" << m_orientations.size() << "keyframes";
+}
+
+// Centered sliding-window quaternion average (Markley style: sum the quaternion
+// vectors after sign-flipping to the nearest neighbor, then normalize). A
+// centered window introduces no phase lag (unlike exponential smoothing), which
+// keeps quick movements responsive while averaging out high-frequency jitter
+// from gyro noise. Window size scales with `smoothing` (0..1) up to a maximum
+// of 40 samples (100 ms at 400 Hz).
+void GyroscopeIntegrator::smoothOrientations(float smoothing)
+{
+    const int count = m_orientations.size();
+    if (count < 3)
+        return;
+
+    const int maxHalf = 20;                    // max window half-width (samples)
+    const int half = qMax(1, qMin(maxHalf, (int)(smoothing * maxHalf)));
+
+    QVector<QQuaternion> smoothed;
+    smoothed.reserve(count);
+
+    for (int i = 0; i < count; i++) {
+        const int lo = qMax(0, i - half);
+        const int hi = qMin(count - 1, i + half);
+
+        // Sum the quaternion vectors, flipping sign so each is within 180° of
+        // the accumulated direction (handles the q/-q double cover).
+        float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
+        const QQuaternion &ref = m_orientations[lo];
+        for (int j = lo; j <= hi; j++) {
+            QQuaternion q = m_orientations[j];
+            if (QQuaternion::dotProduct(q, ref) < 0.0f)
+                q = QQuaternion(-q.scalar(), -q.x(), -q.y(), -q.z());
+            x += q.x(); y += q.y(); z += q.z(); w += q.scalar();
+        }
+        QQuaternion avg(w, x, y, z);
+        avg.normalize();
+        smoothed.append(avg);
+    }
+
+    m_orientations = smoothed;
 }
 
 QQuaternion GyroscopeIntegrator::orientationAtTime(double time) const

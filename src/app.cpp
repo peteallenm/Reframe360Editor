@@ -216,7 +216,8 @@ void App::setVideoPath(const QString &path)
             // separate static per-clip gravity alignment is needed.
             m_gyroIntegrator->integrate(m_imuParser->samples(),
                                         m_imuParser->imuSampleRate(),
-                                        m_imuParser->initialQuaternion());
+                                        m_imuParser->initialQuaternion(),
+                                        (float)m_imuSmoothing);
         }
 
         emit videoLoaded();

@@ -22,8 +22,13 @@ public:
     // 180°-flipped fisheye video for display; the shader applies the conjugate,
     // so it samples kFlipRoll * Q_cam^-1 * ray. imuToCamera is the header's
     // IMU->camera quaternion (config[4..7]).
+    //
+    // smoothing (0.0-1.0) controls a centered sliding-window quaternion average
+    // applied to the stored orientations: 0 = none (raw), 1 = heavy smoothing.
+    // A centered window avoids the lag of an exponential filter, which keeps
+    // quick movements responsive while still reducing high-frequency jitter.
     void integrate(const QVector<ImuSample> &samples, double sampleRate,
-                   const QQuaternion &imuToCamera);
+                   const QQuaternion &imuToCamera, float smoothing = 0.0f);
     QQuaternion orientationAtTime(double time) const;
 
     // Pure interpolation over copied sample data, so orientations can be
@@ -38,6 +43,7 @@ public:
 
 private:
     QVector3D computeGyroBias(const QVector<ImuSample> &samples) const;
+    void smoothOrientations(float smoothing);
 
     QVector<QQuaternion> m_orientations;
     QVector<double> m_timestamps;
