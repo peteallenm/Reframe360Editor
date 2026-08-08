@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "videodecoder.h"
+#include "gpurenderer.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -251,12 +252,18 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                     const double wL = (1.0 - lumaN) * (1.0 - lumaN);
                     const double wH = lumaN * lumaN;
                     const double wM = 1.0 - wL - wH;
+                    // Split the mid band into low-mids / high-mids (mirror of
+                    // project.frag): they share the old wM weight and cross
+                    // over exactly at luma 0.5.
+                    const double tMid = std::max(-1.0, std::min(1.0, (lumaN - 0.5) * 4.0));
+                    const double wLM = wM * 0.5 * (1.0 - tMid);
+                    const double wHM = wM * 0.5 * (1.0 + tMid);
 
-                    r += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                    r += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
                                 + s.redLows * wL + s.redMids * wM + s.redHighs * wH);
-                    g += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                    g += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
                                 + s.greenLows * wL + s.greenMids * wM + s.greenHighs * wH);
-                    b += 255.0 * (s.brightLows * wL + s.brightMids * wM + s.brightHighs * wH
+                    b += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
                                 + s.blueLows * wL + s.blueMids * wM + s.blueHighs * wH);
 
                     const double lumaN2 = clampUnit((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
@@ -654,14 +661,14 @@ bool Exporter::beginExport()
 void Exporter::exportVideo(const QString &videoPath, const QString &outPath,
                            int width, int height, double fps,
                            double startTime, double endTime,
-                           const StateProvider &state)
+                           const StateProvider &state, bool useGpu)
 {
     if (!beginExport())
         return;
     StateProvider sp = state;
     m_thread = QThread::create([this, videoPath, outPath, width, height, fps,
-                                startTime, endTime, sp]() {
-        runVideo(videoPath, outPath, width, height, fps, startTime, endTime, sp);
+                                startTime, endTime, sp, useGpu]() {
+        runVideo(videoPath, outPath, width, height, fps, startTime, endTime, sp, useGpu);
     });
     connect(m_thread, &QThread::finished, this, [this, th = m_thread]() {
         if (m_thread == th)
@@ -673,12 +680,12 @@ void Exporter::exportVideo(const QString &videoPath, const QString &outPath,
 
 void Exporter::exportFrame(const QString &videoPath, const QString &outPath,
                            int width, int height, double time,
-                           const ExportFrameState &state)
+                           const ExportFrameState &state, bool useGpu)
 {
     if (!beginExport())
         return;
-    m_thread = QThread::create([this, videoPath, outPath, width, height, time, state]() {
-        runFrame(videoPath, outPath, width, height, time, state);
+    m_thread = QThread::create([this, videoPath, outPath, width, height, time, state, useGpu]() {
+        runFrame(videoPath, outPath, width, height, time, state, useGpu);
     });
     connect(m_thread, &QThread::finished, this, [this, th = m_thread]() {
         if (m_thread == th)
@@ -690,7 +697,8 @@ void Exporter::exportFrame(const QString &videoPath, const QString &outPath,
 
 void Exporter::runVideo(const QString &videoPath, const QString &outPath,
                         int width, int height, double fps,
-                        double startTime, double endTime, StateProvider state)
+                        double startTime, double endTime, StateProvider state,
+                        bool useGpu)
 {
     const int W = width & ~1;
     const int H = height & ~1;
@@ -704,6 +712,16 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         fail(tr("Invalid export settings"));
         return;
     }
+
+    // Try the GPU pipeline first; fall back to the CPU rasterizer when no
+    // usable GL context can be made (headless CI, old GPUs, etc.).
+    GpuRenderer gpu;
+    QString gpuErr;
+    const bool gpuReady = useGpu && gpu.initialize(&gpuErr);
+    if (useGpu && !gpuReady)
+        qWarning().noquote() << "GPU export unavailable, falling back to CPU:" << gpuErr;
+    else if (gpuReady)
+        qInfo().noquote() << "Export using GPU renderer";
 
     DecodeReader reader;
     QString err;
@@ -736,7 +754,15 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
             break;
         }
         const ExportFrameState s = state(t);
-        const QImage rendered = renderFrame(frame, s, W, H);
+        QImage rendered;
+        if (gpuReady) {
+            if (!gpu.render(frame, s, W, H, &rendered, &err)) {
+                fail(err);
+                return;
+            }
+        } else {
+            rendered = renderFrame(frame, s, W, H);
+        }
         if (!writer.writeFrame(rendered, &err)) {
             fail(err);
             return;
@@ -760,7 +786,8 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
 }
 
 void Exporter::runFrame(const QString &videoPath, const QString &outPath,
-                        int width, int height, double time, ExportFrameState state)
+                        int width, int height, double time, ExportFrameState state,
+                        bool useGpu)
 {
     const int W = width & ~1;
     const int H = height & ~1;
@@ -768,6 +795,12 @@ void Exporter::runFrame(const QString &videoPath, const QString &outPath,
         emit exportError(tr("Invalid export size"));
         return;
     }
+
+    GpuRenderer gpu;
+    QString gpuErr;
+    const bool gpuReady = useGpu && gpu.initialize(&gpuErr);
+    if (useGpu && !gpuReady)
+        qWarning().noquote() << "GPU frame export unavailable, falling back to CPU:" << gpuErr;
 
     DecodeReader reader;
     QString err;
@@ -780,7 +813,15 @@ void Exporter::runFrame(const QString &videoPath, const QString &outPath,
         emit exportError(tr("Could not decode a frame at the requested time"));
         return;
     }
-    const QImage rendered = renderFrame(frame, state, W, H);
+    QImage rendered;
+    if (gpuReady) {
+        if (!gpu.render(frame, state, W, H, &rendered, &err)) {
+            emit exportError(err);
+            return;
+        }
+    } else {
+        rendered = renderFrame(frame, state, W, H);
+    }
     if (!rendered.save(outPath)) {
         emit exportError(tr("Could not write image file"));
         return;

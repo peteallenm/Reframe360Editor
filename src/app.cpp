@@ -55,12 +55,7 @@ App::App(QObject *parent)
     , m_exportEnd(0.0)
 {
     connect(m_decoder, &VideoDecoder::durationChanged, this, [this]() {
-        // Keep the export trim range inside the newly known clip length. Skip
-        // while the low-res preview thumbnail is loaded: its shorter duration
-        // would clamp the trim end (and then persist the wrong marker), while
-        // exports always read the full-resolution m_videoPath.
-        if (m_usePreview)
-            return;
+        // Keep the export trim range inside the newly known clip length.
         const double dur = m_decoder->duration();
         if (dur > 0.0) {
             if (m_exportEnd <= 0.0 || m_exportEnd > dur)
@@ -140,7 +135,8 @@ App::App(QObject *parent)
     connect(m_colorGrade, &ColorGrade::saturationChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::popChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::brightLowsChanged, this, saveGrade);
-    connect(m_colorGrade, &ColorGrade::brightMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::brightLowMidsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::brightHighMidsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::brightHighsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::redLowsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::redMidsChanged, this, saveGrade);
@@ -616,7 +612,7 @@ void App::exportFrame(const QString &path, int width, int height)
                             snap.stateAt(m_currentTime));
 }
 
-void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime)
+void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, bool gpuBackend)
 {
     if (m_videoPath.isEmpty()) {
         m_exportStatus = tr("Export failed: no video loaded");
@@ -633,7 +629,8 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
 
     ExportSnapshot snap = buildExportSnapshot();
     m_exporter->exportVideo(m_videoPath, path, width, height, fps, startTime, endTime,
-                            [snap](double t) { return snap.stateAt(t); });
+                            [snap](double t) { return snap.stateAt(t); },
+                            gpuBackend);
 }
 
 void App::setExportStart(double time)
@@ -710,7 +707,8 @@ ExportSnapshot App::buildExportSnapshot() const
         s.base.saturation = (float)m_colorGrade->saturation();
         s.base.pop = (float)m_colorGrade->pop();
         s.base.brightLows = (float)m_colorGrade->brightLows();
-        s.base.brightMids = (float)m_colorGrade->brightMids();
+        s.base.brightLowMids = (float)m_colorGrade->brightLowMids();
+        s.base.brightHighMids = (float)m_colorGrade->brightHighMids();
         s.base.brightHighs = (float)m_colorGrade->brightHighs();
         s.base.redLows = (float)m_colorGrade->redLows();
         s.base.redMids = (float)m_colorGrade->redMids();
@@ -751,7 +749,8 @@ void App::loadSettings()
         load("grade/saturation", m_colorGrade->saturation(), &ColorGrade::setSaturation);
         load("grade/pop", m_colorGrade->pop(), &ColorGrade::setPop);
         load("grade/brightLows", m_colorGrade->brightLows(), &ColorGrade::setBrightLows);
-        load("grade/brightMids", m_colorGrade->brightMids(), &ColorGrade::setBrightMids);
+        load("grade/brightLowMids", m_colorGrade->brightLowMids(), &ColorGrade::setBrightLowMids);
+        load("grade/brightHighMids", m_colorGrade->brightHighMids(), &ColorGrade::setBrightHighMids);
         load("grade/brightHighs", m_colorGrade->brightHighs(), &ColorGrade::setBrightHighs);
         load("grade/redLows", m_colorGrade->redLows(), &ColorGrade::setRedLows);
         load("grade/redMids", m_colorGrade->redMids(), &ColorGrade::setRedMids);
@@ -779,7 +778,8 @@ void App::saveSettings() const
         s.setValue(QStringLiteral("grade/saturation"), m_colorGrade->saturation());
         s.setValue(QStringLiteral("grade/pop"), m_colorGrade->pop());
         s.setValue(QStringLiteral("grade/brightLows"), m_colorGrade->brightLows());
-        s.setValue(QStringLiteral("grade/brightMids"), m_colorGrade->brightMids());
+        s.setValue(QStringLiteral("grade/brightLowMids"), m_colorGrade->brightLowMids());
+        s.setValue(QStringLiteral("grade/brightHighMids"), m_colorGrade->brightHighMids());
         s.setValue(QStringLiteral("grade/brightHighs"), m_colorGrade->brightHighs());
         s.setValue(QStringLiteral("grade/redLows"), m_colorGrade->redLows());
         s.setValue(QStringLiteral("grade/redMids"), m_colorGrade->redMids());

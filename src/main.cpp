@@ -7,6 +7,7 @@
 #include <QTimer>
 #include <QEventLoop>
 #include <QQuickWindow>
+#include <QFile>
 #include "app.h"
 
 int main(int argc, char *argv[])
@@ -52,6 +53,23 @@ int main(int argc, char *argv[])
 
     QCommandLineOption imuOption("imu", "Enable IMU stabilization");
     parser.addOption(imuOption);
+
+    // Headless video export (implies --headless): render the loaded video to
+    // an MP4, then exit. The trim range defaults to the whole clip.
+    QCommandLineOption exportVideoOption("export-video", "Export the loaded video to FILE as MP4 (headless)", "file");
+    parser.addOption(exportVideoOption);
+    QCommandLineOption exportWOption("export-w", "Export width (default 640)", "px");
+    parser.addOption(exportWOption);
+    QCommandLineOption exportHOption("export-h", "Export height (default 360)", "px");
+    parser.addOption(exportHOption);
+    QCommandLineOption exportFpsOption("export-fps", "Export frame rate (default 30)", "fps");
+    parser.addOption(exportFpsOption);
+    QCommandLineOption exportStartOption("export-start", "Export start time in seconds (default 0)", "sec");
+    parser.addOption(exportStartOption);
+    QCommandLineOption exportEndOption("export-end", "Export end time in seconds (default: clip duration)", "sec");
+    parser.addOption(exportEndOption);
+    QCommandLineOption exportBackendOption("export-backend", "Render backend: gpu, cpu or auto (default auto)", "backend");
+    parser.addOption(exportBackendOption);
     
     parser.process(app);
 
@@ -63,20 +81,67 @@ int main(int argc, char *argv[])
         if (parser.isSet(videoOption)) {
             QString videoPath = parser.value(videoOption);
             
-            QTimer::singleShot(0, [&appController, videoPath]() {
-                appController.setVideoPath(videoPath);
-                
-                QTimer::singleShot(3000, [&appController, videoPath]() {
-                    qDebug() << "Video loaded successfully:" << videoPath;
-                    qDebug() << "Duration:" << appController.duration() << "seconds";
-                    if (appController.videoDecoder()) {
-                        qDebug() << "Video size:" << appController.videoDecoder()->videoWidth() 
-                                 << "x" << appController.videoDecoder()->videoHeight();
-                        qDebug() << "Full range:" << appController.videoDecoder()->isFullRange();
-                    }
-                    QCoreApplication::quit();
+            if (parser.isSet(exportVideoOption)) {
+                // Export the clip headlessly, then exit 0 on success / 1 on
+                // failure once the worker reports completion.
+                const QString outPath = parser.value(exportVideoOption);
+                const int w = parser.value(exportWOption).toInt() ? parser.value(exportWOption).toInt() : 640;
+                const int h = parser.value(exportHOption).toInt() ? parser.value(exportHOption).toInt() : 360;
+                const double fps = parser.value(exportFpsOption).toDouble() > 0.0
+                        ? parser.value(exportFpsOption).toDouble() : 30.0;
+                const double start = parser.value(exportStartOption).toDouble();
+                const bool hasEnd = parser.isSet(exportEndOption);
+                const double end = hasEnd ? parser.value(exportEndOption).toDouble() : -1.0;
+                const bool gpu = parser.value(exportBackendOption) != QLatin1String("cpu");
+
+                // Kick off the decoder, wait for it to report the clip
+                // duration (needed for the default end time), then start the
+                // export. The completion poll is only started afterwards, so
+                // it can never fire before the export begins.
+                QTimer::singleShot(0, [&appController, videoPath]() {
+                    appController.setVideoPath(videoPath);
                 });
-            });
+                QTimer *wait = new QTimer(&app);
+                wait->setInterval(100);
+                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu]() {
+                    if (appController.duration() <= 0.0)
+                        return;   // keep waiting for the decoder
+                    wait->stop();
+                    const double startTime = start;
+                    const double endTime = (end >= 0.0) ? end : appController.duration();
+                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, gpu);
+
+                    // Poll until the export finishes, then exit with a code
+                    // that reflects success/failure.
+                    QTimer *poll = new QTimer(&app);
+                    QObject::connect(poll, &QTimer::timeout, &app, [&appController, outPath]() {
+                        if (appController.exportRunning())
+                            return;
+                        const QString status = appController.exportStatus();
+                        const bool ok = status.startsWith(QLatin1String("Export complete"))
+                                     || QFile::exists(outPath);
+                        qDebug().noquote() << "Export status:" << status;
+                        QCoreApplication::exit(ok ? 0 : 1);
+                    });
+                    poll->start(250);
+                });
+                wait->start();
+            } else {
+                QTimer::singleShot(0, [&appController, videoPath]() {
+                    appController.setVideoPath(videoPath);
+                    
+                    QTimer::singleShot(3000, [&appController, videoPath]() {
+                        qDebug() << "Video loaded successfully:" << videoPath;
+                        qDebug() << "Duration:" << appController.duration() << "seconds";
+                        if (appController.videoDecoder()) {
+                            qDebug() << "Video size:" << appController.videoDecoder()->videoWidth() 
+                                     << "x" << appController.videoDecoder()->videoHeight();
+                            qDebug() << "Full range:" << appController.videoDecoder()->isFullRange();
+                        }
+                        QCoreApplication::quit();
+                    });
+                });
+            }
         }
         return app.exec();
     }

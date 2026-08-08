@@ -47,7 +47,7 @@ struct ExportFrameState {
     float contrast = 1.0f;     // scale about 0.5 (0..2)
     float saturation = 1.0f;   // mix with luma (0..2)
     float pop = 0.0f;          // midtone contrast / clarity (-1..1)
-    float brightLows = 0.0f, brightMids = 0.0f, brightHighs = 0.0f;
+    float brightLows = 0.0f, brightLowMids = 0.0f, brightHighMids = 0.0f, brightHighs = 0.0f;
     float redLows = 0.0f, redMids = 0.0f, redHighs = 0.0f;
     float greenLows = 0.0f, greenMids = 0.0f, greenHighs = 0.0f;
     float blueLows = 0.0f, blueMids = 0.0f, blueHighs = 0.0f;
@@ -70,16 +70,19 @@ public:
 
     // Render <videoPath> over [startTime, endTime] at fps to <outPath> (MP4).
     // Runs on a worker thread; progress/finished/error are signalled back.
+    // If useGpu is true the frames are rendered with the offscreen GL
+    // pipeline (same shader as the live viewer); if no usable GL context can
+    // be created it automatically falls back to the CPU rasterizer.
     void exportVideo(const QString &videoPath, const QString &outPath,
                      int width, int height, double fps,
                      double startTime, double endTime,
-                     const StateProvider &state);
+                     const StateProvider &state, bool useGpu = true);
 
     // Render a single frame at <time> and save it as an image (PNG/JPG by
     // extension) to <outPath>.
     void exportFrame(const QString &videoPath, const QString &outPath,
                      int width, int height, double time,
-                     const ExportFrameState &state);
+                     const ExportFrameState &state, bool useGpu = true);
 
     bool isRunning() const { return m_thread != nullptr; }
 
@@ -95,9 +98,11 @@ private:
 
     void runVideo(const QString &videoPath, const QString &outPath,
                   int width, int height, double fps,
-                  double startTime, double endTime, StateProvider state);
+                  double startTime, double endTime, StateProvider state,
+                  bool useGpu);
     void runFrame(const QString &videoPath, const QString &outPath,
-                  int width, int height, double time, ExportFrameState state);
+                  int width, int height, double time, ExportFrameState state,
+                  bool useGpu);
 
     QThread *m_thread = nullptr;
 };

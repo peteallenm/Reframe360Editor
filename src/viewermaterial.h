@@ -34,7 +34,7 @@ public:
 
     // Colour grading values (see ColorGrade / project.frag for semantics).
     void setColorGrade(float brightness, float contrast, float saturation, float pop,
-                       float brightLows, float brightMids, float brightHighs,
+                       float brightLows, float brightLowMids, float brightHighMids, float brightHighs,
                        float redLows, float redMids, float redHighs,
                        float greenLows, float greenMids, float greenHighs,
                        float blueLows, float blueMids, float blueHighs);
@@ -82,7 +82,7 @@ private:
     bool m_rearHFlip;
     float m_blendStart;
     float m_brightness, m_contrast, m_saturation, m_pop;
-    float m_brightLows, m_brightMids, m_brightHighs;
+    float m_brightLows, m_brightLowMids, m_brightHighMids, m_brightHighs;
     float m_redLows, m_redMids, m_redHighs;
     float m_greenLows, m_greenMids, m_greenHighs;
     float m_blueLows, m_blueMids, m_blueHighs;

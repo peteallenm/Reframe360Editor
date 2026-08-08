@@ -294,10 +294,11 @@ Item {
                                 Layout.fillWidth: true
                             }
 
-                            SectionHeader { sectionTitle: qsTr("Brightness (Lows / Mids / Highs)") }
-                            SliderRow { labelText: qsTr("Lows:");  value: app.colorGrade.brightLows;  onUserChange: (v) => app.colorGrade.brightLows = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Mids:");  value: app.colorGrade.brightMids;  onUserChange: (v) => app.colorGrade.brightMids = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Highs:"); value: app.colorGrade.brightHighs; onUserChange: (v) => app.colorGrade.brightHighs = v; min: -1; max: 1 }
+                            SectionHeader { sectionTitle: qsTr("Brightness (Lows / Low Mids / High Mids / Highs)") }
+                            SliderRow { labelText: qsTr("Lows:");      value: app.colorGrade.brightLows;      onUserChange: (v) => app.colorGrade.brightLows = v;      min: -1; max: 1 }
+                            SliderRow { labelText: qsTr("Low Mids:");  value: app.colorGrade.brightLowMids;    onUserChange: (v) => app.colorGrade.brightLowMids = v;    min: -1; max: 1 }
+                            SliderRow { labelText: qsTr("High Mids:"); value: app.colorGrade.brightHighMids;   onUserChange: (v) => app.colorGrade.brightHighMids = v;   min: -1; max: 1 }
+                            SliderRow { labelText: qsTr("Highs:");     value: app.colorGrade.brightHighs;      onUserChange: (v) => app.colorGrade.brightHighs = v;      min: -1; max: 1 }
 
                             SectionHeader { sectionTitle: qsTr("Red"); accent: "#ef9a9a" }
                             SliderRow { labelText: qsTr("Lows:");  value: app.colorGrade.redLows;  onUserChange: (v) => app.colorGrade.redLows = v;  min: -1; max: 1 }

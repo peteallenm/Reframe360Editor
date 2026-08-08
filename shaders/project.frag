@@ -37,7 +37,8 @@ layout(std140, binding = 0) uniform Uniforms {
     float u_saturation;
     float u_pop;
     float u_brightLows;
-    float u_brightMids;
+    float u_brightLowMids;
+    float u_brightHighMids;
     float u_brightHighs;
     float u_redLows;
     float u_redMids;
@@ -202,8 +203,15 @@ void main() {
     float wL = (1.0 - luma) * (1.0 - luma);
     float wH = luma * luma;
     float wM = 1.0 - wL - wH;
+    // The brightness mid band is split into low-mids and high-mids: the two
+    // shares always sum to the old wM and cross over exactly at luma 0.5
+    // (below 0.25 all mid weight goes to low mids, above 0.75 all to high
+    // mids), so setting both equal reproduces the old single mids slider.
+    float tMid = clamp((luma - 0.5) * 4.0, -1.0, 1.0);
+    float wLM = wM * 0.5 * (1.0 - tMid);
+    float wHM = wM * 0.5 * (1.0 + tMid);
 
-    rgb += vec3(u_brightLows * wL + u_brightMids * wM + u_brightHighs * wH);
+    rgb += vec3(u_brightLows * wL + u_brightLowMids * wLM + u_brightHighMids * wHM + u_brightHighs * wH);
     rgb.r += u_redLows * wL + u_redMids * wM + u_redHighs * wH;
     rgb.g += u_greenLows * wL + u_greenMids * wM + u_greenHighs * wH;
     rgb.b += u_blueLows * wL + u_blueMids * wM + u_blueHighs * wH;

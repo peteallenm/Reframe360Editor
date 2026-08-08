@@ -87,7 +87,8 @@ void LensViewer::setColorGrade(ColorGrade *grade)
         connect(grade, &ColorGrade::saturationChanged, this, [this]() { update(); });
         connect(grade, &ColorGrade::popChanged, this, [this]() { update(); });
         connect(grade, &ColorGrade::brightLowsChanged, this, [this]() { update(); });
-        connect(grade, &ColorGrade::brightMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::brightLowMidsChanged, this, [this]() { update(); });
+        connect(grade, &ColorGrade::brightHighMidsChanged, this, [this]() { update(); });
         connect(grade, &ColorGrade::brightHighsChanged, this, [this]() { update(); });
         connect(grade, &ColorGrade::redLowsChanged, this, [this]() { update(); });
         connect(grade, &ColorGrade::redMidsChanged, this, [this]() { update(); });
@@ -177,8 +178,8 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         material->setColorGrade(
             (float)m_colorGrade->brightness(), (float)m_colorGrade->contrast(),
             (float)m_colorGrade->saturation(), (float)m_colorGrade->pop(),
-            (float)m_colorGrade->brightLows(), (float)m_colorGrade->brightMids(),
-            (float)m_colorGrade->brightHighs(),
+            (float)m_colorGrade->brightLows(), (float)m_colorGrade->brightLowMids(),
+            (float)m_colorGrade->brightHighMids(), (float)m_colorGrade->brightHighs(),
             (float)m_colorGrade->redLows(), (float)m_colorGrade->redMids(),
             (float)m_colorGrade->redHighs(),
             (float)m_colorGrade->greenLows(), (float)m_colorGrade->greenMids(),

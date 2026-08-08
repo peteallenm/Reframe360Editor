@@ -147,7 +147,7 @@ public:
     void setExportEnd(double time);
 
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
-    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime);
+    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, bool gpuBackend = true);
     Q_INVOKABLE QString grabStill(int lens);
     Q_INVOKABLE void dragLook(double angleAboutUp, double angleAboutRight);
 

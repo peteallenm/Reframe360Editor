@@ -23,6 +23,7 @@ qt_add_executable(render360
     src/keyframe.cpp
     src/exporter.cpp
     src/colorgrade.cpp
+    src/gpurenderer.cpp
 )
 
 qt_add_qml_module(render360
@@ -45,6 +46,16 @@ qt_add_shaders(render360 "shaders"
         shaders/quad.vert
         shaders/project.frag
     GLSL "100 es,120,330,440,450,460"
+)
+
+# Embed the raw GLSL too: the GPU exporter compiles project.frag/quad.vert
+# directly (the same files the viewer's qsb is baked from), so preview and
+# export can never drift apart.
+qt_add_resources(render360 "shaders_raw"
+    PREFIX "/shaders_raw"
+    FILES
+        shaders/quad.vert
+        shaders/project.frag
 )
 
 target_include_directories(render360 PRIVATE

@@ -32,20 +32,22 @@ struct ViewerUniforms {
     float contrast;       // offset 228
     float saturation;     // offset 232
     float pop;            // offset 236
-    float brightLows;     // offset 240
-    float brightMids;     // offset 244
-    float brightHighs;    // offset 248
-    float redLows;        // offset 252
-    float redMids;        // offset 256
-    float redHighs;       // offset 260
-    float greenLows;      // offset 264
-    float greenMids;      // offset 268
-    float greenHighs;     // offset 272
-    float blueLows;       // offset 276
-    float blueMids;       // offset 280
-    float blueHighs;      // offset 284
+    float brightLows;       // offset 240
+    float brightLowMids;    // offset 244
+    float brightHighMids;   // offset 248
+    float brightHighs;      // offset 252
+    float redLows;          // offset 256
+    float redMids;          // offset 260
+    float redHighs;         // offset 264
+    float greenLows;        // offset 268
+    float greenMids;        // offset 272
+    float greenHighs;       // offset 276
+    float blueLows;         // offset 280
+    float blueMids;         // offset 284
+    float blueHighs;        // offset 288
+    float _padG[3];         // offset 292 (std140 rounds the struct to 16B -> 304)
 };
-static_assert(sizeof(ViewerUniforms) == 288, "ViewerUniforms must match std140 layout");
+static_assert(sizeof(ViewerUniforms) == 304, "ViewerUniforms must match std140 layout");
 
 ViewerMaterial::ViewerMaterial()
     : m_yTex(nullptr), m_uTex(nullptr), m_vTex(nullptr)
@@ -59,7 +61,7 @@ ViewerMaterial::ViewerMaterial()
     , m_rearRotation(180.0f), m_rearHFlip(false)
     , m_blendStart(0.9f)
     , m_brightness(0.0f), m_contrast(1.0f), m_saturation(1.0f), m_pop(0.0f)
-    , m_brightLows(0.0f), m_brightMids(0.0f), m_brightHighs(0.0f)
+    , m_brightLows(0.0f), m_brightLowMids(0.0f), m_brightHighMids(0.0f), m_brightHighs(0.0f)
     , m_redLows(0.0f), m_redMids(0.0f), m_redHighs(0.0f)
     , m_greenLows(0.0f), m_greenMids(0.0f), m_greenHighs(0.0f)
     , m_blueLows(0.0f), m_blueMids(0.0f), m_blueHighs(0.0f)
@@ -107,7 +109,7 @@ void ViewerMaterial::setTextures(QSGTexture *y, QSGTexture *u, QSGTexture *v)
 }
 
 void ViewerMaterial::setColorGrade(float brightness, float contrast, float saturation, float pop,
-                                   float brightLows, float brightMids, float brightHighs,
+                                   float brightLows, float brightLowMids, float brightHighMids, float brightHighs,
                                    float redLows, float redMids, float redHighs,
                                    float greenLows, float greenMids, float greenHighs,
                                    float blueLows, float blueMids, float blueHighs)
@@ -117,7 +119,8 @@ void ViewerMaterial::setColorGrade(float brightness, float contrast, float satur
     m_saturation = saturation;
     m_pop = pop;
     m_brightLows = brightLows;
-    m_brightMids = brightMids;
+    m_brightLowMids = brightLowMids;
+    m_brightHighMids = brightHighMids;
     m_brightHighs = brightHighs;
     m_redLows = redLows;
     m_redMids = redMids;
@@ -161,7 +164,8 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.saturation = m_saturation;
     u.pop = m_pop;
     u.brightLows = m_brightLows;
-    u.brightMids = m_brightMids;
+    u.brightLowMids = m_brightLowMids;
+    u.brightHighMids = m_brightHighMids;
     u.brightHighs = m_brightHighs;
     u.redLows = m_redLows;
     u.redMids = m_redMids;

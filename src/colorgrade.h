@@ -25,7 +25,8 @@ class ColorGrade : public QObject
     Q_PROPERTY(double saturation READ saturation WRITE setSaturation NOTIFY saturationChanged)
     Q_PROPERTY(double pop READ pop WRITE setPop NOTIFY popChanged)
     Q_PROPERTY(double brightLows READ brightLows WRITE setBrightLows NOTIFY brightLowsChanged)
-    Q_PROPERTY(double brightMids READ brightMids WRITE setBrightMids NOTIFY brightMidsChanged)
+    Q_PROPERTY(double brightLowMids READ brightLowMids WRITE setBrightLowMids NOTIFY brightLowMidsChanged)
+    Q_PROPERTY(double brightHighMids READ brightHighMids WRITE setBrightHighMids NOTIFY brightHighMidsChanged)
     Q_PROPERTY(double brightHighs READ brightHighs WRITE setBrightHighs NOTIFY brightHighsChanged)
     Q_PROPERTY(double redLows READ redLows WRITE setRedLows NOTIFY redLowsChanged)
     Q_PROPERTY(double redMids READ redMids WRITE setRedMids NOTIFY redMidsChanged)
@@ -51,8 +52,10 @@ public:
 
     double brightLows() const { return m_brightLows; }
     void setBrightLows(double v);
-    double brightMids() const { return m_brightMids; }
-    void setBrightMids(double v);
+    double brightLowMids() const { return m_brightLowMids; }
+    void setBrightLowMids(double v);
+    double brightHighMids() const { return m_brightHighMids; }
+    void setBrightHighMids(double v);
     double brightHighs() const { return m_brightHighs; }
     void setBrightHighs(double v);
 
@@ -86,7 +89,8 @@ signals:
     void saturationChanged();
     void popChanged();
     void brightLowsChanged();
-    void brightMidsChanged();
+    void brightLowMidsChanged();
+    void brightHighMidsChanged();
     void brightHighsChanged();
     void redLowsChanged();
     void redMidsChanged();
@@ -103,7 +107,7 @@ private:
     double m_contrast;
     double m_saturation;
     double m_pop;
-    double m_brightLows, m_brightMids, m_brightHighs;
+    double m_brightLows, m_brightLowMids, m_brightHighMids, m_brightHighs;
     double m_redLows, m_redMids, m_redHighs;
     double m_greenLows, m_greenMids, m_greenHighs;
     double m_blueLows, m_blueMids, m_blueHighs;
