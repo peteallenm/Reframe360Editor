@@ -82,6 +82,7 @@ class App : public QObject
     Q_PROPERTY(bool flowStitch READ flowStitch WRITE setFlowStitch NOTIFY flowStitchChanged)
     Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
     Q_PROPERTY(int flowIterations READ flowIterations WRITE setFlowIterations NOTIFY flowIterationsChanged)
+    Q_PROPERTY(double flowAlpha READ flowAlpha WRITE setFlowAlpha NOTIFY flowAlphaChanged)
     Q_PROPERTY(QImage flowImage READ flowImage NOTIFY flowImageReady)
     Q_PROPERTY(double flowEncode READ flowEncode NOTIFY flowImageReady)
     Q_PROPERTY(QString previewThumbnailPath READ previewThumbnailPath NOTIFY videoPathChanged)
@@ -149,6 +150,8 @@ public:
     void setFlowStrength(double v);
     int flowIterations() const { return m_flowIterations; }
     void setFlowIterations(int v);
+    double flowAlpha() const { return m_flowAlpha; }
+    void setFlowAlpha(double v);
     QImage flowImage() const { return m_flowImage; }
     double flowEncode() const { return m_flowEncode; }
 
@@ -221,6 +224,7 @@ signals:
     void flowStitchChanged();
     void flowStrengthChanged();
     void flowIterationsChanged();
+    void flowAlphaChanged();
     void flowImageReady();
     void usePreviewThumbnailChanged();
     void activeLensChanged();
@@ -273,6 +277,7 @@ private:
     bool m_flowStitch;
     double m_flowStrength;
     int m_flowIterations;
+    double m_flowAlpha;
     QImage m_flowImage;
     double m_flowEncode;
     FlowWorker *m_flowWorker;

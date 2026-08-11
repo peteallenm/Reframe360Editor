@@ -20,15 +20,22 @@ class QOpenGLShaderProgram;
 // ---------------------------------------------------------------------------
 
 // Band texture resolution (phi x theta over [bandTheta0, bandTheta1]).
-inline constexpr int kFlowBandWidth = 1024;
-inline constexpr int kFlowBandHeight = 256;
+// 512x128 rather than 1024x256: each texel averages a 2x2 source region, which
+// inherently smooths the gradient noise that otherwise shows up as high-
+// frequency jitter in the seam, reduces aliasing from the band extraction, and
+// is ~4x faster. The encode/decode and project.frag sampling are resolution-
+// independent (normalized band coordinates), so no other code changes.
+inline constexpr int kFlowBandWidth = 512;
+inline constexpr int kFlowBandHeight = 128;
 
 // Default camera-native seam band: the equator straddling 90 deg.
 inline constexpr float kDefaultBandTheta0 = 75.0f * 3.14159265358979323846f / 180.0f;
 inline constexpr float kDefaultBandTheta1 = 105.0f * 3.14159265358979323846f / 180.0f;
 
-// Horn-Schunck defaults (see OpticalFlow.md).
-inline constexpr float kDefaultFlowAlpha = 10.0f;
+// Horn-Schunck defaults (see OpticalFlow.md). alpha is the smoothness weight:
+// higher = smoother (less high-frequency seam noise) but softer at object
+// boundaries. Tunable live via the app's flowAlpha slider (1..100).
+inline constexpr float kDefaultFlowAlpha = 20.0f;
 inline constexpr int kDefaultFlowIterations = 60;
 
 // The flow field is packed into an RG/RGBA texture as (ndu*k + 0.5, ndv*k + 0.5)
@@ -78,10 +85,10 @@ struct FlowSettings {
 //
 //   pass 1 (band_extract.frag, MRT): band_front / band_rear luma
 //   pass 2 (hs_gradients.frag):       Ix, Iy (central diffs of avg), It
-//   pass 3 (hs_iteration.frag, xN):   Jacobi relaxation, ping-pong RG32F
+//   pass 3 (hs_iteration.frag, xN):   Jacobi relaxation, ping-pong RGBA16F
 //
 // Flow is returned as a QVector<float> of (du, dv) pairs in texel units
-// (band texture 1024x256). QOpenGLContext is thread-affine: the context +
+// (band texture 512x128). QOpenGLContext is thread-affine: the context +
 // surface must be created on the thread that calls compute(). The preview
 // path uses FlowWorker; the export path instantiates FlowRenderer directly on
 // the export worker thread.

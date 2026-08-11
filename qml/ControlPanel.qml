@@ -273,6 +273,14 @@ Item {
                                 min: 20; max: 100; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
                             }
+
+                            SliderRow {
+                                labelText: qsTr("Smoothness:")
+                                value: app.flowAlpha
+                                onUserChange: (v) => app.flowAlpha = v
+                                min: 1; max: 100; step: 1; decimals: 0
+                                controlEnabled: flowCheck.checked
+                            }
                         }
                     }
 

@@ -354,7 +354,7 @@ public:
             return false;
         }
         m_cal = flowCalibrationFromState(s);
-        m_settings.alpha = kDefaultFlowAlpha;
+        m_settings.alpha = s.flowAlpha;
         m_settings.iterations = s.flowIterations;
         m_settings.bandTheta0 = s.bandTheta0;
         m_settings.bandTheta1 = s.bandTheta1;

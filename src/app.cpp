@@ -53,6 +53,7 @@ App::App(QObject *parent)
     , m_flowStitch(false)
     , m_flowStrength(1.0)
     , m_flowIterations(kDefaultFlowIterations)
+    , m_flowAlpha(kDefaultFlowAlpha)
     , m_flowEncode(16.0)
     , m_usePreview(false)
     , m_activeLens(2)
@@ -171,6 +172,7 @@ App::App(QObject *parent)
     connect(this, &App::flowStitchChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowStrengthChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowIterationsChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::flowAlphaChanged, this, [this]() { saveSettings(); });
 
     // Colour grade changes persist automatically (same convention as the
     // projection / IMU settings).
@@ -513,6 +515,18 @@ void App::setFlowIterations(int iterations)
         maybeComputeFlow();
 }
 
+void App::setFlowAlpha(double alpha)
+{
+    alpha = qBound(1.0, alpha, 100.0);
+    if (qFuzzyCompare(m_flowAlpha, alpha))
+        return;
+    m_flowAlpha = alpha;
+    emit flowAlphaChanged();
+    // The flow field itself depends on the smoothness weight.
+    if (m_flowStitch)
+        maybeComputeFlow();
+}
+
 void App::maybeComputeFlow()
 {
     if (!m_flowStitch || !m_decoder || !m_decoder->hasFrame())
@@ -540,6 +554,7 @@ void App::maybeComputeFlow()
 
     FlowSettings settings;
     settings.iterations = m_flowIterations;
+    settings.alpha = (float)m_flowAlpha;
 
     emit flowRequested(frame, cal, settings);
 }
@@ -859,6 +874,7 @@ ExportSnapshot App::buildExportSnapshot() const
     s.base.flowStitch = m_flowStitch;
     s.base.flowStrength = (float)m_flowStrength;
     s.base.flowIterations = m_flowIterations;
+    s.base.flowAlpha = (float)m_flowAlpha;
     s.base.bandTheta0 = kDefaultBandTheta0;
     s.base.bandTheta1 = kDefaultBandTheta1;
     if (m_colorGrade) {
@@ -905,6 +921,7 @@ void App::loadSettings()
     setFlowStitch(s.value(QStringLiteral("flow/stitch"), m_flowStitch).toBool());
     setFlowStrength(s.value(QStringLiteral("flow/strength"), m_flowStrength).toDouble());
     setFlowIterations(qBound(1, s.value(QStringLiteral("flow/iterations"), m_flowIterations).toInt(), 200));
+    setFlowAlpha(qBound(1.0, s.value(QStringLiteral("flow/alpha"), m_flowAlpha).toDouble(), 100.0));
 
     if (m_colorGrade) {
         auto load = [this, &s](const char *key, double def, void (ColorGrade::*setter)(double)) {
@@ -941,6 +958,7 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("flow/stitch"), m_flowStitch);
     s.setValue(QStringLiteral("flow/strength"), m_flowStrength);
     s.setValue(QStringLiteral("flow/iterations"), m_flowIterations);
+    s.setValue(QStringLiteral("flow/alpha"), m_flowAlpha);
 
     if (m_colorGrade) {
         s.setValue(QStringLiteral("grade/brightness"), m_colorGrade->brightness());

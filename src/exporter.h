@@ -49,6 +49,7 @@ struct ExportFrameState {
     bool flowStitch = false;
     float flowStrength = 1.0f;
     int flowIterations = kDefaultFlowIterations;
+    float flowAlpha = kDefaultFlowAlpha;
     float bandTheta0 = kDefaultBandTheta0;
     float bandTheta1 = kDefaultBandTheta1;
 
