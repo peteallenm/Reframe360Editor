@@ -22,28 +22,36 @@ public:
     // 180°-flipped fisheye video for display; the shader applies the conjugate,
     // so it samples kFlipRoll * Q_cam^-1 * ray. imuToCamera is the header's
     // IMU->camera quaternion (config[4..7]).
-    //
-    // smoothing (0.0-1.0) controls a centered sliding-window quaternion average
-    // applied to the stored orientations: 0 = none (raw), 1 = heavy smoothing.
-    // A centered window avoids the lag of an exponential filter, which keeps
-    // quick movements responsive while still reducing high-frequency jitter.
     void integrate(const QVector<ImuSample> &samples, double sampleRate,
-                   const QQuaternion &imuToCamera, float smoothing = 0.0f);
-    QQuaternion orientationAtTime(double time) const;
+                   const QQuaternion &imuToCamera);
+    // smoothingMs: same semantics as orientationAt(); applied at the caller's
+    // (video) frame rate to avoid 400 Hz -> 30 fps aliasing of high-freq jitter.
+    QQuaternion orientationAtTime(double time, float smoothingMs = 0.0f) const;
 
     // Pure interpolation over copied sample data, so orientations can be
     // evaluated from a worker thread (e.g. the exporter) without racing
     // against integrate() reallocating the vectors in the GUI thread.
+    //
+    // smoothingMs > 0: Gaussian-weighted quaternion average over a centered
+    // time window of +-smoothingMs/2 around `time` (sigma = window/4). Applied
+    // at the caller's sample rate (video fps), NOT the IMU rate, so no
+    // high-frequency jitter aliases back into the 0-15 Hz band when
+    // sub-sampled from 400 Hz to 30 fps. The window is clamped to >= 33 ms
+    // (one 30 fps frame = ~13 IMU samples) at all settings — the frame
+    // exposure time, giving ~11 dB jitter reduction for free with no lag (all
+    // orientations are pre-computed, so a centered window looks ahead in the
+    // array). Larger windows up to the caller's value add progressively more
+    // high-frequency attenuation via the Gaussian profile (no box-filter side
+    // lobes).
     static QQuaternion orientationAt(const QVector<QQuaternion> &orientations,
                                      const QVector<double> &timestamps,
-                                     double time);
+                                     double time, float smoothingMs = 0.0f);
 
     QVector<QQuaternion> orientations() const { return m_orientations; }
     QVector<double> timestamps() const { return m_timestamps; }
 
 private:
     QVector3D computeGyroBias(const QVector<ImuSample> &samples) const;
-    void smoothOrientations(float smoothing);
 
     QVector<QQuaternion> m_orientations;
     QVector<double> m_timestamps;

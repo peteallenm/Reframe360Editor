@@ -31,6 +31,14 @@ struct ExportSnapshot {
     QVector<QQuaternion> imuOrientations;
     QVector<double> imuTimestamps;
     double syncOffset = 0.0;
+    // Linear clock-drift between the IMU and video clocks: the effective sync
+    // offset at video time t is syncOffset + drift * t (s/s, ~0.0038 measured
+    // on this camera). A constant offset cannot be optimal for the whole clip
+    // because the two clocks run at slightly different rates.
+    double drift = 0.0;
+    // Gaussian smoothing window (ms) applied at the export frame rate by
+    // orientationAt(); 0 = min window (33 ms exposure average).
+    float imuSmoothingMs = 0.0f;
 
     ExportFrameState stateAt(double t) const
     {
@@ -46,7 +54,8 @@ struct ExportSnapshot {
         if (imuStabilize && !imuOrientations.isEmpty()) {
             QQuaternion q = GyroscopeIntegrator::orientationAt(imuOrientations,
                                                                imuTimestamps,
-                                                               t + syncOffset);
+                                                               t * (1.0 + drift) + syncOffset,
+                                                               imuSmoothingMs);
             s.imuOrientation = q;
         } else {
             s.imuOrientation = QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
@@ -69,6 +78,7 @@ class App : public QObject
     Q_PROPERTY(bool imuStabilize READ imuStabilize WRITE setImuStabilize NOTIFY imuStabilizeChanged)
     Q_PROPERTY(double imuSmoothing READ imuSmoothing WRITE setImuSmoothing NOTIFY imuSmoothingChanged)
     Q_PROPERTY(double imuSyncOffset READ imuSyncOffset WRITE setImuSyncOffset NOTIFY imuSyncOffsetChanged)
+    Q_PROPERTY(double imuDrift READ imuDrift WRITE setImuDrift NOTIFY imuDriftChanged)
     Q_PROPERTY(bool flowStitch READ flowStitch WRITE setFlowStitch NOTIFY flowStitchChanged)
     Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
     Q_PROPERTY(int flowIterations READ flowIterations WRITE setFlowIterations NOTIFY flowIterationsChanged)
@@ -129,6 +139,9 @@ public:
 
     double imuSyncOffset() const;
     void setImuSyncOffset(double offset);
+
+    double imuDrift() const;
+    void setImuDrift(double drift);
 
     bool flowStitch() const { return m_flowStitch; }
     void setFlowStitch(bool v);
@@ -204,6 +217,7 @@ signals:
     void imuStabilizeChanged();
     void imuSmoothingChanged();
     void imuSyncOffsetChanged();
+    void imuDriftChanged();
     void flowStitchChanged();
     void flowStrengthChanged();
     void flowIterationsChanged();
@@ -250,6 +264,7 @@ private:
     bool m_imuStabilize;
     double m_imuSmoothing;
     double m_imuSyncOffset;
+    double m_imuDrift;
     bool m_usePreview;
     int m_activeLens;
     int m_projection;

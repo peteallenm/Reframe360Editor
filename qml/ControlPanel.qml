@@ -224,6 +224,20 @@ Item {
                                 }
                                 Label { text: syncSlider.value.toFixed(2) + "s"; Layout.preferredWidth: 50 }
                             }
+
+                            RowLayout {
+                                enabled: imuCheck.checked
+                                Label { text: qsTr("Drift:"); Layout.preferredWidth: 80 }
+                                Slider {
+                                    id: driftSlider
+                                    Layout.fillWidth: true
+                                    from: -0.01; to: 0.01
+                                    value: app.imuDrift
+                                    stepSize: 0.0001
+                                    onMoved: app.imuDrift = value
+                                }
+                                Label { text: (driftSlider.value * 1000).toFixed(1) + " ms/s"; Layout.preferredWidth: 50 }
+                            }
                         }
                     }
 

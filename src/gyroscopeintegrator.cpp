@@ -15,6 +15,17 @@ static const float kMagHigh    = 1.1f;
 // below ~10 Hz) untouched. Gentle enough not to add perceptible lag to quick
 // rolls. alpha = fraction of the new sample: 1 = no filtering.
 static const float kGyroFilterAlpha = 0.75f;
+// Rate-adaptive smoothing gates for orientationAt(): the Gaussian window
+// scales with the local camera angular rate so that fast/shakey motion (where
+// high-frequency jitter lives) gets the full user-selected window, while slow
+// smooth motion shrinks toward the 33 ms exposure average — a large Gaussian
+// on a slow pan adds lag instead of removing jitter, which reads out as
+// low-frequency wander in the residual. Below kRateSlow the window keeps only
+// kRateLowRatio of the user's requested window; at/above kRateFast it uses the
+// full window; linear ramp in between.
+static const float kRateSlow     = 15.0f;  // deg/s: below this = near-still camera
+static const float kRateFast     = 90.0f;  // deg/s: at/above this = full smoothing
+static const float kRateLowRatio = 0.5f;   // fraction of the user window kept when still
 // World frame convention: +Y is the world "up" vector used to seed and correct
 // the orientation (the Mahony filter drives current^-1 * kWorldUp toward the
 // measured acceleration). For a level camera the accelerometer reads
@@ -63,7 +74,7 @@ QVector3D GyroscopeIntegrator::computeGyroBias(const QVector<ImuSample> &samples
 }
 
 void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sampleRate,
-                                    const QQuaternion &imuToCamera, float smoothing)
+                                    const QQuaternion &imuToCamera)
 {
     m_sampleRate = sampleRate;
     m_orientations.clear();
@@ -241,60 +252,17 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         current = (current * delta).normalized();
     }
 
-    if (smoothing > 0.0f)
-        smoothOrientations(smoothing);
-
     qDebug() << "Gyro integrator:" << m_orientations.size() << "keyframes";
 }
 
-// Centered sliding-window quaternion average (Markley style: sum the quaternion
-// vectors after sign-flipping to the nearest neighbor, then normalize). A
-// centered window introduces no phase lag (unlike exponential smoothing), which
-// keeps quick movements responsive while averaging out high-frequency jitter
-// from gyro noise. Window size scales with `smoothing` (0..1) up to a maximum
-// of 40 samples (100 ms at 400 Hz).
-void GyroscopeIntegrator::smoothOrientations(float smoothing)
+QQuaternion GyroscopeIntegrator::orientationAtTime(double time, float smoothingMs) const
 {
-    const int count = m_orientations.size();
-    if (count < 3)
-        return;
-
-    const int maxHalf = 20;                    // max window half-width (samples)
-    const int half = qMax(1, qMin(maxHalf, (int)(smoothing * maxHalf)));
-
-    QVector<QQuaternion> smoothed;
-    smoothed.reserve(count);
-
-    for (int i = 0; i < count; i++) {
-        const int lo = qMax(0, i - half);
-        const int hi = qMin(count - 1, i + half);
-
-        // Sum the quaternion vectors, flipping sign so each is within 180° of
-        // the accumulated direction (handles the q/-q double cover).
-        float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
-        const QQuaternion &ref = m_orientations[lo];
-        for (int j = lo; j <= hi; j++) {
-            QQuaternion q = m_orientations[j];
-            if (QQuaternion::dotProduct(q, ref) < 0.0f)
-                q = QQuaternion(-q.scalar(), -q.x(), -q.y(), -q.z());
-            x += q.x(); y += q.y(); z += q.z(); w += q.scalar();
-        }
-        QQuaternion avg(w, x, y, z);
-        avg.normalize();
-        smoothed.append(avg);
-    }
-
-    m_orientations = smoothed;
-}
-
-QQuaternion GyroscopeIntegrator::orientationAtTime(double time) const
-{
-    return orientationAt(m_orientations, m_timestamps, time);
+    return orientationAt(m_orientations, m_timestamps, time, smoothingMs);
 }
 
 QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orientations,
                                                const QVector<double> &timestamps,
-                                               double time)
+                                               double time, float smoothingMs)
 {
     if (orientations.isEmpty()) return QQuaternion();
 
@@ -303,13 +271,85 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
     if (time >= timestamps.last())
         return orientations.last();
 
-    for (int i = 0; i < timestamps.size() - 1; i++) {
-        if (time >= timestamps[i] && time < timestamps[i + 1]) {
-            float t = (float)((time - timestamps[i]) /
-                              (timestamps[i + 1] - timestamps[i]));
-            return QQuaternion::slerp(orientations[i], orientations[i + 1], t);
+    // Find the bracketing index.
+    int i = 0;
+    for (int k = 0; k < timestamps.size() - 1; k++) {
+        if (time >= timestamps[k] && time < timestamps[k + 1]) { i = k; break; }
+    }
+
+    // Estimate the local camera angular rate (deg/s) from the pre-computed
+    // orientation chain (angle between orientations +/-span samples apart over
+    // their timestamps) so the smoothing window can adapt to the motion.
+    float rateDegS = 0.0f;
+    {
+        const int span = 5;  // +/-5 samples (~25 ms at 400 Hz)
+        const int a = qMax(0, i - span);
+        const int b = qMin(timestamps.size() - 1, i + span);
+        if (b > a) {
+            QQuaternion qa = orientations[a];
+            const QQuaternion &qb = orientations[b];
+            if (QQuaternion::dotProduct(qa, qb) < 0.0f)
+                qa = QQuaternion(-qa.scalar(), -qa.x(), -qa.y(), -qa.z());
+            const float angRad = 2.0f * qAcos(qAbs(QQuaternion::dotProduct(qa, qb)));
+            const float dtS = (float)(timestamps[b] - timestamps[a]);
+            if (dtS > 0.0f)
+                rateDegS = qRadiansToDegrees(angRad) / dtS;
         }
     }
 
-    return orientations.last();
+    // Minimum window = one 30 fps video frame (~33 ms, ~13 IMU samples at 400 Hz)
+    // so even at smoothingMs = 0 we average over the frame exposure time, giving
+    // ~11 dB jitter reduction for free. Larger windows use a Gaussian profile
+    // (sigma = window/4) so the frequency response rolls off monotonically with
+    // no box-filter side lobes. All orientations are pre-computed, so this
+    // centered window looks ahead in the array without any real-time latency.
+    //
+    // The user's smoothingMs sets the window ceiling and the 33 ms exposure
+    // average the floor; the local rate scales between them (kRateSlow/Fast,
+    // kRateLowRatio) so slow pans don't accumulate Gaussian lag and fast shakes
+    // get the full attenuation.
+    const float minWindowMs = 33.0f;
+    const float userWindowMs = qMax(minWindowMs, smoothingMs);
+    float ratio = 1.0f;
+    if (rateDegS < kRateSlow) {
+        ratio = kRateLowRatio;
+    } else if (rateDegS < kRateFast) {
+        ratio = kRateLowRatio
+              + (1.0f - kRateLowRatio) * (rateDegS - kRateSlow) / (kRateFast - kRateSlow);
+    }
+    const float windowMs = qMax(minWindowMs,
+                                minWindowMs + (userWindowMs - minWindowMs) * ratio);
+    const float halfMs = windowMs / 2.0f;
+    const float sigmaMs = windowMs / 4.0f;
+
+    const double t0 = time - halfMs;
+    const double t1 = time + halfMs;
+    int lo = i, hi = i;
+    while (lo > 0 && timestamps[lo] > t0) lo--;
+    while (hi < timestamps.size() - 1 && timestamps[hi] < t1) hi++;
+
+    // Markley-style Gaussian-weighted quaternion average: accumulate the
+    // quaternion vectors (sign-flipped so each is within 180° of the reference)
+    // weighted by a Gaussian of the time offset, then normalize.
+    const QQuaternion &ref = orientations[i];
+    float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
+    float wsum = 0.0f;
+    const float invSigma2 = 1.0f / (sigmaMs * sigmaMs);
+    for (int j = lo; j <= hi; j++) {
+        double dt = (timestamps[j] - time) * 1000.0; // ms
+        float weight = std::exp(-0.5f * (float)(dt * dt) * invSigma2);
+        QQuaternion q = orientations[j];
+        if (QQuaternion::dotProduct(q, ref) < 0.0f)
+            q = QQuaternion(-q.scalar(), -q.x(), -q.y(), -q.z());
+        x += q.x() * weight; y += q.y() * weight;
+        z += q.z() * weight; w += q.scalar() * weight;
+        wsum += weight;
+    }
+    if (wsum <= 0.0f)
+        return orientations[i];
+
+    QQuaternion avg(w, x, y, z);
+    avg /= wsum;
+    avg.normalize();
+    return avg;
 }

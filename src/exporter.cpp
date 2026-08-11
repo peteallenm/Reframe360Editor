@@ -833,7 +833,12 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
             eof = true;
             break;
         }
-        ExportFrameState s = state(t);
+        // Look up the state at the frame's actual presentation timestamp, not
+        // the idealized start + i/fps grid: the IMU sync must align to the real
+        // frame time (the same PTS the preview uses), otherwise VFR timing
+        // variations and container jitter desync the stabilization.
+        const double stateTime = (frame.timestamp >= 0.0) ? frame.timestamp : t;
+        ExportFrameState s = state(stateTime);
         QImage rendered;
         if (gpuReady) {
             // Optical-flow stitching: estimate the parallax field for this

@@ -92,12 +92,13 @@ Pane {
                     border.color: "white"
                     border.width: 1
                     onXChanged: {
-                        if (dragIn.active)
+                        if (dragIn.drag.active)
                             app.exportStart = Math.max(0, Math.min(app.exportEnd, (x + 3) / trimStrip.width * app.duration))
                     }
                     Binding {
                         target: inHandle
                         property: "x"
+                        when: !dragIn.drag.active
                         value: trimStrip.width * (app.exportStart / Math.max(app.duration, 0.001)) - 3
                     }
                     MouseArea {
@@ -121,12 +122,13 @@ Pane {
                     border.color: "white"
                     border.width: 1
                     onXChanged: {
-                        if (dragOut.active)
+                        if (dragOut.drag.active)
                             app.exportEnd = Math.max(app.exportStart, Math.min(app.duration, (x + 3) / trimStrip.width * app.duration))
                     }
                     Binding {
                         target: outHandle
                         property: "x"
+                        when: !dragOut.drag.active
                         value: trimStrip.width * (app.exportEnd / Math.max(app.duration, 0.001)) - 3
                     }
                     MouseArea {

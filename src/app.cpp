@@ -45,7 +45,11 @@ App::App(QObject *parent)
     , m_fov(90.0)
     , m_imuStabilize(false)
     , m_imuSmoothing(0.5)
-    , m_imuSyncOffset(0.0)
+    // Linear sync model: offset(t) = m_imuSyncOffset + m_imuDrift * t. The
+    // measured IMU<->video clock drift on this camera is ~0.0038 s/s, so the
+    // offset that works at t=0 (~0.17 s) grows to ~0.26 s by 24 s.
+    , m_imuSyncOffset(0.17)
+    , m_imuDrift(0.0038)
     , m_flowStitch(false)
     , m_flowStrength(1.0)
     , m_flowIterations(kDefaultFlowIterations)
@@ -162,6 +166,7 @@ App::App(QObject *parent)
     connect(this, &App::imuStabilizeChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSmoothingChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSyncOffsetChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::imuDriftChanged, this, [this]() { saveSettings(); });
     connect(this, &App::projectionChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowStitchChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowStrengthChanged, this, [this]() { saveSettings(); });
@@ -260,8 +265,7 @@ void App::setVideoPath(const QString &path)
             // separate static per-clip gravity alignment is needed.
             m_gyroIntegrator->integrate(m_imuParser->samples(),
                                         m_imuParser->imuSampleRate(),
-                                        m_imuParser->initialQuaternion(),
-                                        (float)m_imuSmoothing);
+                                        m_imuParser->initialQuaternion());
         }
 
         emit videoLoaded();
@@ -454,6 +458,20 @@ void App::setImuSyncOffset(double offset)
 
     m_imuSyncOffset = offset;
     emit imuSyncOffsetChanged();
+}
+
+double App::imuDrift() const
+{
+    return m_imuDrift;
+}
+
+void App::setImuDrift(double drift)
+{
+    if (qFuzzyCompare(m_imuDrift, drift))
+        return;
+
+    m_imuDrift = drift;
+    emit imuDriftChanged();
 }
 
 void App::setFlowStitch(bool stitch)
@@ -709,7 +727,21 @@ QQuaternion App::imuOrientationAt(double time) const
         // quaternion to the shader, so the displayed (stabilized) world
         // direction lives in a gravity-aligned frame and the default 0/0/0
         // view is level.
-        return m_gyroIntegrator->orientationAtTime(time + m_imuSyncOffset);
+        //
+        // Smoothing slider (0..1) maps to a Gaussian window of up to 300 ms,
+        // applied at the video frame rate in the integrator (avoids 400 Hz ->
+        // 30 fps aliasing of high-frequency jitter). The window is rate-adaptive
+        // inside orientationAt(): it scales up to the slider value during
+        // fast/shakey motion and shrinks toward the 33 ms exposure average on
+        // slow smooth pans, so Gaussian lag doesn't read out as low-freq wander.
+        // 0.5 (default) = 150 ms ceiling.
+        //
+        // Sync is a linear model offset(t) = m_imuSyncOffset + m_imuDrift*t
+        // (the IMU and video clocks run at slightly different rates, so the
+        // offset that aligns the start of the clip is ~0.07 s too small by 24 s).
+        const float smoothingMs = (float)(m_imuSmoothing * 300.0);
+        return m_gyroIntegrator->orientationAtTime(
+                    time * (1.0 + m_imuDrift) + m_imuSyncOffset, smoothingMs);
     }
     return QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
 }
@@ -855,6 +887,8 @@ ExportSnapshot App::buildExportSnapshot() const
         s.imuTimestamps = m_gyroIntegrator->timestamps();
     }
     s.syncOffset = m_imuSyncOffset;
+    s.drift = m_imuDrift;
+    s.imuSmoothingMs = (float)(m_imuSmoothing * 300.0);
     return s;
 }
 
@@ -864,6 +898,7 @@ void App::loadSettings()
     setImuStabilize(s.value(QStringLiteral("imu/stabilize"), m_imuStabilize).toBool());
     setImuSmoothing(s.value(QStringLiteral("imu/smoothing"), m_imuSmoothing).toDouble());
     setImuSyncOffset(s.value(QStringLiteral("imu/syncOffset"), m_imuSyncOffset).toDouble());
+    setImuDrift(s.value(QStringLiteral("imu/drift"), m_imuDrift).toDouble());
     // Clamp to the valid projection ids so a stale/corrupt settings value can
     // never put the QML combo box out of range.
     setProjection(qBound(0, s.value(QStringLiteral("projection"), m_projection).toInt(), 3));
@@ -901,6 +936,7 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("imu/stabilize"), m_imuStabilize);
     s.setValue(QStringLiteral("imu/smoothing"), m_imuSmoothing);
     s.setValue(QStringLiteral("imu/syncOffset"), m_imuSyncOffset);
+    s.setValue(QStringLiteral("imu/drift"), m_imuDrift);
     s.setValue(QStringLiteral("projection"), m_projection);
     s.setValue(QStringLiteral("flow/stitch"), m_flowStitch);
     s.setValue(QStringLiteral("flow/strength"), m_flowStrength);
