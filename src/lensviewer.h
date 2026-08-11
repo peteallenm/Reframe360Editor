@@ -5,6 +5,7 @@
 #include <QQuaternion>
 #include <QQmlEngine>
 #include <QSGTexture>
+#include <QImage>
 #include "videodecoder.h"
 #include "calibration.h"
 #include "colorgrade.h"
@@ -27,6 +28,10 @@ class LensViewer : public QQuickItem
     Q_PROPERTY(CalibrationProfile* calibration READ calibration WRITE setCalibration NOTIFY calibrationChanged)
     Q_PROPERTY(ColorGrade* colorGrade READ colorGrade WRITE setColorGrade NOTIFY colorGradeChanged)
     Q_PROPERTY(QQuaternion imuOrientation READ imuOrientation WRITE setImuOrientation NOTIFY imuOrientationChanged)
+    Q_PROPERTY(bool flowStitch READ flowStitch WRITE setFlowStitch NOTIFY flowStitchChanged)
+    Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
+    Q_PROPERTY(QImage flowImage READ flowImage WRITE setFlowImage NOTIFY flowImageChanged)
+    Q_PROPERTY(double flowEncode READ flowEncode WRITE setFlowEncode NOTIFY flowEncodeChanged)
 
 public:
     explicit LensViewer(QQuickItem *parent = nullptr);
@@ -57,6 +62,14 @@ public:
     void setColorGrade(ColorGrade *grade);
     QQuaternion imuOrientation() const { return m_imuOrientation; }
     void setImuOrientation(const QQuaternion &q);
+    bool flowStitch() const { return m_flowStitch; }
+    void setFlowStitch(bool v);
+    double flowStrength() const { return m_flowStrength; }
+    void setFlowStrength(double v);
+    QImage flowImage() const { return m_flowImage; }
+    void setFlowImage(const QImage &img);
+    double flowEncode() const { return m_flowEncode; }
+    void setFlowEncode(double v);
 
 protected:
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
@@ -74,6 +87,10 @@ signals:
     void calibrationChanged();
     void colorGradeChanged();
     void imuOrientationChanged();
+    void flowStitchChanged();
+    void flowStrengthChanged();
+    void flowImageChanged();
+    void flowEncodeChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -89,6 +106,13 @@ private:
     QSGTexture *m_uTexture;
     QSGTexture *m_vTexture;
     int m_lastFrameTimestamp;
+
+    bool m_flowStitch;
+    double m_flowStrength;
+    double m_flowEncode;
+    QImage m_flowImage;
+    QSGTexture *m_flowTexture;
+    qint64 m_flowTextureKey;
 };
 
 #endif // LENSVIEWER_H

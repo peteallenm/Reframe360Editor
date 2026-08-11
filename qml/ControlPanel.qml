@@ -23,6 +23,8 @@ Item {
         property real step: 0.01
         property int decimals: 2
         property string suffixText: ""
+        property bool controlEnabled: true
+        enabled: row.controlEnabled
 
         Label {
             text: row.labelText
@@ -221,6 +223,41 @@ Item {
                                     onMoved: app.imuSyncOffset = value
                                 }
                                 Label { text: syncSlider.value.toFixed(2) + "s"; Layout.preferredWidth: 50 }
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: qsTr("Flow Stitching")
+                        Layout.fillWidth: true
+                        ToolTip.text: qsTr("Estimates the parallax displacement between the two lenses in the seam band (Horn-Schunck optical flow) and warps the rear view to align with the front before blending, removing seam ghosting on near objects.")
+                        ToolTip.visible: hovered
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+
+                            CheckBox {
+                                id: flowCheck
+                                text: qsTr("Enable")
+                                checked: app.flowStitch
+                                onCheckedChanged: app.flowStitch = checked
+                            }
+
+                            SliderRow {
+                                labelText: qsTr("Strength:")
+                                value: app.flowStrength
+                                onUserChange: (v) => app.flowStrength = v
+                                min: 0; max: 2; step: 0.05
+                                controlEnabled: flowCheck.checked
+                            }
+
+                            SliderRow {
+                                labelText: qsTr("Iterations:")
+                                value: app.flowIterations
+                                onUserChange: (v) => app.flowIterations = v
+                                min: 20; max: 100; step: 1; decimals: 0
+                                controlEnabled: flowCheck.checked
                             }
                         }
                     }

@@ -46,8 +46,16 @@ struct ViewerUniforms {
     float blueMids;         // offset 284
     float blueHighs;        // offset 288
     float _padG[3];         // offset 292 (std140 rounds the struct to 16B -> 304)
+    // --- Flow stitching (see OpticalFlow.md; std140-locked to project.frag) ---
+    int flowStitch;         // offset 304
+    int flowIterations;     // offset 308  (for FlowRenderer, not the shader)
+    float flowStrength;     // offset 312
+    float bandTheta0;       // offset 316  (radians)
+    float bandTheta1;       // offset 320  (radians)
+    float flowEncode;       // offset 324  (decode scale of the packed flow)
+    float _padH[2];         // offset 328  (std140 rounds the struct to 16B -> 336)
 };
-static_assert(sizeof(ViewerUniforms) == 304, "ViewerUniforms must match std140 layout");
+static_assert(sizeof(ViewerUniforms) == 336, "ViewerUniforms must match std140 layout");
 
 ViewerMaterial::ViewerMaterial()
     : m_yTex(nullptr), m_uTex(nullptr), m_vTex(nullptr)
@@ -65,6 +73,9 @@ ViewerMaterial::ViewerMaterial()
     , m_redLows(0.0f), m_redMids(0.0f), m_redHighs(0.0f)
     , m_greenLows(0.0f), m_greenMids(0.0f), m_greenHighs(0.0f)
     , m_blueLows(0.0f), m_blueMids(0.0f), m_blueHighs(0.0f)
+    , m_flowTex(nullptr), m_flowStitch(false), m_flowStrength(1.0f)
+    , m_bandTheta0(kDefaultBandTheta0), m_bandTheta1(kDefaultBandTheta1)
+    , m_flowEncode(16.0f)
 {
 }
 
@@ -82,6 +93,7 @@ int ViewerMaterial::compare(const QSGMaterial *other) const
 {
     const ViewerMaterial *m = static_cast<const ViewerMaterial*>(other);
     if (m_yTex != m->m_yTex) return (intptr_t)m_yTex - (intptr_t)m->m_yTex;
+    if (m_flowTex != m->m_flowTex) return (intptr_t)m_flowTex - (intptr_t)m->m_flowTex;
     return 0;
 }
 
@@ -176,6 +188,12 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.blueLows = m_blueLows;
     u.blueMids = m_blueMids;
     u.blueHighs = m_blueHighs;
+    u.flowStitch = m_flowStitch ? 1 : 0;
+    u.flowIterations = 0;   // FlowRenderer-only; unused by the shader
+    u.flowStrength = m_flowStrength;
+    u.bandTheta0 = m_bandTheta0;
+    u.bandTheta1 = m_bandTheta1;
+    u.flowEncode = m_flowEncode;
 
     const float *mat = m_imuMatrix.constData();
     for (int i = 0; i < 16; i++) u.imuMatrix[i] = mat[i];
@@ -234,11 +252,14 @@ void ViewerMaterialShader::updateSampledImage(RenderState &state, int binding,
     case 1: tex = m->yTexture(); break;
     case 2: tex = m->uTexture(); break;
     case 3: tex = m->vTexture(); break;
+    case 4: tex = m->flowTexture(); break;
     }
     if (tex) {
         tex->setFiltering(QSGTexture::Linear);
         tex->setMipmapFiltering(QSGTexture::None);
-        tex->setHorizontalWrapMode(QSGTexture::ClampToEdge);
+        // The flow's u axis is the periodic phi (front/back seam lives at the
+        // u=0/1 wrap), so horizontal wrapping must not smear the seam texels.
+        tex->setHorizontalWrapMode(binding == 4 ? QSGTexture::Repeat : QSGTexture::ClampToEdge);
         tex->setVerticalWrapMode(QSGTexture::ClampToEdge);
         tex->commitTextureOperations(state.rhi(), state.resourceUpdateBatch());
         *texture = tex;

@@ -6,7 +6,15 @@ layout(location = 0) out vec4 fragColor;
 layout(binding = 1) uniform sampler2D u_texY;
 layout(binding = 2) uniform sampler2D u_texU;
 layout(binding = 3) uniform sampler2D u_texV;
+layout(binding = 4) uniform sampler2D u_flow;  // optical-flow field (RG, encoded)
 
+// NOTE: GpuRenderer::flattenUniformBlock turns every non-empty line in the
+// block below into "uniform <line>;", so standalone comment lines are NOT
+// allowed inside it (they would become "uniform // ..." and fail to compile).
+// Keep comments on the same line as a member, after its semicolon.
+// Also NOTE: std140 arrays of scalars are strided to 16 bytes, so the padding
+// below MUST be scalar members (not float _padG[3]) to keep offsets 292..335
+// locked to the C++ ViewerUniforms struct (336 bytes total).
 layout(std140, binding = 0) uniform Uniforms {
     mat4 qt_Matrix;
     float qt_Opacity;
@@ -49,6 +57,17 @@ layout(std140, binding = 0) uniform Uniforms {
     float u_blueLows;
     float u_blueMids;
     float u_blueHighs;
+    float _padG0;          // offset 292
+    float _padG1;          // offset 296
+    float _padG2;          // offset 300
+    int u_flowStitch;      // offset 304 (1 = apply flow warp in the blend band)
+    int u_flowIterations;  // offset 308 (for FlowRenderer, not the shader)
+    float u_flowStrength;  // offset 312 (scales the displacement; 0 disables)
+    float u_bandTheta0;    // offset 316 (band lower bound, radians)
+    float u_bandTheta1;    // offset 320 (band upper bound, radians)
+    float u_flowEncode;    // offset 324 (decode scale of the packed flow texture)
+    float _padH0;          // offset 328 -> struct rounds to 336
+    float _padH1;          // offset 332
 };
 
 const float PI = 3.14159265359;
@@ -190,6 +209,46 @@ void main() {
         float ur = texture(u_texU, uv_r).r;
         float vr = texture(u_texV, uv_r).r;
         vec3 rgb_r = yuvToRgb(yr, ur, vr);
+
+        // ---- Optical-flow parallax stitching (see OpticalFlow.md) ----
+        // Only the transition band (where both lenses contribute) is warped:
+        // w = 4*blend*(1-blend) is a tent peaking at blend=0.5 (the seam
+        // centre) and 0 at pure front (blend=0) / pure rear (blend=1), so the
+        // regions that render from a single lens stay geometrically
+        // unmodified. The flow field lives in the camera-native band
+        // (phi in [0,2pi), theta in [bandTheta0, bandTheta1]) and stores the
+        // rear-vs-front displacement in normalized band units, so we warp the
+        // rear sample to align with the front before blending.
+        if (u_flowStitch != 0) {
+            float w = 4.0 * blend * (1.0 - blend);
+            if (w > 0.0) {
+                float u_band = mod(phi + PI, 2.0 * PI) / (2.0 * PI);
+                float v_band = clamp((theta - u_bandTheta0) / (u_bandTheta1 - u_bandTheta0), 0.0, 1.0);
+                vec2 enc = texture(u_flow, vec2(u_band, v_band)).rg;
+                vec2 nduv = (enc - 0.5) / u_flowEncode * u_flowStrength;
+
+                float phi2 = mod(u_band + nduv.x, 1.0) * 2.0 * PI - PI;
+                float theta2 = mix(u_bandTheta0, u_bandTheta1,
+                                   clamp(v_band + nduv.y, 0.0, 1.0));
+                vec3 ray2 = vec3(sin(theta2) * cos(phi2),
+                                 sin(theta2) * sin(phi2), -cos(theta2));
+
+                // Project the warped direction into the REAR fisheye (same
+                // math as the geometric rear sample above).
+                float theta_rear2 = PI - theta2;
+                float r_rear2 = theta_rear2 / (PI * 0.5);
+                float r_dist2 = r_rear2 * (1.0 + u_rearK1 * r_rear2 * r_rear2 + u_rearK2 * r_rear2 * r_rear2 * r_rear2 * r_rear2);
+                vec2 off2 = rotateVec2(vec2(cos(phi2), sin(phi2)), radians(u_rearRotation)) * r_dist2 * u_rearRadius;
+                if (mod(float(u_hflipFlags), 4.0) >= 2.0)
+                    off2.x = -off2.x;
+                vec2 uv_r2 = u_rearCenter + off2;
+                vec2 uv_tex2 = vec2(uv_r2.x, uv_r2.y * 0.5 + 0.5);
+                vec3 rgb_warped = yuvToRgb(texture(u_texY, uv_tex2).r,
+                                           texture(u_texU, uv_tex2).r,
+                                           texture(u_texV, uv_tex2).r);
+                rgb_r = mix(rgb_r, rgb_warped, w);
+            }
+        }
 
         rgb = mix(rgb_f, rgb_r, blend);
     }

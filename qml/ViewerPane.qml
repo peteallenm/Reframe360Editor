@@ -24,6 +24,10 @@ Item {
             calibration: app.currentCalibration
             colorGrade: app.colorGrade
             imuOrientation: app.imuStabilize ? app.imuOrientation : Qt.quaternion(1, 0, 0, 0)
+            flowStitch: app.flowStitch
+            flowStrength: app.flowStrength
+            flowImage: app.flowImage
+            flowEncode: app.flowEncode
         }
 
         MouseArea {

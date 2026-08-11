@@ -5,8 +5,10 @@
 #include <QString>
 #include <QUrl>
 #include <QQuaternion>
+#include <QImage>
 
 class QTimer;
+class QThread;
 #include "videodecoder.h"
 #include "imuparser.h"
 #include "gyroscopeintegrator.h"
@@ -14,6 +16,7 @@ class QTimer;
 #include "colorgrade.h"
 #include "keyframe.h"
 #include "exporter.h"
+#include "flowrenderer.h"
 
 // Immutable snapshot of everything the exporter needs, captured at export
 // start so the export worker thread never touches live GUI state. Per-time
@@ -66,6 +69,11 @@ class App : public QObject
     Q_PROPERTY(bool imuStabilize READ imuStabilize WRITE setImuStabilize NOTIFY imuStabilizeChanged)
     Q_PROPERTY(double imuSmoothing READ imuSmoothing WRITE setImuSmoothing NOTIFY imuSmoothingChanged)
     Q_PROPERTY(double imuSyncOffset READ imuSyncOffset WRITE setImuSyncOffset NOTIFY imuSyncOffsetChanged)
+    Q_PROPERTY(bool flowStitch READ flowStitch WRITE setFlowStitch NOTIFY flowStitchChanged)
+    Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
+    Q_PROPERTY(int flowIterations READ flowIterations WRITE setFlowIterations NOTIFY flowIterationsChanged)
+    Q_PROPERTY(QImage flowImage READ flowImage NOTIFY flowImageReady)
+    Q_PROPERTY(double flowEncode READ flowEncode NOTIFY flowImageReady)
     Q_PROPERTY(QString previewThumbnailPath READ previewThumbnailPath NOTIFY videoPathChanged)
     Q_PROPERTY(bool usePreviewThumbnail READ usePreviewThumbnail WRITE setUsePreviewThumbnail NOTIFY usePreviewThumbnailChanged)
     Q_PROPERTY(int activeLens READ activeLens WRITE setActiveLens NOTIFY activeLensChanged)
@@ -122,6 +130,15 @@ public:
     double imuSyncOffset() const;
     void setImuSyncOffset(double offset);
 
+    bool flowStitch() const { return m_flowStitch; }
+    void setFlowStitch(bool v);
+    double flowStrength() const { return m_flowStrength; }
+    void setFlowStrength(double v);
+    int flowIterations() const { return m_flowIterations; }
+    void setFlowIterations(int v);
+    QImage flowImage() const { return m_flowImage; }
+    double flowEncode() const { return m_flowEncode; }
+
     int activeLens() const;
     void setActiveLens(int lens);
 
@@ -170,6 +187,11 @@ private:
     // reads fixed integrator data).
     QQuaternion imuOrientationAt(double time) const;
 
+    // Optical-flow preview: request a recompute for the current frame (queued
+    // to the flow worker), and consume its packed result.
+    void maybeComputeFlow();
+    void onFlowReady(const QImage &image, float encodeScale);
+
 signals:
     void videoPathChanged();
     void isPlayingChanged();
@@ -182,12 +204,18 @@ signals:
     void imuStabilizeChanged();
     void imuSmoothingChanged();
     void imuSyncOffsetChanged();
+    void flowStitchChanged();
+    void flowStrengthChanged();
+    void flowIterationsChanged();
+    void flowImageReady();
     void usePreviewThumbnailChanged();
     void activeLensChanged();
     void projectionChanged();
     void currentCalibrationChanged();
     void imuOrientationChanged();
     void videoLoaded();
+    void flowRequested(const DecodedFrame &frame, const FlowCalibration &cal,
+                       const FlowSettings &settings);
     void errorOccurred(const QString &message);
     void exportRunningChanged();
     void exportProgressChanged();
@@ -226,6 +254,14 @@ private:
     int m_activeLens;
     int m_projection;
     QQuaternion m_viewQuat;
+
+    bool m_flowStitch;
+    double m_flowStrength;
+    int m_flowIterations;
+    QImage m_flowImage;
+    double m_flowEncode;
+    FlowWorker *m_flowWorker;
+    QThread *m_flowThread;
 };
 
 #endif // APP_H

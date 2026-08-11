@@ -1,5 +1,6 @@
 #include "lensviewer.h"
 #include "viewermaterial.h"
+#include "flowrenderer.h"
 #include <QSGGeometryNode>
 #include <QSGGeometry>
 #include <QSGSimpleTextureNode>
@@ -21,6 +22,11 @@ LensViewer::LensViewer(QQuickItem *parent)
     , m_uTexture(nullptr)
     , m_vTexture(nullptr)
     , m_lastFrameTimestamp(-1)
+    , m_flowStitch(false)
+    , m_flowStrength(1.0)
+    , m_flowEncode(16.0)
+    , m_flowTexture(nullptr)
+    , m_flowTextureKey(-1)
 {
     setFlag(ItemHasContents, true);
 }
@@ -74,6 +80,19 @@ void LensViewer::setCalibration(CalibrationProfile *cal)
     update();
 }
 void LensViewer::setImuOrientation(const QQuaternion &q) { if (m_imuOrientation == q) return; m_imuOrientation = q; emit imuOrientationChanged(); update(); }
+
+void LensViewer::setFlowStitch(bool v) { if (m_flowStitch == v) return; m_flowStitch = v; emit flowStitchChanged(); update(); }
+void LensViewer::setFlowStrength(double v) { if (qFuzzyCompare(m_flowStrength, v)) return; m_flowStrength = v; emit flowStrengthChanged(); update(); }
+void LensViewer::setFlowEncode(double v) { if (qFuzzyCompare(m_flowEncode, v)) return; m_flowEncode = v; emit flowEncodeChanged(); update(); }
+
+void LensViewer::setFlowImage(const QImage &img)
+{
+    if (m_flowImage.cacheKey() == img.cacheKey() && m_flowImage.isNull() == img.isNull())
+        return;
+    m_flowImage = img;
+    emit flowImageChanged();
+    update();
+}
 
 void LensViewer::setColorGrade(ColorGrade *grade)
 {
@@ -200,6 +219,36 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         );
         material->setHFlip(m_calibration->frontHFlip(), m_calibration->rearHFlip());
     }
+
+    // Optical-flow stitching: upload the packed flow field on the render
+    // thread (like the YUV planes) and enable the warp only when a field is
+    // actually present AND the user has flow stitching on. The flow image is
+    // RGBA8 from the FlowWorker; it is re-uploaded only when its backing data
+    // changes (cacheKey), i.e. when a new frame's flow has arrived. The image
+    // is snapshotted by value so the backing data stays alive for the whole
+    // upload even if the GUI thread replaces the member concurrently.
+    const QImage flowImg = m_flowImage;
+    if (m_flowStitch && !flowImg.isNull()) {
+        const qint64 key = flowImg.cacheKey();
+        if (key != m_flowTextureKey) {
+            delete m_flowTexture;
+            m_flowTexture = window()->createTextureFromImage(flowImg);
+            m_flowTextureKey = key;
+        }
+        material->setFlowTexture(m_flowTexture);
+        material->setFlow(true);
+    } else {
+        if (m_flowTexture) {
+            delete m_flowTexture;
+            m_flowTexture = nullptr;
+            m_flowTextureKey = -1;
+        }
+        material->setFlowTexture(nullptr);
+        material->setFlow(false);
+    }
+    material->setFlowStrength((float)m_flowStrength);
+    material->setFlowEncode((float)m_flowEncode);
+    material->setBandTheta(kDefaultBandTheta0, kDefaultBandTheta1);
 
     node->markDirty(QSGNode::DirtyGeometry | QSGNode::DirtyMaterial);
     return node;

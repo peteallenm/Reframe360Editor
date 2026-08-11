@@ -12,6 +12,7 @@
 
 #include "videodecoder.h"
 #include "gpurenderer.h"
+#include "flowrenderer.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -310,6 +311,83 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
 
     return img;
 }
+
+// Build the FlowCalibration the band extraction needs from an export state.
+static FlowCalibration flowCalibrationFromState(const ExportFrameState &s)
+{
+    FlowCalibration c;
+    c.frontCenterX = s.frontCenterX;
+    c.frontCenterY = s.frontCenterY;
+    c.frontRadius = s.frontRadius;
+    c.frontK1 = s.frontK1;
+    c.frontK2 = s.frontK2;
+    c.frontRotation = s.frontRotation;
+    c.frontHFlip = s.frontHFlip;
+    c.rearCenterX = s.rearCenterX;
+    c.rearCenterY = s.rearCenterY;
+    c.rearRadius = s.rearRadius;
+    c.rearK1 = s.rearK1;
+    c.rearK2 = s.rearK2;
+    c.rearRotation = s.rearRotation;
+    c.rearHFlip = s.rearHFlip;
+    return c;
+}
+
+// Small state machine so the export worker estimates the parallax flow field
+// for each rendered frame (when flow stitching is enabled) and hands it to the
+// GpuRenderer. If no 4.4 context can be made, or a frame's flow fails, the
+// frame is rendered without the warp (with a single warning) rather than
+// failing the whole export.
+class FlowEngine
+{
+public:
+    bool prepare(const ExportFrameState &s)
+    {
+        if (!s.flowStitch || m_failed)
+            return false;
+        if (m_ready)
+            return true;
+        QString err;
+        if (!m_renderer.initialize(&err)) {
+            m_failed = true;
+            qWarning().noquote() << "Flow stitching unavailable, rendering without it:" << err;
+            return false;
+        }
+        m_cal = flowCalibrationFromState(s);
+        m_settings.alpha = kDefaultFlowAlpha;
+        m_settings.iterations = s.flowIterations;
+        m_settings.bandTheta0 = s.bandTheta0;
+        m_settings.bandTheta1 = s.bandTheta1;
+        m_ready = true;
+        return true;
+    }
+
+    // Compute the flow for <frame>; on success uploads it into <gpu> and
+    // returns true. Returns false if the frame must render without flow.
+    bool apply(const DecodedFrame &frame, GpuRenderer &gpu)
+    {
+        if (!m_ready)
+            return false;
+        QVector<float> flow;
+        QString err;
+        if (!m_renderer.compute(frame, m_cal, m_settings, &flow, &err)) {
+            if (!m_failed) {
+                m_failed = true;
+                qWarning().noquote() << "Flow computation failed for a frame, rendering without it:" << err;
+            }
+            return false;
+        }
+        gpu.setFlowData(flow, m_renderer.bandWidth(), m_renderer.bandHeight());
+        return true;
+    }
+
+private:
+    FlowRenderer m_renderer;
+    FlowCalibration m_cal;
+    FlowSettings m_settings;
+    bool m_ready = false;
+    bool m_failed = false;
+};
 
 // ---------------------------------------------------------------------------
 // FFmpeg decode reader — owns its own context so exporting can't disturb the
@@ -746,6 +824,8 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     bool eof = false;
     int framesWritten = 0;
 
+    FlowEngine flow;
+
     for (int i = 0; i < totalFrames && !eof; ++i) {
         const double t = start + (double)i / fps;
         DecodedFrame frame;
@@ -753,9 +833,17 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
             eof = true;
             break;
         }
-        const ExportFrameState s = state(t);
+        ExportFrameState s = state(t);
         QImage rendered;
         if (gpuReady) {
+            // Optical-flow stitching: estimate the parallax field for this
+            // frame and upload it before rendering. If flow was requested but
+            // the 4.4 context or a frame's computation fails, that frame
+            // renders without the warp (a warning was logged once).
+            if (s.flowStitch) {
+                if (!flow.prepare(s) || !flow.apply(frame, gpu))
+                    s.flowStitch = false;
+            }
             if (!gpu.render(frame, s, W, H, &rendered, &err)) {
                 fail(err);
                 return;
@@ -815,7 +903,13 @@ void Exporter::runFrame(const QString &videoPath, const QString &outPath,
     }
     QImage rendered;
     if (gpuReady) {
-        if (!gpu.render(frame, state, W, H, &rendered, &err)) {
+        FlowEngine flow;
+        ExportFrameState st = state;
+        if (st.flowStitch) {
+            if (!flow.prepare(st) || !flow.apply(frame, gpu))
+                st.flowStitch = false;
+        }
+        if (!gpu.render(frame, st, W, H, &rendered, &err)) {
             emit exportError(err);
             return;
         }

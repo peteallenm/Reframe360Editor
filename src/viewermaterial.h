@@ -6,6 +6,7 @@
 #include <QSGGeometryNode>
 #include <QSGTexture>
 #include <QMatrix4x4>
+#include "flowrenderer.h"
 
 class ViewerMaterial : public QSGMaterial
 {
@@ -32,6 +33,16 @@ public:
     void setHFlip(bool front, bool rear) { m_frontHFlip = front; m_rearHFlip = rear; }
     void setTextures(QSGTexture *y, QSGTexture *u, QSGTexture *v);
 
+    // Optical-flow stitching (see OpticalFlow.md). setFlowTexture installs
+    // the packed flow field; setFlow toggles whether project.frag warps the
+    // blend band; setFlowEncode passes the packing scale used by the flow
+    // producer so the shader can decode the texture.
+    void setFlowTexture(QSGTexture *flow) { m_flowTex = flow; }
+    void setFlow(bool stitch) { m_flowStitch = stitch; }
+    void setFlowStrength(float strength) { m_flowStrength = strength; }
+    void setFlowEncode(float encode) { m_flowEncode = encode; }
+    void setBandTheta(float theta0, float theta1) { m_bandTheta0 = theta0; m_bandTheta1 = theta1; }
+
     // Colour grading values (see ColorGrade / project.frag for semantics).
     void setColorGrade(float brightness, float contrast, float saturation, float pop,
                        float brightLows, float brightLowMids, float brightHighMids, float brightHighs,
@@ -42,6 +53,12 @@ public:
     QSGTexture *yTexture() const { return m_yTex; }
     QSGTexture *uTexture() const { return m_uTex; }
     QSGTexture *vTexture() const { return m_vTex; }
+    // When flow is off the flow texture is null, but updateSampledImage must
+    // still return a valid QSGTexture for binding 4 (Qt asserts otherwise).
+    // Return the Y texture as a harmless stand-in — project.frag gates the
+    // u_flow sample on u_flowStitch, so the bound texture's contents never
+    // matter when stitching is disabled.
+    QSGTexture *flowTexture() const { return m_flowTex ? m_flowTex : m_yTex; }
 
     QByteArray compileUniformData() const;
 
@@ -67,7 +84,11 @@ public:
     float blendStart() const { return m_blendStart; }
 
 private:
-    QSGTexture *m_yTex, *m_uTex, *m_vTex;
+    QSGTexture *m_yTex, *m_uTex, *m_vTex, *m_flowTex;
+    bool m_flowStitch;
+    float m_flowStrength;
+    float m_bandTheta0, m_bandTheta1;
+    float m_flowEncode;
     float m_viewAspect;
     bool m_fullRange;
     float m_yaw, m_pitch, m_roll, m_fov;

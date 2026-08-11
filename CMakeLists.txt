@@ -24,6 +24,7 @@ qt_add_executable(render360
     src/exporter.cpp
     src/colorgrade.cpp
     src/gpurenderer.cpp
+    src/flowrenderer.cpp
 )
 
 qt_add_qml_module(render360
@@ -50,12 +51,18 @@ qt_add_shaders(render360 "shaders"
 
 # Embed the raw GLSL too: the GPU exporter compiles project.frag/quad.vert
 # directly (the same files the viewer's qsb is baked from), so preview and
-# export can never drift apart.
+# export can never drift apart. The optical-flow shaders are also embedded
+# here — they are compiled at runtime by FlowRenderer's core-4.4 context (they
+# use MRT / layout(binding=...) / RG32F, which cannot be baked for GLSL 100es
+# or 120), so they live only in this raw resource block.
 qt_add_resources(render360 "shaders_raw"
     PREFIX "/shaders_raw"
     FILES
         shaders/quad.vert
         shaders/project.frag
+        shaders/band_extract.frag
+        shaders/hs_gradients.frag
+        shaders/hs_iteration.frag
 )
 
 target_include_directories(render360 PRIVATE

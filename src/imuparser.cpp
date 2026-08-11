@@ -51,9 +51,28 @@ bool ImuParser::loadFile(const QString &path)
     // combined across two IMUs.
     m_imuSampleRate = (sampleRate > 0) ? (double)sampleRate : 400.0;
 
-    // calib[0] is the gyro scale factor in LSB/(deg/s) (32.8 in all files).
+    // calib[0] is the nominal gyro scale factor in LSB/(deg/s) (32.8 in all
+    // files). The actual sensor scale differs per axis: measured from the
+    // controlled 360° rotation files (JustYaw/Pitch/Roll), a 360° rotation
+    // integrates to +369.2° (yaw), +367.7° (pitch) and -353.2° (roll) with the
+    // nominal 32.8 scale. Correcting each axis to read exactly 360° gives the
+    // per-axis scales below (33.64 / 33.51 / 32.18). A scale error leaves a
+    // residual proportional to the motion (e.g. 2.6% yaw scale error -> ~2.3°
+    // residual after a 90° pan), which shows up as the persistent pan/tilt
+    // oscillation measured by vidstabdetect.
+    const double kGyroScaleRoll  = 32.18;   // t1[3], X=roll
+    const double kGyroScalePitch = 33.51;   // t1[1], Y=pitch
+    const double kGyroScaleYaw   = 33.64;   // t1[2], Z=yaw
     if (calib[0] > 0.0 && calib[0] < 1000.0) {
-        m_gyroScaleX = m_gyroScaleY = m_gyroScaleZ = calib[0];
+        // Use the measured per-axis scales if the nominal header scale matches
+        // the known 32.8 (otherwise fall back to the header value).
+        if (std::abs(calib[0] - 32.8) < 0.01) {
+            m_gyroScaleX = kGyroScaleRoll;   // X=roll
+            m_gyroScaleY = kGyroScalePitch;  // Y=pitch
+            m_gyroScaleZ = kGyroScaleYaw;    // Z=yaw
+        } else {
+            m_gyroScaleX = m_gyroScaleY = m_gyroScaleZ = calib[0];
+        }
     }
 
     // dataOffset must be even so the int16 record reads stay aligned.

@@ -5,6 +5,7 @@
 #include <QImage>
 #include <QString>
 #include <QMatrix4x4>
+#include <QVector>
 
 class QOffscreenSurface;
 class QOpenGLContext;
@@ -54,6 +55,13 @@ public:
     bool render(const DecodedFrame &frame, const ExportFrameState &state,
                 int width, int height, QImage *out, QString *error);
 
+    // Install the optical-flow field produced by FlowRenderer for the frame
+    // about to be rendered. The flow is (du, dv) in band-texel units; it is
+    // packed as RG16F (same encoding as the preview path: (ndu*k + 0.5, ...))
+    // and sampled at sampler unit 4 by project.frag when state.flowStitch is
+    // set. The matching decode scale is stored and uploaded as u_flowEncode.
+    void setFlowData(const QVector<float> &flow, int w, int h);
+
 private:
     static QByteArray loadResource(const char *path);
     bool createContext(QString *error);
@@ -78,8 +86,11 @@ private:
     quint32 m_yTex = 0;
     quint32 m_uTex = 0;
     quint32 m_vTex = 0;
+    quint32 m_flowTex = 0;
     int m_fbW = 0;
     int m_fbH = 0;
+    bool m_flowValid = false;
+    float m_flowEncode = 16.0f;
     bool m_ready = false;
 };
 

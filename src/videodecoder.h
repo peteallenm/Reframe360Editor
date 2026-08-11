@@ -6,6 +6,7 @@
 #include <QMutex>
 #include <QQueue>
 #include <QByteArray>
+#include <QMetaType>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -24,6 +25,8 @@ struct DecodedFrame {
     int vStride;
     double timestamp;
 };
+
+Q_DECLARE_METATYPE(DecodedFrame)   // queued to the optical-flow worker
 
 class VideoDecoder : public QObject
 {

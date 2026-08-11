@@ -6,6 +6,8 @@
 #include <QQuaternion>
 #include <functional>
 
+#include "flowrenderer.h"
+
 class QThread;
 
 // Everything needed to render one output frame, mirroring the uniforms the
@@ -40,6 +42,15 @@ struct ExportFrameState {
     bool rearHFlip = false;
 
     float blendStart = 0.9f;
+
+    // Optical-flow stitching (per-export settings, not keyframed). When
+    // flowStitch is set the exporter estimates the Horn-Schunck parallax field
+    // with FlowRenderer and uploads it to GpuRenderer before rendering.
+    bool flowStitch = false;
+    float flowStrength = 1.0f;
+    int flowIterations = kDefaultFlowIterations;
+    float bandTheta0 = kDefaultBandTheta0;
+    float bandTheta1 = kDefaultBandTheta1;
 
     // Colour grading (mirrors the ColorGrade properties and project.frag
     // uniforms, so exported frames match the viewer).

@@ -11,10 +11,12 @@
 #include <QSurfaceFormat>
 #include <QVector2D>
 #include <QtGlobal>
+#include <QtCore/qfloat16.h>
 #include <cstring>
 
 #include "videodecoder.h"
 #include "exporter.h"
+#include "flowrenderer.h"
 
 // ---------------------------------------------------------------------------
 // Shader source adaptation.
@@ -41,6 +43,7 @@ static QByteArray adaptShader(const QByteArray &src)
     s.replace("layout(binding = 1) uniform sampler2D", "uniform sampler2D");
     s.replace("layout(binding = 2) uniform sampler2D", "uniform sampler2D");
     s.replace("layout(binding = 3) uniform sampler2D", "uniform sampler2D");
+    s.replace("layout(binding = 4) uniform sampler2D", "uniform sampler2D");
     // layout(location = N) needs GLSL 410 (or an extension) on NVIDIA's
     // compiler, so strip them and assign attribute locations explicitly via
     // QOpenGLShaderProgram::bindAttributeLocation before linking. With a
@@ -104,6 +107,7 @@ void GpuRenderer::destroy()
     if (m_yTex) { f->glDeleteTextures(1, &m_yTex); m_yTex = 0; }
     if (m_uTex) { f->glDeleteTextures(1, &m_uTex); m_uTex = 0; }
     if (m_vTex) { f->glDeleteTextures(1, &m_vTex); m_vTex = 0; }
+    if (m_flowTex) { f->glDeleteTextures(1, &m_flowTex); m_flowTex = 0; m_flowValid = false; }
     if (m_colorTex) { f->glDeleteTextures(1, &m_colorTex); m_colorTex = 0; }
     if (m_vbo) { f->glDeleteBuffers(1, &m_vbo); m_vbo = 0; }
     if (m_ebo) { f->glDeleteBuffers(1, &m_ebo); m_ebo = 0; }
@@ -145,6 +149,7 @@ bool GpuRenderer::initialize(QString *error)
     m_program->setUniformValue("u_texY", 1);
     m_program->setUniformValue("u_texU", 2);
     m_program->setUniformValue("u_texV", 3);
+    m_program->setUniformValue("u_flow", 4);
 
     QOpenGLFunctions_3_3_Core *f = m_functions;
     f->glGenTextures(1, &m_yTex);
@@ -277,6 +282,48 @@ void GpuRenderer::uploadPlane(quint32 tex, int w, int h, int stride, const void 
     f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
+void GpuRenderer::setFlowData(const QVector<float> &flow, int w, int h)
+{
+    if (!m_ready || !m_context->makeCurrent(m_surface) || w <= 0 || h <= 0
+        || flow.size() < w * h * 2) {
+        m_flowValid = false;
+        return;
+    }
+
+    QOpenGLFunctions_3_3_Core *f = m_functions;
+
+    // Same packing as the preview path (see FlowRenderer::packFlowToImage):
+    // e = ndu*k + 0.5 with ndu = du/w, so the field fits [0,1]. Stored as
+    // RG16F (half float) — GL 3.3-safe, with enough precision after packing.
+    m_flowEncode = flowEncodeScaleFor(flow, w, h);
+
+    if (!m_flowTex)
+        f->glGenTextures(1, &m_flowTex);
+    f->glBindTexture(GL_TEXTURE_2D, m_flowTex);
+
+    QVector<qfloat16> packed(w * h * 2);
+    const float invW = 1.0f / w;
+    const float invH = 1.0f / h;
+    // Row-flip like FlowRenderer::packFlowToImage: glReadPixels is bottom-up,
+    // while project.frag samples v_band=0 for theta0 (the GL texture's v=0
+    // edge is data row 0).
+    for (int i = 0; i < w * h; ++i) {
+        const int y = i / w;
+        const int x = i % w;
+        const int j = ((h - 1 - y) * w + x) * 2;
+        packed[i * 2 + 0] = qfloat16(qBound(0.0f, flow[j + 0] * invW * m_flowEncode + 0.5f, 1.0f));
+        packed[i * 2 + 1] = qfloat16(qBound(0.0f, flow[j + 1] * invH * m_flowEncode + 0.5f, 1.0f));
+    }
+
+    f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, w, h, 0, GL_RG, GL_HALF_FLOAT,
+                    packed.constData());
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    m_flowValid = true;
+}
+
 bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
                          int width, int height, QImage *out, QString *error)
 {
@@ -389,13 +436,25 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
     m_program->setUniformValue("u_blueMids", GLfloat(s.blueMids));
     m_program->setUniformValue("u_blueHighs", GLfloat(s.blueHighs));
 
-    // Bind the YUV textures to sampler units 1..3.
+    // Optical-flow stitching uniforms (only consumed when state.flowStitch is
+    // set; otherwise u_flowStitch=0 and the shader never samples u_flow).
+    m_program->setUniformValue("u_flowStitch", GLint(s.flowStitch ? 1 : 0));
+    m_program->setUniformValue("u_flowStrength", GLfloat(s.flowStrength));
+    m_program->setUniformValue("u_bandTheta0", GLfloat(s.bandTheta0));
+    m_program->setUniformValue("u_bandTheta1", GLfloat(s.bandTheta1));
+    m_program->setUniformValue("u_flowEncode", GLfloat(m_flowEncode));
+
+    // Bind the YUV textures to sampler units 1..3 and the flow field to 4.
     f->glActiveTexture(GL_TEXTURE1);
     f->glBindTexture(GL_TEXTURE_2D, m_yTex);
     f->glActiveTexture(GL_TEXTURE2);
     f->glBindTexture(GL_TEXTURE_2D, m_uTex);
     f->glActiveTexture(GL_TEXTURE3);
     f->glBindTexture(GL_TEXTURE_2D, m_vTex);
+    if (s.flowStitch && m_flowValid) {
+        f->glActiveTexture(GL_TEXTURE4);
+        f->glBindTexture(GL_TEXTURE_2D, m_flowTex);
+    }
 
     f->glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
     f->glViewport(0, 0, W, H);

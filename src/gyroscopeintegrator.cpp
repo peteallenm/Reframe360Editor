@@ -9,6 +9,12 @@ static const float kAccelKp    = 0.35f;   // proportional gain, rad/s per rad of
 static const float kGyroGate   = 60.0f;   // deg/s: below this the accel is trusted
 static const float kMagLow     = 0.9f;    // |accel| window (g) for "camera still"
 static const float kMagHigh    = 1.1f;
+// One-pole IIR low-pass coefficient for the camera-frame gyro (~88 Hz cutoff
+// at 400 Hz sampling). Attenuates high-frequency gyro noise that would
+// otherwise integrate into orientation jitter, while leaving real motion (well
+// below ~10 Hz) untouched. Gentle enough not to add perceptible lag to quick
+// rolls. alpha = fraction of the new sample: 1 = no filtering.
+static const float kGyroFilterAlpha = 0.75f;
 // World frame convention: +Y is the world "up" vector used to seed and correct
 // the orientation (the Mahony filter drives current^-1 * kWorldUp toward the
 // measured acceleration). For a level camera the accelerometer reads
@@ -133,6 +139,10 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         }
     }
 
+    // One-pole IIR filter state for the camera-frame gyro (see kGyroFilterAlpha).
+    QVector3D gyroFiltered(0.0f, 0.0f, 0.0f);
+    bool gyroFilterInitialized = false;
+
     for (int i = 0; i < samples.size(); i++) {
         m_timestamps.append(samples[i].timestamp);
         // Store the video-un-flip (180° roll) as part of the output orientation.
@@ -153,9 +163,20 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         // and fight the accelerometer correction (doubling pitch/yaw motion).
         QVector3D gyroCorr = samples[i].gyro - bias;                 // sensor axes
         QVector3D gyroCam = qInv.rotatedVector(gyroCorr);            // camera axes
-        float cx = gyroCam.x();  // camera X <- pitch
-        float cy = gyroCam.y();  // camera Y <- -yaw
-        float cz = gyroCam.z();  // camera Z <- -roll
+
+        // One-pole IIR low-pass to reject high-frequency gyro noise before it
+        // is integrated (and before the gate below is evaluated).
+        if (gyroFilterInitialized) {
+            gyroFiltered = kGyroFilterAlpha * gyroCam
+                         + (1.0f - kGyroFilterAlpha) * gyroFiltered;
+        } else {
+            gyroFiltered = gyroCam;
+            gyroFilterInitialized = true;
+        }
+
+        float cx = gyroFiltered.x();  // camera X <- pitch
+        float cy = gyroFiltered.y();  // camera Y <- -yaw
+        float cz = gyroFiltered.z();  // camera Z <- -roll
 
         // Accelerometer gravity correction (body-frame angular velocity).
         QVector3D accel = qInv.rotatedVector(samples[i].accel);  // camera axes

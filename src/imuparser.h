@@ -24,6 +24,9 @@ public:
     double imuSampleRate() const { return m_imuSampleRate; }
     QVector<ImuSample> samples() const { return m_rawData; }
 
+    // Per-axis gyro scales in LSB/(deg/s), calibrated so a 360° rotation on
+    // each axis integrates to exactly ±360°: X=roll 32.18, Y=pitch 33.51,
+    // Z=yaw 33.64 (vs the nominal header 32.8).
     double gyroScaleX() const { return m_gyroScaleX; }
     double gyroScaleY() const { return m_gyroScaleY; }
     double gyroScaleZ() const { return m_gyroScaleZ; }

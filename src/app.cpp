@@ -5,6 +5,7 @@
 #include <QSettings>
 #include <QDateTime>
 #include <QTimer>
+#include <QThread>
 #include <QQuaternion>
 #include <QMatrix4x4>
 #include <QtMath>
@@ -45,6 +46,10 @@ App::App(QObject *parent)
     , m_imuStabilize(false)
     , m_imuSmoothing(0.5)
     , m_imuSyncOffset(0.0)
+    , m_flowStitch(false)
+    , m_flowStrength(1.0)
+    , m_flowIterations(kDefaultFlowIterations)
+    , m_flowEncode(16.0)
     , m_usePreview(false)
     , m_activeLens(2)
     , m_projection(0)
@@ -74,6 +79,38 @@ App::App(QObject *parent)
             emit imuOrientationChanged();
     });
     connect(m_decoder, &VideoDecoder::errorOccurred, this, &App::errorOccurred);
+
+    // Optical-flow stitching: a dedicated worker thread owns the FlowRenderer
+    // (QOpenGLContext is thread-affine — the 4.4 context is created lazily on
+    // the worker). Recompute whenever a new decoded frame arrives or the
+    // calibration changes, and hand the packed RGBA8 field to the preview.
+    m_flowThread = new QThread(this);
+    m_flowWorker = new FlowWorker;
+    m_flowWorker->moveToThread(m_flowThread);
+    connect(m_flowThread, &QThread::finished, m_flowWorker, &QObject::deleteLater);
+    connect(this, &App::flowRequested, m_flowWorker, &FlowWorker::computeFrame);
+    connect(m_flowWorker, &FlowWorker::flowReady, this, &App::onFlowReady);
+    connect(m_flowWorker, &FlowWorker::flowFailed, this, [this](const QString &message) {
+        qWarning().noquote() << "Flow stitching preview:" << message;
+    });
+    m_flowThread->start();
+
+    connect(m_decoder, &VideoDecoder::frameReady, this, [this]() { maybeComputeFlow(); });
+    auto onCalChanged = [this]() { maybeComputeFlow(); };
+    connect(m_currentCalibration, &CalibrationProfile::frontCenterXChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontCenterYChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontRadiusChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontK1Changed, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontK2Changed, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontRotationChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::frontHFlipChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearCenterXChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearCenterYChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearRadiusChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearK1Changed, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearK2Changed, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearRotationChanged, this, onCalChanged);
+    connect(m_currentCalibration, &CalibrationProfile::rearHFlipChanged, this, onCalChanged);
 
     // Keep the per-video keyframe sidecar file in sync whenever the user adds,
     // edits or deletes keyframes.
@@ -126,6 +163,9 @@ App::App(QObject *parent)
     connect(this, &App::imuSmoothingChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSyncOffsetChanged, this, [this]() { saveSettings(); });
     connect(this, &App::projectionChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::flowStitchChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::flowStrengthChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::flowIterationsChanged, this, [this]() { saveSettings(); });
 
     // Colour grade changes persist automatically (same convention as the
     // projection / IMU settings).
@@ -151,6 +191,10 @@ App::App(QObject *parent)
 
 App::~App()
 {
+    if (m_flowThread) {
+        m_flowThread->quit();
+        m_flowThread->wait();
+    }
 }
 
 QString App::videoPath() const
@@ -410,6 +454,84 @@ void App::setImuSyncOffset(double offset)
 
     m_imuSyncOffset = offset;
     emit imuSyncOffsetChanged();
+}
+
+void App::setFlowStitch(bool stitch)
+{
+    if (m_flowStitch == stitch)
+        return;
+
+    m_flowStitch = stitch;
+    emit flowStitchChanged();
+
+    if (stitch) {
+        maybeComputeFlow();
+    } else {
+        // Disable the warp immediately; drop any stale field so the next
+        // toggle-on starts fresh.
+        m_flowImage = QImage();
+        m_flowEncode = 16.0;
+        emit flowImageReady();
+    }
+}
+
+void App::setFlowStrength(double strength)
+{
+    if (qFuzzyCompare(m_flowStrength, strength))
+        return;
+    m_flowStrength = strength;
+    emit flowStrengthChanged();
+}
+
+void App::setFlowIterations(int iterations)
+{
+    iterations = qBound(1, iterations, 200);
+    if (m_flowIterations == iterations)
+        return;
+    m_flowIterations = iterations;
+    emit flowIterationsChanged();
+    // The flow field itself depends on the iteration count.
+    if (m_flowStitch)
+        maybeComputeFlow();
+}
+
+void App::maybeComputeFlow()
+{
+    if (!m_flowStitch || !m_decoder || !m_decoder->hasFrame())
+        return;
+
+    DecodedFrame frame = m_decoder->currentFrame();  // copy (ref-counted planes)
+
+    FlowCalibration cal;
+    if (m_currentCalibration) {
+        cal.frontCenterX = (float)m_currentCalibration->frontCenterX();
+        cal.frontCenterY = (float)m_currentCalibration->frontCenterY();
+        cal.frontRadius = (float)m_currentCalibration->frontRadius();
+        cal.frontK1 = (float)m_currentCalibration->frontK1();
+        cal.frontK2 = (float)m_currentCalibration->frontK2();
+        cal.frontRotation = (float)m_currentCalibration->frontRotation();
+        cal.frontHFlip = m_currentCalibration->frontHFlip();
+        cal.rearCenterX = (float)m_currentCalibration->rearCenterX();
+        cal.rearCenterY = (float)m_currentCalibration->rearCenterY();
+        cal.rearRadius = (float)m_currentCalibration->rearRadius();
+        cal.rearK1 = (float)m_currentCalibration->rearK1();
+        cal.rearK2 = (float)m_currentCalibration->rearK2();
+        cal.rearRotation = (float)m_currentCalibration->rearRotation();
+        cal.rearHFlip = m_currentCalibration->rearHFlip();
+    }
+
+    FlowSettings settings;
+    settings.iterations = m_flowIterations;
+
+    emit flowRequested(frame, cal, settings);
+}
+
+void App::onFlowReady(const QImage &image, float encodeScale)
+{
+    m_flowEncode = encodeScale;
+    m_flowImage = image.copy();  // deep copy: the worker must never touch it again
+    image.save("/tmp/flow_debug.png");    // <-- temporary dump
+    emit flowImageReady();
 }
 
 int App::activeLens() const
@@ -702,6 +824,11 @@ ExportSnapshot App::buildExportSnapshot() const
         s.base.rearHFlip = m_currentCalibration->rearHFlip();
         s.base.blendStart = (float)m_currentCalibration->blendStart();
     }
+    s.base.flowStitch = m_flowStitch;
+    s.base.flowStrength = (float)m_flowStrength;
+    s.base.flowIterations = m_flowIterations;
+    s.base.bandTheta0 = kDefaultBandTheta0;
+    s.base.bandTheta1 = kDefaultBandTheta1;
     if (m_colorGrade) {
         s.base.brightness = (float)m_colorGrade->brightness();
         s.base.contrast = (float)m_colorGrade->contrast();
@@ -740,6 +867,9 @@ void App::loadSettings()
     // Clamp to the valid projection ids so a stale/corrupt settings value can
     // never put the QML combo box out of range.
     setProjection(qBound(0, s.value(QStringLiteral("projection"), m_projection).toInt(), 3));
+    setFlowStitch(s.value(QStringLiteral("flow/stitch"), m_flowStitch).toBool());
+    setFlowStrength(s.value(QStringLiteral("flow/strength"), m_flowStrength).toDouble());
+    setFlowIterations(qBound(1, s.value(QStringLiteral("flow/iterations"), m_flowIterations).toInt(), 200));
 
     if (m_colorGrade) {
         auto load = [this, &s](const char *key, double def, void (ColorGrade::*setter)(double)) {
@@ -772,6 +902,9 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("imu/smoothing"), m_imuSmoothing);
     s.setValue(QStringLiteral("imu/syncOffset"), m_imuSyncOffset);
     s.setValue(QStringLiteral("projection"), m_projection);
+    s.setValue(QStringLiteral("flow/stitch"), m_flowStitch);
+    s.setValue(QStringLiteral("flow/strength"), m_flowStrength);
+    s.setValue(QStringLiteral("flow/iterations"), m_flowIterations);
 
     if (m_colorGrade) {
         s.setValue(QStringLiteral("grade/brightness"), m_colorGrade->brightness());

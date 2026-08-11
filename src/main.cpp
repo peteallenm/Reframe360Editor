@@ -9,9 +9,16 @@
 #include <QQuickWindow>
 #include <QFile>
 #include "app.h"
+#include "videodecoder.h"
+#include "flowrenderer.h"
 
 int main(int argc, char *argv[])
 {
+    // Register the types queued to the optical-flow worker thread.
+    qRegisterMetaType<DecodedFrame>();
+    qRegisterMetaType<FlowCalibration>();
+    qRegisterMetaType<FlowSettings>();
+
     // Qt's default platform theme provides no native file-dialog helper, so
     // FileDialog silently falls back to a non-native dialog that ignores
     // fileMode: SaveFile (it always shows "Open"). The GTK3 platform theme
