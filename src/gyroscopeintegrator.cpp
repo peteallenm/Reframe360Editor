@@ -1,5 +1,6 @@
 #include "gyroscopeintegrator.h"
 #include <QtMath>
+#include <algorithm>
 #include <cmath>
 #include <QDebug>
 #include <iostream>
@@ -271,10 +272,16 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
     if (time >= timestamps.last())
         return orientations.last();
 
-    // Find the bracketing index.
-    int i = 0;
-    for (int k = 0; k < timestamps.size() - 1; k++) {
-        if (time >= timestamps[k] && time < timestamps[k + 1]) { i = k; break; }
+    // Find the bracketing index with a binary search. This runs on every
+    // preview/export frame and the IMU chain can be tens of thousands of
+    // samples long, so a linear scan (O(n) per call) stalls playback even
+    // though it never maxes a core.
+    int i;
+    {
+        const auto it = std::lower_bound(timestamps.begin(), timestamps.end(), time);
+        i = (it == timestamps.end()) ? timestamps.size() - 1
+                                     : (int)(it - timestamps.begin());
+        if (i > 0 && timestamps[i] > time) i--;
     }
 
     // Estimate the local camera angular rate (deg/s) from the pre-computed

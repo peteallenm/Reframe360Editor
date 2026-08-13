@@ -226,6 +226,11 @@ void App::setVideoPath(const QString &path)
     emit exportStartChanged();
     emit exportEndChanged();
 
+    // A new clip resets the manual view to the level, straight-ahead default.
+    setYaw(0.0);
+    setPitch(0.0);
+    setRoll(0.0);
+
     if (!path.isEmpty()) {
         // Restore this video's saved keyframes and export in/out markers (or
         // clear both when the video has no sidecar yet).
