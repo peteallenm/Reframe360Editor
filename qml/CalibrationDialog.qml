@@ -258,7 +258,7 @@ Dialog {
                         Slider {
                             id: cXS
                             Layout.fillWidth: true
-                            from: 0; to: 1; stepSize: 0.001
+                            from: 0.4; to: 0.6; stepSize: 0.001
                             value: calibrationDialog.curCX
                             onValueChanged: if (pressed) calibrationDialog.setCX(value)
                         }
@@ -270,7 +270,7 @@ Dialog {
                         Slider {
                             id: cYS
                             Layout.fillWidth: true
-                            from: 0; to: 1; stepSize: 0.001
+                            from: 0.4; to: 0.6; stepSize: 0.001
                             value: calibrationDialog.curCY
                             onValueChanged: if (pressed) calibrationDialog.setCY(value)
                         }
@@ -282,7 +282,7 @@ Dialog {
                         Slider {
                             id: rS
                             Layout.fillWidth: true
-                            from: 0; to: 1; stepSize: 0.001
+                            from: 0.4; to: 0.6; stepSize: 0.001
                             value: calibrationDialog.curR
                             onValueChanged: if (pressed) calibrationDialog.setR(value)
                         }
@@ -294,7 +294,7 @@ Dialog {
                         Slider {
                             id: rotS
                             Layout.fillWidth: true
-                            from: -180; to: 180; stepSize: 0.5
+                            from: -180; to: 180; stepSize: 0.1
                             value: calibrationDialog.curRot
                             onValueChanged: if (pressed) calibrationDialog.setRot(value)
                         }

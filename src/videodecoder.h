@@ -72,6 +72,11 @@ private:
     double m_duration;
     double m_currentTime;
     double m_startTime;
+    // Pending seek destination (seconds), or < 0 when not seeking. While set,
+    // the decode loop runs forward from the keyframe and only publishes
+    // currentTimeChanged once a decoded frame reaches/passes this time, so the
+    // UI shows the actual frame instead of the idealized target.
+    double m_targetTime;
 
     int m_videoWidth;
     int m_videoHeight;

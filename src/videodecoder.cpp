@@ -18,6 +18,7 @@ VideoDecoder::VideoDecoder(QObject *parent)
     , m_duration(0.0)
     , m_currentTime(0.0)
     , m_startTime(0.0)
+    , m_targetTime(-1.0)
     , m_videoWidth(0)
     , m_videoHeight(0)
     , m_isFullRange(false)
@@ -99,6 +100,7 @@ void VideoDecoder::loadVideo(const QString &path)
         QMutexLocker lock(&m_mutex);
         m_running = true;
         m_currentTime = 0.0;
+        m_targetTime = -1.0;
         m_hasFrame = false;
     }
     qDebug() << "Video loaded:" << m_videoWidth << "x" << m_videoHeight
@@ -136,10 +138,22 @@ void VideoDecoder::seekTo(double time)
 
     {
         QMutexLocker lock(&m_mutex);
-        m_currentTime = time;
+        m_targetTime = time;
         m_startTime = getTimeSeconds() - time;
+        // The last decoded frame predates the seek (it is AHEAD of a backward
+        // target), so don't let its timestamp be read as "reached the target"
+        // before a fresh frame is decoded.
+        m_hasFrame = false;
     }
-    emit currentTimeChanged();
+
+    // The decode loop decodes forward from the keyframe and publishes
+    // currentTimeChanged only once it reaches the target, so the UI shows the
+    // actual frame (not the idealized seek time). Ensure the loop is running.
+    if (!m_decodeThread) {
+        m_decodeThread = new QThread();
+        connect(m_decodeThread, &QThread::started, this, [this]() { decodeLoop(); }, Qt::DirectConnection);
+        m_decodeThread->start();
+    }
 }
 
 double VideoDecoder::duration() const
@@ -168,13 +182,18 @@ void VideoDecoder::decodeLoop()
 {
     while (true) {
         bool playing;
+        double target;
         {
             QMutexLocker lock(&m_mutex);
             if (!m_running) return;
             playing = m_playing;
+            target = m_targetTime;
         }
 
-        if (!playing) {
+        // Idle while paused with no pending seek (wait for a seek or play).
+        // During a seek the target is set even while paused, so the loop
+        // decodes forward from the keyframe as fast as possible to reach it.
+        if (!playing && target < 0.0) {
             QThread::msleep(10);
             continue;
         }
@@ -185,10 +204,13 @@ void VideoDecoder::decodeLoop()
             // The stream reached the end and rewound to the start (loop-back).
             // Reset the playback clock here, otherwise the throttle below
             // compares against the original start time and the next lap
-            // decodes as fast as possible ("plays really fast").
+            // decodes as fast as possible ("plays really fast"). Clear any
+            // pending seek target so the loop returns to idle instead of
+            // spinning forever past the end.
             {
                 QMutexLocker lock(&m_mutex);
                 m_currentTime = 0.0;
+                m_targetTime = -1.0;
                 m_startTime = getTimeSeconds();
             }
             emit currentTimeChanged();
@@ -196,24 +218,43 @@ void VideoDecoder::decodeLoop()
         }
 
         double frameTimestamp;
+        bool reachedTarget = false;
         {
             QMutexLocker lock(&m_mutex);
-            frameTimestamp = m_currentFrame.timestamp;
+            // Ignore the stale frame left from before a seek (m_hasFrame is
+            // cleared in seekTo); only a freshly decoded frame's timestamp can
+            // satisfy a pending target or update playback time.
+            frameTimestamp = m_hasFrame ? m_currentFrame.timestamp : -1.0;
 
-            // Use actual frame PTS, not a fixed delta
-            if (frameTimestamp >= 0.0) {
+            if (m_targetTime >= 0.0) {
+                // Seeking: decode forward and only publish the current time
+                // once a frame reaches/passes the target, so the UI shows the
+                // actual frame (not the idealized seek time).
+                if (frameTimestamp >= 0.0 && frameTimestamp >= m_targetTime) {
+                    m_currentTime = frameTimestamp;
+                    m_targetTime = -1.0;
+                    reachedTarget = true;
+                }
+            } else if (frameTimestamp >= 0.0) {
+                // Normal playback: use actual frame PTS, not a fixed delta.
                 m_currentTime = frameTimestamp;
+                reachedTarget = true;  // publish the playback position
             }
 
             if (m_currentTime >= m_duration && m_duration > 0.0) {
                 m_playing = false;
                 m_currentTime = m_duration;
+                reachedTarget = true;
             }
         }
-        emit currentTimeChanged();
 
-        // Throttle to real-time: sleep until the next frame is due
-        if (frameTimestamp >= 0.0) {
+        if (reachedTarget)
+            emit currentTimeChanged();
+
+        // Throttle to real-time only during normal playback (no pending seek);
+        // a seek decodes as fast as possible to reach the target, whether the
+        // user scrubbed while paused or while playing.
+        if (playing && target < 0.0 && frameTimestamp >= 0.0) {
             double wallElapsed = getTimeSeconds() - m_startTime;
             double due = m_currentTime - wallElapsed;
             if (due > 0.0 && due < 1.0) {
