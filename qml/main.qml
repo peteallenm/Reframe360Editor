@@ -77,7 +77,8 @@ ApplicationWindow {
                 icon.name: "media-record"
                 enabled: app.videoPath !== "" && !app.exportRunning
                 onClicked: {
-                    exportVideoDialog.currentFile = "file://" + videoFolderPath() + "/" + videoBaseName() + "_export.mp4"
+                    exportVideoDialog.defaultFolder = videoFolderPath()
+                    exportVideoDialog.defaultBase = videoBaseName()
                     exportVideoDialog.open()
                 }
             }
@@ -118,7 +119,7 @@ ApplicationWindow {
 
     // Progress/status shown while an export is running.
     Dialog {
-        id: exportDialog
+        id: exportProgressDialog
         modal: true
         visible: app.exportRunning
         closePolicy: Popup.NoAutoClose
@@ -148,6 +149,14 @@ ApplicationWindow {
         }
     }
 
+    // Export configuration dialog (resolution, codec, bitrate/CRF, FFmpeg
+    // vidstab post-processing). Replaces the old bare save-as dialog.
+    ExportDialog {
+        id: exportVideoDialog
+        defaultFolder: videoFolderPath()
+        defaultBase: videoBaseName()
+    }
+
     FileDialog {
         id: fileDialog
         title: qsTr("Open 360 Video")
@@ -157,9 +166,9 @@ ApplicationWindow {
         }
     }
 
-    // Standard save-as dialogs (native, since QT_QUICK_CONTROLS_NATIVE_DIALOGS
-    // is no longer forced to 0). fileMode: SaveFile makes these proper "Save"
-    // dialogs; currentFile pre-fills a sensible name next to the source video.
+    // Native save-as dialog (since QT_QUICK_CONTROLS_NATIVE_DIALOGS is no
+    // longer forced to 0). fileMode: SaveFile makes this a proper "Save"
+    // dialog; currentFile pre-fills a sensible name next to the source video.
     FileDialog {
         id: exportFrameDialog
         title: qsTr("Export Frame")
@@ -168,17 +177,6 @@ ApplicationWindow {
         nameFilters: ["PNG images (*.png)", "JPEG images (*.jpg)"]
         onAccepted: {
             app.exportFrame(ensureSuffix(selectedFile.toString().replace("file://", ""), "png"), 1920, 1080)
-        }
-    }
-
-    FileDialog {
-        id: exportVideoDialog
-        title: qsTr("Export Video")
-        fileMode: FileDialog.SaveFile
-        defaultSuffix: "mp4"
-        nameFilters: ["MP4 video (*.mp4)"]
-        onAccepted: {
-            app.exportVideo(ensureSuffix(selectedFile.toString().replace("file://", ""), "mp4"), 1920, 1080, 30.0, app.exportStart, app.exportEnd)
         }
     }
 }

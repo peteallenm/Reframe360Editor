@@ -100,6 +100,13 @@ class App : public QObject
     Q_PROPERTY(QString exportStatus READ exportStatus NOTIFY exportStatusChanged)
     Q_PROPERTY(double exportStart READ exportStart WRITE setExportStart NOTIFY exportStartChanged)
     Q_PROPERTY(double exportEnd READ exportEnd WRITE setExportEnd NOTIFY exportEndChanged)
+    Q_PROPERTY(int exportWidth READ exportWidth WRITE setExportWidth NOTIFY exportWidthChanged)
+    Q_PROPERTY(int exportHeight READ exportHeight WRITE setExportHeight NOTIFY exportHeightChanged)
+    Q_PROPERTY(double exportFps READ exportFps WRITE setExportFps NOTIFY exportFpsChanged)
+    Q_PROPERTY(QString exportCodec READ exportCodec WRITE setExportCodec NOTIFY exportCodecChanged)
+    Q_PROPERTY(int exportCrf READ exportCrf WRITE setExportCrf NOTIFY exportCrfChanged)
+    Q_PROPERTY(int exportBitrate READ exportBitrate WRITE setExportBitrate NOTIFY exportBitrateChanged)
+    Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportVidstabChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -179,8 +186,23 @@ public:
     double exportEnd() const { return m_exportEnd; }
     void setExportEnd(double time);
 
+    int exportWidth() const { return m_keyframes->exportWidth(); }
+    void setExportWidth(int width);
+    int exportHeight() const { return m_keyframes->exportHeight(); }
+    void setExportHeight(int height);
+    double exportFps() const { return m_keyframes->exportFps(); }
+    void setExportFps(double fps);
+    QString exportCodec() const { return m_keyframes->exportCodec(); }
+    void setExportCodec(const QString &codec);
+    int exportCrf() const { return m_keyframes->exportCrf(); }
+    void setExportCrf(int crf);
+    int exportBitrate() const { return m_keyframes->exportBitrate(); }
+    void setExportBitrate(int bitrate);
+    bool exportVidstab() const { return m_keyframes->exportVidstab(); }
+    void setExportVidstab(bool vidstab);
+
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
-    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, bool gpuBackend = true);
+    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool gpuBackend = true);
     Q_INVOKABLE QString grabStill(int lens);
     Q_INVOKABLE void dragLook(double angleAboutUp, double angleAboutRight);
 
@@ -240,6 +262,13 @@ signals:
     void exportStatusChanged();
     void exportStartChanged();
     void exportEndChanged();
+    void exportWidthChanged();
+    void exportHeightChanged();
+    void exportFpsChanged();
+    void exportCodecChanged();
+    void exportCrfChanged();
+    void exportBitrateChanged();
+    void exportVidstabChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -255,8 +284,12 @@ private:
     bool m_exportRunning;
     double m_exportProgress;
     QString m_exportStatus;
+    // The trim in/out markers (kept in App) and the last-used export output
+    // options (kept in the KeyframeModel) are both persisted per-video in the
+    // keyframe sidecar file.
     double m_exportStart;
     double m_exportEnd;
+    bool m_restoringSidecar = false;  // set while loading a video's sidecar file
 
     QString m_videoPath;
     bool m_isPlaying;
@@ -282,6 +315,14 @@ private:
     double m_flowEncode;
     FlowWorker *m_flowWorker;
     QThread *m_flowThread;
+    // True while a flow job is queued/in flight on the worker thread. Used to
+    // implement latest-wins scheduling: flow for intermediate frames is
+    // dropped so the seam never lags unboundedly behind the decode rate.
+    bool m_flowPending;
+    // Timestamp of the frame whose flow job is in flight; onFlowReady compares
+    // it against the decoder's newest frame to decide whether to run a follow-up
+    // (so a paused playback doesn't recompute the same frame in a loop).
+    double m_flowLastTs;
 };
 
 #endif // APP_H

@@ -68,6 +68,59 @@ void KeyframeModel::setTrimOut(double t)
     emit trimChanged();
 }
 
+void KeyframeModel::setExportWidth(int w)
+{
+    w = qMax(16, w & ~1);
+    if (m_exportWidth == w) return;
+    m_exportWidth = w;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportHeight(int h)
+{
+    h = qMax(16, h & ~1);
+    if (m_exportHeight == h) return;
+    m_exportHeight = h;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportFps(double fps)
+{
+    if (qFuzzyCompare(m_exportFps, fps) || fps <= 0.0) return;
+    m_exportFps = fps;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportCodec(const QString &codec)
+{
+    if (m_exportCodec == codec) return;
+    m_exportCodec = codec;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportCrf(int crf)
+{
+    crf = qBound(0, crf, 51);
+    if (m_exportCrf == crf) return;
+    m_exportCrf = crf;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportBitrate(int bitrate)
+{
+    bitrate = qBound(1, bitrate, 100);
+    if (m_exportBitrate == bitrate) return;
+    m_exportBitrate = bitrate;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportVidstab(bool vidstab)
+{
+    if (m_exportVidstab == vidstab) return;
+    m_exportVidstab = vidstab;
+    emit exportSettingsChanged();
+}
+
 void KeyframeModel::removeKeyframe(int i)
 {
     if (i < 0 || i >= (int)m_keyframes.size()) return;
@@ -171,9 +224,18 @@ void KeyframeModel::saveToFile(const QString &path) const
         });
     }
     QJsonObject root{
-        {"version", 2},
+        {"version", 3},
         {"in", m_trimIn},        // export trim start marker
         {"out", m_trimOut},      // export trim end marker
+        {"export", QJsonObject{
+            {"width", m_exportWidth},
+            {"height", m_exportHeight},
+            {"fps", m_exportFps},
+            {"codec", m_exportCodec},
+            {"crf", m_exportCrf},
+            {"bitrateMbps", m_exportBitrate},
+            {"vidstab", m_exportVidstab},
+        }},
         {"keyframes", arr},
     };
 
@@ -187,6 +249,13 @@ void KeyframeModel::loadFromFile(const QString &path)
     QVector<Keyframe> loaded;
     double trimIn = 0.0;
     double trimOut = 0.0;
+    int expWidth = m_exportWidth;
+    int expHeight = m_exportHeight;
+    double expFps = m_exportFps;
+    QString expCodec = m_exportCodec;
+    int expCrf = m_exportCrf;
+    int expBitrate = m_exportBitrate;
+    bool expVidstab = m_exportVidstab;
 
     QFile f(path);
     if (f.open(QIODevice::ReadOnly)) {
@@ -208,6 +277,19 @@ void KeyframeModel::loadFromFile(const QString &path)
             // Optional export trim markers (absent in v1 sidecars -> 0/0).
             trimIn  = root.value("in").toDouble(0.0);
             trimOut = root.value("out").toDouble(0.0);
+            // Optional last-used export options (absent in older sidecars ->
+            // keep the current in-memory defaults).
+            const QJsonObject exp = root.value("export").toObject();
+            const int w = exp.value("width").toInt(expWidth);
+            const int h = exp.value("height").toInt(expHeight);
+            if (w >= 16 && w % 2 == 0) expWidth = w;
+            if (h >= 16 && h % 2 == 0) expHeight = h;
+            const double fps = exp.value("fps").toDouble(expFps);
+            if (fps > 0.0) expFps = fps;
+            if (exp.contains("codec")) expCodec = exp.value("codec").toString();
+            expCrf = qBound(0, exp.value("crf").toInt(expCrf), 51);
+            expBitrate = qBound(1, exp.value("bitrateMbps").toInt(expBitrate), 100);
+            if (exp.contains("vidstab")) expVidstab = exp.value("vidstab").toBool();
         }
     }
     std::sort(loaded.begin(), loaded.end());
@@ -223,13 +305,22 @@ void KeyframeModel::loadFromFile(const QString &path)
         loaded.resize(write);
     }
 
+    const bool exportUnchanged = expWidth == m_exportWidth
+                              && expHeight == m_exportHeight
+                              && qFuzzyCompare(expFps, m_exportFps)
+                              && expCodec == m_exportCodec
+                              && expCrf == m_exportCrf
+                              && expBitrate == m_exportBitrate
+                              && expVidstab == m_exportVidstab;
+
     // No-op load (same contents + trim, or a missing file with an empty
     // model): skip the model reset so opening videos doesn't churn the
-    // timeline. The trim check matters too: two videos can share identical
-    // keyframes but different in/out markers.
+    // timeline. The trim/export checks matter too: two videos can share
+    // identical keyframes but different markers or export options.
     if (loaded == m_keyframes
         && qFuzzyCompare(trimIn, m_trimIn)
-        && qFuzzyCompare(trimOut, m_trimOut))
+        && qFuzzyCompare(trimOut, m_trimOut)
+        && exportUnchanged)
         return;
 
     // Replace the model contents (empty if the file is missing/invalid) so
@@ -239,5 +330,13 @@ void KeyframeModel::loadFromFile(const QString &path)
     endResetModel();
     m_trimIn = trimIn;
     m_trimOut = trimOut;
+    m_exportWidth = expWidth;
+    m_exportHeight = expHeight;
+    m_exportFps = expFps;
+    m_exportCodec = expCodec;
+    m_exportCrf = expCrf;
+    m_exportBitrate = expBitrate;
+    m_exportVidstab = expVidstab;
     emit trimChanged();
+    emit exportSettingsChanged();
 }

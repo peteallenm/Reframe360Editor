@@ -36,6 +36,7 @@ qt_add_qml_module(render360
         qml/ControlPanel.qml
         qml/Timeline.qml
         qml/CalibrationDialog.qml
+        qml/ExportDialog.qml
     RESOURCES
         resources/presets/yi360_default.json
 )

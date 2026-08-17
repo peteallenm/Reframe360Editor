@@ -49,7 +49,7 @@ int main(int argc, char *argv[])
     QCommandLineOption grabOption("grab", "Grab the window after a short delay and save to FILE", "file");
     parser.addOption(grabOption);
 
-    QCommandLineOption tabOption("tab", "Start on the given side-panel tab (0 View, 1 Colour Grading, 2 Calibration)", "index");
+    QCommandLineOption tabOption("tab", "Start on the given side-panel tab (0 View, 1 Colours, 2 Lens)", "index");
     parser.addOption(tabOption);
     
     QCommandLineOption projectionOption("projection", "Rendering projection: 0 perspective, 1 equirectangular, 2 stereographic, 3 sportsview", "mode");
@@ -77,6 +77,14 @@ int main(int argc, char *argv[])
     parser.addOption(exportEndOption);
     QCommandLineOption exportBackendOption("export-backend", "Render backend: gpu, cpu or auto (default auto)", "backend");
     parser.addOption(exportBackendOption);
+    QCommandLineOption exportCodecOption("export-codec", "Encoder: libx264, libx265 or hevc_nvenc (default libx264)", "codec");
+    parser.addOption(exportCodecOption);
+    QCommandLineOption exportCrfOption("export-crf", "CRF quality for CPU codecs, 0..51 (default 19)", "crf");
+    parser.addOption(exportCrfOption);
+    QCommandLineOption exportBitrateOption("export-bitrate", "Target bitrate in Mbps for hevc_nvenc (default 12)", "mbps");
+    parser.addOption(exportBitrateOption);
+    QCommandLineOption exportVidstabOption("export-vidstab", "Enable FFmpeg vidstab post-processing stabilization");
+    parser.addOption(exportVidstabOption);
     
     parser.process(app);
 
@@ -100,23 +108,36 @@ int main(int argc, char *argv[])
                 const bool hasEnd = parser.isSet(exportEndOption);
                 const double end = hasEnd ? parser.value(exportEndOption).toDouble() : -1.0;
                 const bool gpu = parser.value(exportBackendOption) != QLatin1String("cpu");
+                const QString codec = parser.value(exportCodecOption).isEmpty()
+                        ? QStringLiteral("libx264") : parser.value(exportCodecOption);
+                const int crf = (parser.value(exportCrfOption).toInt() > 0)
+                        ? parser.value(exportCrfOption).toInt() : 19;
+                const int bitrate = (parser.value(exportBitrateOption).toInt() > 0)
+                        ? parser.value(exportBitrateOption).toInt() : 12;
+                const bool vidstab = parser.isSet(exportVidstabOption);
+                const bool enableImu = parser.isSet(imuOption);
+                const int projIdx = parser.isSet(projectionOption) ? parser.value(projectionOption).toInt() : -1;
 
                 // Kick off the decoder, wait for it to report the clip
                 // duration (needed for the default end time), then start the
                 // export. The completion poll is only started afterwards, so
                 // it can never fire before the export begins.
-                QTimer::singleShot(0, [&appController, videoPath]() {
+                QTimer::singleShot(0, [&appController, videoPath, enableImu, projIdx]() {
                     appController.setVideoPath(videoPath);
+                    if (enableImu)
+                        appController.setImuStabilize(true);
+                    if (projIdx >= 0)
+                        appController.setProjection(projIdx);
                 });
                 QTimer *wait = new QTimer(&app);
                 wait->setInterval(100);
-                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu]() {
+                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab]() {
                     if (appController.duration() <= 0.0)
                         return;   // keep waiting for the decoder
                     wait->stop();
                     const double startTime = start;
                     const double endTime = (end >= 0.0) ? end : appController.duration();
-                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, gpu);
+                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, gpu);
 
                     // Poll until the export finishes, then exit with a code
                     // that reflects success/failure.

@@ -3,6 +3,11 @@
 #include <QImage>
 #include <QThread>
 #include <QFile>
+#include <QFileInfo>
+#include <QProcess>
+#include <QDateTime>
+#include <QTemporaryDir>
+#include <QRegularExpression>
 #include <QtMath>
 #include <QtGlobal>
 #include <algorithm>
@@ -540,7 +545,9 @@ public:
     VideoWriter() = default;
     ~VideoWriter();
 
-    bool open(const QString &path, int w, int h, double fps, QString *error);
+    bool open(const QString &path, int w, int h, double fps,
+              const QString &codecName, int crf, int bitrateMbps,
+              const QString &title, const QString &comment, QString *error);
     bool writeFrame(const QImage &rgb, QString *error);
     bool finish(QString *error);
 
@@ -567,7 +574,9 @@ VideoWriter::~VideoWriter()
     }
 }
 
-bool VideoWriter::open(const QString &path, int w, int h, double fps, QString *error)
+bool VideoWriter::open(const QString &path, int w, int h, double fps,
+                       const QString &codecName, int crf, int bitrateMbps,
+                       const QString &title, const QString &comment, QString *error)
 {
     const int den = qMax(1, qRound(fps * 1000.0));
     m_tb = AVRational{1000, den};
@@ -577,11 +586,11 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps, QString *e
         return false;
     }
 
-    const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
-    if (!codec)
+    const AVCodec *codec = avcodec_find_encoder_by_name(codecName.toUtf8().constData());
+    if (!codec && codecName == QLatin1String("libx264"))
         codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
     if (!codec) {
-        if (error) *error = QObject::tr("No video encoder available (libx264/mpeg4)");
+        if (error) *error = QObject::tr("No video encoder available (%1)").arg(codecName);
         return false;
     }
 
@@ -594,13 +603,23 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps, QString *e
     m_enc->gop_size = qMax(1, qRound(fps * 2.0));
     m_enc->max_b_frames = 0;  // keep the muxer simple (no reorder delay)
 
+    // Per-codec options: CPU codecs use a CRF constant-quality scale, NVENC
+    // uses a target bitrate.
     if (codec->id == AV_CODEC_ID_H264) {
-        m_enc->bit_rate = 10000000;
+        m_enc->bit_rate = qMax(1, bitrateMbps) * 1000000;
         av_opt_set(m_enc->priv_data, "preset", "veryfast", 0);
-        av_opt_set(m_enc->priv_data, "crf", "19", 0);
+        av_opt_set(m_enc->priv_data, "crf", QString::number(crf).toUtf8().constData(), 0);
         av_opt_set(m_enc->priv_data, "bframes", "0", 0);
+    } else if (codec->id == AV_CODEC_ID_HEVC && codec->name && QString::fromLatin1(codec->name) == QLatin1String("hevc_nvenc")) {
+        m_enc->bit_rate = qMax(1, bitrateMbps) * 1000000;
+        m_enc->rc_max_rate = m_enc->bit_rate;
+        av_opt_set(m_enc->priv_data, "preset", "medium", 0);
+        av_opt_set(m_enc->priv_data, "rc", "vbr", 0);
     } else {
-        m_enc->bit_rate = 8000000;
+        // libx265 and other HEVC encoders
+        m_enc->bit_rate = qMax(1, bitrateMbps) * 1000000;
+        av_opt_set(m_enc->priv_data, "preset", "medium", 0);
+        av_opt_set(m_enc->priv_data, "crf", QString::number(crf).toUtf8().constData(), 0);
     }
 
     if (m_fmt->oformat->flags & AVFMT_GLOBALHEADER)
@@ -614,6 +633,14 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps, QString *e
     m_stream->time_base = m_tb;
     avcodec_parameters_from_context(m_stream->codecpar, m_enc);
     av_opt_set(m_fmt->priv_data, "movflags", "+faststart", 0);  // ignore if unsupported
+
+    // Embed useful metadata (input filename + export summary). creation_time
+    // is written in ISO 8601 so external tools can sort/identify exports.
+    av_dict_set(&m_fmt->metadata, "title", title.toUtf8().constData(), 0);
+    av_dict_set(&m_fmt->metadata, "encoder", "360Render", 0);
+    av_dict_set(&m_fmt->metadata, "comment", comment.toUtf8().constData(), 0);
+    av_dict_set(&m_fmt->metadata, "creation_time",
+                QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8().constData(), 0);
 
     if (avio_open(&m_fmt->pb, path.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
         if (error) *error = QObject::tr("Cannot write to output file");
@@ -737,16 +764,16 @@ bool Exporter::beginExport()
 }
 
 void Exporter::exportVideo(const QString &videoPath, const QString &outPath,
-                           int width, int height, double fps,
+                           const ExportSettings &settings,
                            double startTime, double endTime,
                            const StateProvider &state, bool useGpu)
 {
     if (!beginExport())
         return;
     StateProvider sp = state;
-    m_thread = QThread::create([this, videoPath, outPath, width, height, fps,
+    m_thread = QThread::create([this, videoPath, outPath, settings,
                                 startTime, endTime, sp, useGpu]() {
-        runVideo(videoPath, outPath, width, height, fps, startTime, endTime, sp, useGpu);
+        runVideo(videoPath, outPath, settings, startTime, endTime, sp, useGpu);
     });
     connect(m_thread, &QThread::finished, this, [this, th = m_thread]() {
         if (m_thread == th)
@@ -774,22 +801,32 @@ void Exporter::exportFrame(const QString &videoPath, const QString &outPath,
 }
 
 void Exporter::runVideo(const QString &videoPath, const QString &outPath,
-                        int width, int height, double fps,
+                        const ExportSettings &settings,
                         double startTime, double endTime, StateProvider state,
                         bool useGpu)
 {
-    const int W = width & ~1;
-    const int H = height & ~1;
+    const int width = settings.width & ~1;
+    const int height = settings.height & ~1;
+    const int fps = qMax(1, qRound(settings.fps));
+    const double fpsd = settings.fps;
 
     auto fail = [this, outPath](const QString &message) {
         QFile::remove(outPath);  // drop any partial output
         emit exportError(message);
     };
 
-    if (fps <= 0.0 || W < 2 || H < 2) {
+    if (fpsd <= 0.0 || width < 2 || height < 2) {
         fail(tr("Invalid export settings"));
         return;
     }
+
+    // When vidstab is enabled the render pass targets a temporary file; the
+    // final output is produced by the vidstab transform (which re-encodes with
+    // the chosen codec/bitrate and carries the metadata along).
+    QString outFile = outPath;
+    QTemporaryDir tmpDir;
+    if (settings.vidstab)
+        outFile = tmpDir.filePath(QStringLiteral("render.mp4"));
 
     // Try the GPU pipeline first; fall back to the CPU rasterizer when no
     // usable GL context can be made (headless CI, old GPUs, etc.).
@@ -808,8 +845,16 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         return;
     }
 
+    // Metadata: the input filename plus a summary of the export settings.
+    QFileInfo srcInfo(videoPath);
+    const QString comment = tr("Resolution: %1x%2, FPS: %3, Codec: %4, Stabilization: %5")
+                                .arg(width).arg(height).arg(fps)
+                                .arg(settings.codec)
+                                .arg(settings.vidstab ? tr("vidstab") : tr("none"));
     VideoWriter writer;
-    if (!writer.open(outPath, W, H, fps, &err)) {
+    if (!writer.open(outFile, width, height, fpsd, settings.codec,
+                     settings.crf, settings.bitrateMbps,
+                     srcInfo.fileName(), comment, &err)) {
         fail(err);
         return;
     }
@@ -818,16 +863,16 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     double start = qMax(0.0, startTime);
     double end = (dur > 0.0) ? qMin(endTime, dur) : endTime;
     if (end <= start)
-        end = start + 1.0 / fps;
+        end = start + 1.0 / fpsd;
 
-    const int totalFrames = qMax(1, (int)qCeil((end - start) * fps));
+    const int totalFrames = qMax(1, (int)qCeil((end - start) * fpsd));
     bool eof = false;
     int framesWritten = 0;
 
     FlowEngine flow;
 
     for (int i = 0; i < totalFrames && !eof; ++i) {
-        const double t = start + (double)i / fps;
+        const double t = start + (double)i / fpsd;
         DecodedFrame frame;
         if (!reader.readFrameAt(t, &frame)) {
             eof = true;
@@ -849,19 +894,22 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
                 if (!flow.prepare(s) || !flow.apply(frame, gpu))
                     s.flowStitch = false;
             }
-            if (!gpu.render(frame, s, W, H, &rendered, &err)) {
+            if (!gpu.render(frame, s, width, height, &rendered, &err)) {
                 fail(err);
                 return;
             }
         } else {
-            rendered = renderFrame(frame, s, W, H);
+            rendered = renderFrame(frame, s, width, height);
         }
         if (!writer.writeFrame(rendered, &err)) {
             fail(err);
             return;
         }
         framesWritten++;
-        emit exportProgress((double)(i + 1) / (double)totalFrames);
+        // With vidstab enabled the video is re-encoded afterwards, so the
+        // render pass only maps onto the first half of the progress bar.
+        emit exportProgress((double)(i + 1) / (double)totalFrames
+                            * (settings.vidstab ? 0.5 : 1.0));
     }
 
     // A range entirely past the end of the clip would otherwise produce an
@@ -874,6 +922,15 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     if (!writer.finish(&err)) {
         fail(err);
         return;
+    }
+
+    // Optional FFmpeg vidstab post-processing: detect motion vectors, then
+    // transform + re-encode with the chosen codec/bitrate into the final file.
+    if (settings.vidstab) {
+        if (!runVidStab(outFile, outPath, settings, srcInfo.fileName(), comment)) {
+            fail(tr("FFmpeg vidstab post-processing failed (is ffmpeg installed?)"));
+            return;
+        }
     }
     emit exportFinished(outPath);
 }
@@ -926,4 +983,115 @@ void Exporter::runFrame(const QString &videoPath, const QString &outPath,
         return;
     }
     emit exportFinished(outPath);
+}
+
+bool Exporter::runVidStab(const QString &input, const QString &output,
+                          const ExportSettings &settings,
+                          const QString &sourceName, const QString &comment)
+{
+    // Build the ffmpeg CLI. The transform holds its transform-vector file in
+    // the same directory it runs in, so launch it relative to the temp dir of
+    // the intermediate render (which for the vidstab path is a QTemporaryDir).
+    QString trfPath = QFileInfo(input).dir().filePath(QStringLiteral("transform_vectors.trf"));
+    QFile::remove(trfPath);
+
+    const int fps = qMax(1, qRound(settings.fps));
+
+    // Pass 1: motion detection -> transform_vectors.trf
+    {
+        QStringList args = {
+            QStringLiteral("-i"), input,
+            QStringLiteral("-vf"),
+            QStringLiteral("vidstabdetect=stepsize=2:shakiness=6:accuracy=9:result=%1")
+                .arg(trfPath),
+            QStringLiteral("-f"), QStringLiteral("null"), QStringLiteral("-")
+        };
+        if (!runFfmpeg(args, 0.5, 0.25, fps))
+            return false;
+    }
+
+    // Pass 2: transform + sharpen + re-encode with the chosen codec settings.
+    {
+        QStringList encodeArgs;
+        if (settings.codec == QLatin1String("hevc_nvenc")) {
+            encodeArgs << QStringLiteral("-preset") << QStringLiteral("medium")
+                       << QStringLiteral("-b:v") << QStringLiteral("%1M").arg(qMax(1, settings.bitrateMbps));
+        } else if (settings.codec == QLatin1String("libx264")) {
+            encodeArgs << QStringLiteral("-preset") << QStringLiteral("veryfast")
+                       << QStringLiteral("-crf") << QString::number(qBound(0, settings.crf, 51));
+        } else {
+            encodeArgs << QStringLiteral("-preset") << QStringLiteral("medium")
+                       << QStringLiteral("-crf") << QString::number(qBound(0, settings.crf, 51));
+        }
+
+        if (QFile::exists(output))
+            QFile::remove(output);
+        QStringList args = {
+            QStringLiteral("-i"), input,
+            QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"),
+            QStringLiteral("-vf"),
+            QStringLiteral("vidstabtransform=input=%1:optzoom=0:smoothing=20,"
+                           "unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount=0.00")
+                .arg(trfPath),
+            QStringLiteral("-c:v"), settings.codec
+        };
+        args.append(encodeArgs);
+        args << QStringLiteral("-metadata")
+             << QStringLiteral("title=%1").arg(sourceName)
+             << QStringLiteral("-metadata") << QStringLiteral("encoder=360Render")
+             << QStringLiteral("-metadata")
+             << QStringLiteral("comment=%1").arg(comment)
+             << QStringLiteral("-metadata")
+             << QStringLiteral("creation_time=%1")
+                 .arg(QDateTime::currentDateTime().toString(Qt::ISODate))
+             << QStringLiteral("-y") << output;
+
+        if (!runFfmpeg(args, 0.75, 0.25, fps))
+            return false;
+    }
+
+    QFile::remove(trfPath);
+    return true;
+}
+
+bool Exporter::runFfmpeg(const QStringList &args, double startProgress,
+                         double weight, int fps)
+{
+    QProcess proc;
+    proc.setProcessChannelMode(QProcess::MergedChannels);
+    proc.start(QStringLiteral("ffmpeg"), args);
+    if (!proc.waitForStarted(5000))
+        return false;
+
+    // Parse "time=HH:MM:SS.cc" from ffmpeg's stderr log for progress; each pass
+    // maps onto [startProgress, startProgress + weight].
+    static const QRegularExpression timeRe(QStringLiteral("time=(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)"));
+    QByteArray log;
+    QByteArray buf;
+    while (proc.waitForReadyRead(250)) {
+        buf += proc.readAllStandardOutput();
+        int idx;
+        while ((idx = buf.indexOf('\r')) >= 0) {
+            const QByteArray line = buf.left(idx).trimmed();
+            buf.remove(0, idx + 1);
+            if (!line.trimmed().isEmpty())
+                log += line.trimmed() + '\n';
+            const QRegularExpressionMatch m = timeRe.match(QString::fromLatin1(line));
+            if (m.hasMatch()) {
+                const double sec = m.captured(1).toDouble() * 3600.0
+                                + m.captured(2).toDouble() * 60.0
+                                + m.captured(3).toDouble();
+                emit exportProgress(qBound(0.0,
+                    startProgress + weight * qMin(1.0, sec / qMax(1, fps)), 1.0));
+            }
+        }
+    }
+    if (!buf.isEmpty())
+        log += buf + '\n';
+    proc.waitForFinished();
+    const bool ok = (proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0);
+    if (!ok)
+        qWarning().noquote() << "ffmpeg failed:" << args.join(QLatin1Char(' '))
+                             << "\n" << QString::fromUtf8(log);
+    return ok;
 }

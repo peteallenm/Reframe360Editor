@@ -74,8 +74,8 @@ Item {
             Material.elevation: 2
 
             TabButton { text: qsTr("View") }
-            TabButton { text: qsTr("Colour Grading") }
-            TabButton { text: qsTr("Calibration") }
+            TabButton { text: qsTr("Colours") }
+            TabButton { text: qsTr("Lens") }
         }
 
         StackLayout {
@@ -288,7 +288,7 @@ Item {
                 }
             }
 
-            // ======================= Colour Grading tab =====================
+            // ======================= Colours tab =====================
             ScrollView {
                 contentWidth: availableWidth
                 clip: true
@@ -387,7 +387,7 @@ Item {
                 }
             }
 
-            // ======================== Calibration tab =======================
+            // ======================== Lens tab =======================
             ScrollView {
                 contentWidth: availableWidth
                 clip: true

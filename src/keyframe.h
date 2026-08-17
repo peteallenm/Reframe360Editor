@@ -45,6 +45,30 @@ public:
     Q_INVOKABLE void setTrimIn(double t);
     Q_INVOKABLE void setTrimOut(double t);
 
+    // Last-used export output options, persisted in the same sidecar file so
+    // each video remembers its own encoder/quality choices.
+    Q_PROPERTY(int exportWidth READ exportWidth WRITE setExportWidth NOTIFY exportSettingsChanged)
+    Q_PROPERTY(int exportHeight READ exportHeight WRITE setExportHeight NOTIFY exportSettingsChanged)
+    Q_PROPERTY(double exportFps READ exportFps WRITE setExportFps NOTIFY exportSettingsChanged)
+    Q_PROPERTY(QString exportCodec READ exportCodec WRITE setExportCodec NOTIFY exportSettingsChanged)
+    Q_PROPERTY(int exportCrf READ exportCrf WRITE setExportCrf NOTIFY exportSettingsChanged)
+    Q_PROPERTY(int exportBitrate READ exportBitrate WRITE setExportBitrate NOTIFY exportSettingsChanged)
+    Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportSettingsChanged)
+    Q_INVOKABLE int exportWidth() const { return m_exportWidth; }
+    Q_INVOKABLE void setExportWidth(int w);
+    Q_INVOKABLE int exportHeight() const { return m_exportHeight; }
+    Q_INVOKABLE void setExportHeight(int h);
+    Q_INVOKABLE double exportFps() const { return m_exportFps; }
+    Q_INVOKABLE void setExportFps(double fps);
+    Q_INVOKABLE QString exportCodec() const { return m_exportCodec; }
+    Q_INVOKABLE void setExportCodec(const QString &codec);
+    Q_INVOKABLE int exportCrf() const { return m_exportCrf; }
+    Q_INVOKABLE void setExportCrf(int crf);
+    Q_INVOKABLE int exportBitrate() const { return m_exportBitrate; }
+    Q_INVOKABLE void setExportBitrate(int bitrate);
+    Q_INVOKABLE bool exportVidstab() const { return m_exportVidstab; }
+    Q_INVOKABLE void setExportVidstab(bool vidstab);
+
     Keyframe keyframeAt(int index) const;
     int count() const { return (int)m_keyframes.size(); }
 
@@ -72,12 +96,21 @@ signals:
     void keyframesChanged();
     // Emitted after the export trim in/out markers change.
     void trimChanged();
+    // Emitted after any last-used export output option changes.
+    void exportSettingsChanged();
 
 private:
     void sortAndNotify();
     QVector<Keyframe> m_keyframes;
     double m_trimIn = 0.0;
     double m_trimOut = 0.0;
+    int m_exportWidth = 1920;
+    int m_exportHeight = 1080;
+    double m_exportFps = 30.0;
+    QString m_exportCodec = QStringLiteral("libx264");
+    int m_exportCrf = 19;
+    int m_exportBitrate = 12;
+    bool m_exportVidstab = false;
 };
 
 #endif // KEYFRAME_H

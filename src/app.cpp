@@ -55,6 +55,8 @@ App::App(QObject *parent)
     , m_flowIterations(kDefaultFlowIterations)
     , m_flowAlpha(kDefaultFlowAlpha)
     , m_flowEncode(16.0)
+    , m_flowPending(false)
+    , m_flowLastTs(-1.0)
     , m_usePreview(false)
     , m_activeLens(2)
     , m_projection(0)
@@ -96,6 +98,7 @@ App::App(QObject *parent)
     connect(this, &App::flowRequested, m_flowWorker, &FlowWorker::computeFrame);
     connect(m_flowWorker, &FlowWorker::flowReady, this, &App::onFlowReady);
     connect(m_flowWorker, &FlowWorker::flowFailed, this, [this](const QString &message) {
+        m_flowPending = false;
         qWarning().noquote() << "Flow stitching preview:" << message;
     });
     m_flowThread->start();
@@ -120,6 +123,23 @@ App::App(QObject *parent)
     // Keep the per-video keyframe sidecar file in sync whenever the user adds,
     // edits or deletes keyframes.
     connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::saveKeyframes);
+
+    // The last-used export output options live in the same sidecar file, so
+    // surface their changes to QML and persist them when the user picks new
+    // encoder settings. During loadFromFile() (switching videos) the model
+    // has already been restored, so a write here would just rewrite what we
+    // read — guarded against by m_restoringSidecar.
+    connect(m_keyframes, &KeyframeModel::exportSettingsChanged, this, [this]() {
+        emit exportWidthChanged();
+        emit exportHeightChanged();
+        emit exportFpsChanged();
+        emit exportCodecChanged();
+        emit exportCrfChanged();
+        emit exportBitrateChanged();
+        emit exportVidstabChanged();
+        if (!m_restoringSidecar)
+            saveKeyframes();
+    });
 
     // The export in/out markers live in the same sidecar file, so persist them
     // too. The timeline handles drag continuously, so coalesce the writes
@@ -216,6 +236,8 @@ void App::setVideoPath(const QString &path)
 
     m_videoPath = path;
     m_usePreview = false;
+    m_flowPending = false;  // drop any in-flight flow job from the old clip
+    m_flowLastTs = -1.0;
     emit videoPathChanged();
     emit usePreviewThumbnailChanged();
 
@@ -232,9 +254,13 @@ void App::setVideoPath(const QString &path)
     setRoll(0.0);
 
     if (!path.isEmpty()) {
-        // Restore this video's saved keyframes and export in/out markers (or
-        // clear both when the video has no sidecar yet).
+        // Restore this video's saved keyframes, export in/out markers and
+        // last-used export options from the sidecar (or clear them when the
+        // video has no sidecar yet). The guard prevents the export-settings
+        // change handler from immediately rewriting the file it just read.
+        m_restoringSidecar = true;
         m_keyframes->loadFromFile(keyframesPathFor(path));
+        m_restoringSidecar = false;
         m_exportStart = m_keyframes->trimIn();
         m_exportEnd = m_keyframes->trimOut();
         emit exportStartChanged();
@@ -494,6 +520,8 @@ void App::setFlowStitch(bool stitch)
     } else {
         // Disable the warp immediately; drop any stale field so the next
         // toggle-on starts fresh.
+        m_flowPending = false;
+        m_flowLastTs = -1.0;
         m_flowImage = QImage();
         m_flowEncode = 16.0;
         emit flowImageReady();
@@ -536,8 +564,16 @@ void App::maybeComputeFlow()
 {
     if (!m_flowStitch || !m_decoder || !m_decoder->hasFrame())
         return;
+    // Latest-wins: if the flow worker is already busy, drop this intermediate
+    // frame instead of enqueueing it — otherwise the serial worker falls
+    // behind during playback and the seam is warped with an ever-staler flow
+    // field ("edges of the image appear static").
+    if (m_flowPending)
+        return;
+    m_flowPending = true;
 
     DecodedFrame frame = m_decoder->currentFrame();  // copy (ref-counted planes)
+    m_flowLastTs = frame.timestamp;
 
     FlowCalibration cal;
     if (m_currentCalibration) {
@@ -566,10 +602,18 @@ void App::maybeComputeFlow()
 
 void App::onFlowReady(const QImage &image, float encodeScale)
 {
+    m_flowPending = false;
     m_flowEncode = encodeScale;
     m_flowImage = image.copy();  // deep copy: the worker must never touch it again
-    image.save("/tmp/flow_debug.png");    // <-- temporary dump
     emit flowImageReady();
+    // The worker is idle again. If playback has advanced past the frame we
+    // just processed, run one more compute for the newest frame (latest-wins).
+    // If the timestamp hasn't changed (paused), don't recompute the same frame.
+    const double newest = (m_decoder && m_decoder->hasFrame())
+        ? m_decoder->currentFrame().timestamp : -1.0;
+    if (newest >= 0.0 && newest != m_flowLastTs)
+        QMetaObject::invokeMethod(this, [this]() { maybeComputeFlow(); },
+                                  Qt::QueuedConnection);
 }
 
 int App::activeLens() const
@@ -787,7 +831,7 @@ void App::exportFrame(const QString &path, int width, int height)
                             snap.stateAt(m_currentTime));
 }
 
-void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, bool gpuBackend)
+void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool gpuBackend)
 {
     if (m_videoPath.isEmpty()) {
         m_exportStatus = tr("Export failed: no video loaded");
@@ -802,8 +846,17 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     m_exportStatus = tr("Preparing export…");
     emit exportStatusChanged();
 
+    ExportSettings settings;
+    settings.width = width;
+    settings.height = height;
+    settings.fps = fps;
+    settings.codec = codec;
+    settings.crf = crf;
+    settings.bitrateMbps = bitrateMbps;
+    settings.vidstab = vidstab;
+
     ExportSnapshot snap = buildExportSnapshot();
-    m_exporter->exportVideo(m_videoPath, path, width, height, fps, startTime, endTime,
+    m_exporter->exportVideo(m_videoPath, path, settings, startTime, endTime,
                             [snap](double t) { return snap.stateAt(t); },
                             gpuBackend);
 }
@@ -813,6 +866,7 @@ void App::setExportStart(double time)
     const double dur = m_decoder ? m_decoder->duration() : 0.0;
     double hi = (dur > 0.0) ? qMin(m_exportEnd, dur) : m_exportEnd;
     time = qBound(0.0, time, hi);
+    time = qRound(time * 100.0) / 100.0;  // store at 1/100 s resolution
     if (qFuzzyCompare(m_exportStart, time))
         return;
     m_exportStart = time;
@@ -824,10 +878,46 @@ void App::setExportEnd(double time)
     const double dur = m_decoder ? m_decoder->duration() : 0.0;
     double hi = (dur > 0.0) ? dur : time;
     time = qBound(m_exportStart, time, hi);
+    time = qRound(time * 100.0) / 100.0;  // store at 1/100 s resolution
     if (qFuzzyCompare(m_exportEnd, time))
         return;
     m_exportEnd = time;
     emit exportEndChanged();
+}
+
+void App::setExportWidth(int width)
+{
+    m_keyframes->setExportWidth(width);
+}
+
+void App::setExportHeight(int height)
+{
+    m_keyframes->setExportHeight(height);
+}
+
+void App::setExportFps(double fps)
+{
+    m_keyframes->setExportFps(fps);
+}
+
+void App::setExportCodec(const QString &codec)
+{
+    m_keyframes->setExportCodec(codec);
+}
+
+void App::setExportCrf(int crf)
+{
+    m_keyframes->setExportCrf(crf);
+}
+
+void App::setExportBitrate(int bitrate)
+{
+    m_keyframes->setExportBitrate(bitrate);
+}
+
+void App::setExportVidstab(bool vidstab)
+{
+    m_keyframes->setExportVidstab(vidstab);
 }
 
 void App::setExportRunning(bool running)

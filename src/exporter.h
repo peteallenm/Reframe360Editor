@@ -69,6 +69,17 @@ struct ExportFrameState {
     QQuaternion imuOrientation{1.0f, 0.0f, 0.0f, 0.0f};
 };
 
+// Encoder/output choices for a video export.
+struct ExportSettings {
+    int width = 1920;
+    int height = 1080;
+    double fps = 30.0;
+    QString codec = QStringLiteral("libx264");  // libx264, libx265, hevc_nvenc
+    int crf = 19;               // quality for CPU codecs (0..51)
+    int bitrateMbps = 12;       // bitrate for NVENC (Mbit/s)
+    bool vidstab = false;       // FFmpeg vidstab post-processing stabilization
+};
+
 class Exporter : public QObject
 {
     Q_OBJECT
@@ -80,13 +91,14 @@ public:
     // it must only touch snapshot/copy data (never live GUI objects).
     using StateProvider = std::function<ExportFrameState(double time)>;
 
-    // Render <videoPath> over [startTime, endTime] at fps to <outPath> (MP4).
-    // Runs on a worker thread; progress/finished/error are signalled back.
-    // If useGpu is true the frames are rendered with the offscreen GL
-    // pipeline (same shader as the live viewer); if no usable GL context can
-    // be created it automatically falls back to the CPU rasterizer.
+    // Render <videoPath> over [startTime, endTime] at fps/fps to <outPath>
+    // (MP4) using the encoder settings in <settings>. Runs on a worker thread;
+    // progress/finished/error are signalled back. If useGpu is true the frames
+    // are rendered with the offscreen GL pipeline (same shader as the live
+    // viewer); if no usable GL context can be created it automatically falls
+    // back to the CPU rasterizer.
     void exportVideo(const QString &videoPath, const QString &outPath,
-                     int width, int height, double fps,
+                     const ExportSettings &settings,
                      double startTime, double endTime,
                      const StateProvider &state, bool useGpu = true);
 
@@ -109,12 +121,25 @@ private:
     bool beginExport();
 
     void runVideo(const QString &videoPath, const QString &outPath,
-                  int width, int height, double fps,
+                  const ExportSettings &settings,
                   double startTime, double endTime, StateProvider state,
                   bool useGpu);
     void runFrame(const QString &videoPath, const QString &outPath,
                   int width, int height, double time, ExportFrameState state,
                   bool useGpu);
+
+    // Run the FFmpeg vidstab two-pass stabilization (vidstabdetect ->
+    // vidstabtransform) on <input>, producing <output> re-encoded with the
+    // chosen codec/bitrate and export metadata. Reports progress via
+    // exportProgress (each pass contributes half).
+    bool runVidStab(const QString &input, const QString &output,
+                    const ExportSettings &settings,
+                    const QString &sourceName, const QString &comment);
+
+    // Launch ffmpeg with <args>, mapping its "time=" progress (relative to
+    // <fps>) onto [startProgress, startProgress + weight] via exportProgress.
+    bool runFfmpeg(const QStringList &args, double startProgress, double weight,
+                   int fps);
 
     QThread *m_thread = nullptr;
 };
