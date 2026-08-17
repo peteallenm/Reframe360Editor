@@ -54,6 +54,8 @@ public:
     Q_PROPERTY(int exportCrf READ exportCrf WRITE setExportCrf NOTIFY exportSettingsChanged)
     Q_PROPERTY(int exportBitrate READ exportBitrate WRITE setExportBitrate NOTIFY exportSettingsChanged)
     Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportSettingsChanged)
+    Q_PROPERTY(bool exportVidstabInformed READ exportVidstabInformed WRITE setExportVidstabInformed NOTIFY exportSettingsChanged)
+    Q_PROPERTY(QString exportFileName READ exportFileName WRITE setExportFileName NOTIFY exportSettingsChanged)
     Q_INVOKABLE int exportWidth() const { return m_exportWidth; }
     Q_INVOKABLE void setExportWidth(int w);
     Q_INVOKABLE int exportHeight() const { return m_exportHeight; }
@@ -68,6 +70,10 @@ public:
     Q_INVOKABLE void setExportBitrate(int bitrate);
     Q_INVOKABLE bool exportVidstab() const { return m_exportVidstab; }
     Q_INVOKABLE void setExportVidstab(bool vidstab);
+    Q_INVOKABLE bool exportVidstabInformed() const { return m_exportVidstabInformed; }
+    Q_INVOKABLE void setExportVidstabInformed(bool informed);
+    Q_INVOKABLE QString exportFileName() const { return m_exportFileName; }
+    Q_INVOKABLE void setExportFileName(const QString &name);
 
     Keyframe keyframeAt(int index) const;
     int count() const { return (int)m_keyframes.size(); }
@@ -111,6 +117,8 @@ private:
     int m_exportCrf = 19;
     int m_exportBitrate = 12;
     bool m_exportVidstab = false;
+    bool m_exportVidstabInformed = false;
+    QString m_exportFileName;  // last-used output MP4 path (persisted per-video)
 };
 
 #endif // KEYFRAME_H

@@ -10,7 +10,7 @@ Dialog {
     title: qsTr("Export Video")
     modal: true
     standardButtons: Dialog.NoButton
-    width: 440
+    width: 480
     closePolicy: Popup.CloseOnEscape
 
     property string defaultFolder: ""
@@ -31,7 +31,13 @@ Dialog {
     }
 
     onOpened: {
-        outputField.text = defaultFolder + "/" + defaultBase + "_export.mp4"
+        // Restore the last-used output path for this video (persisted in the
+        // keyframe sidecar) if we have one; otherwise fall back to deriving
+        // one from the current folder/base.
+        if (app.exportFileName !== "")
+            outputField.text = app.exportFileName
+        else if (outputField.text === "")
+            outputField.text = defaultFolder + "/" + defaultBase + "_export.mp4"
         // Keep the resolution / fps / codec / quality combos synced to the
         // persisted settings (they may have been restored at startup).
         syncResolutionCombo()
@@ -65,9 +71,29 @@ Dialog {
         codecCombo.currentIndex = Math.max(0, codecCombo.indexOfValue(app.exportCodec))
     }
 
+    // Body area height (the fields scroll internally if they exceed this).
+    property int bodyHeight: 380
+
     contentItem: ColumnLayout {
-        spacing: 12
+        spacing: 8
         implicitWidth: 440
+
+        // Scrollable body: fields reachable without pushing the action buttons
+        // off the bottom of the window. The body uses a fixed content width so
+        // there is no horizontal scrolling.
+        ScrollView {
+            id: bodyScroll
+            Layout.fillWidth: true
+            Layout.preferredWidth: 440
+            Layout.preferredHeight: exportDialog.bodyHeight
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            ColumnLayout {
+                id: bodyLayout
+                spacing: 12
+                width: 424
+                implicitWidth: 424
 
         // ---- Output file ----
         RowLayout {
@@ -172,21 +198,54 @@ Dialog {
 
         Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
 
-        // ---- FFmpeg vidstab post-processing ----
-        CheckBox {
-            id: vidstabCheck
-            text: qsTr("FFmpeg vidstab post-processing stabilization")
-            checked: app.exportVidstab
-            onCheckedChanged: app.exportVidstab = checked
-        }
-
-        Label {
-            text: qsTr("Runs vidstabdetect + vidstabtransform on the rendered output (two ffmpeg passes) to reduce residual jitter.")
-            font.pixelSize: 11
-            color: Material.secondaryTextColor
-            wrapMode: Text.WordWrap
-            Layout.fillWidth: true
-            Layout.leftMargin: 24
+        // ---- Extra stabilization (mutually exclusive options) ----
+        ColumnLayout {
+            spacing: 4
+            Label {
+                text: qsTr("Extra stabilization:")
+                font.pixelSize: 12
+                color: Material.primaryTextColor
+            }
+            RadioButton {
+                id: stabNone
+                text: qsTr("None")
+                checked: !app.exportVidstab && !app.exportVidstabInformed
+                onToggled: {
+                    if (checked) {
+                        app.exportVidstab = false
+                        app.exportVidstabInformed = false
+                    }
+                }
+            }
+            RadioButton {
+                id: stabHybrid
+                text: qsTr("Hybrid stabilization (experimental)")
+                checked: app.exportVidstabInformed
+                onToggled: {
+                    if (checked) {
+                        app.exportVidstabInformed = true
+                        app.exportVidstab = false
+                    }
+                }
+            }
+            RadioButton {
+                id: stabPost
+                text: qsTr("FFmpeg vidstab post-processing")
+                checked: app.exportVidstab
+                onToggled: {
+                    if (checked) {
+                        app.exportVidstab = true
+                        app.exportVidstabInformed = false
+                    }
+                }
+            }
+            Label {
+                text: qsTr("Hybrid (experimental): analyzes a low-res pass with vidstabdetect and folds the detected jitter into the native render (single clean export). May not improve 360 content — see classic post-processing for reliable results. Post-processing: runs vidstabdetect + vidstabtransform on the output (two ffmpeg passes, re-encodes).")
+                font.pixelSize: 11
+                color: Material.secondaryTextColor
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
         }
 
         Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
@@ -201,7 +260,8 @@ Dialog {
             }
         }
 
-        // ---- Buttons ----
+            } // bodyLayout
+        } // bodyScroll (ScrollView)        // ---- Buttons (always visible, outside the scrollable body) ----
         RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: 4
@@ -229,6 +289,7 @@ Dialog {
                         app.exportCrf,
                         app.exportBitrate,
                         app.exportVidstab,
+                        app.exportVidstabInformed,
                         true)
     }
 

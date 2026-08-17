@@ -121,6 +121,20 @@ void KeyframeModel::setExportVidstab(bool vidstab)
     emit exportSettingsChanged();
 }
 
+void KeyframeModel::setExportVidstabInformed(bool informed)
+{
+    if (m_exportVidstabInformed == informed) return;
+    m_exportVidstabInformed = informed;
+    emit exportSettingsChanged();
+}
+
+void KeyframeModel::setExportFileName(const QString &name)
+{
+    if (m_exportFileName == name) return;
+    m_exportFileName = name;
+    emit exportSettingsChanged();
+}
+
 void KeyframeModel::removeKeyframe(int i)
 {
     if (i < 0 || i >= (int)m_keyframes.size()) return;
@@ -235,6 +249,8 @@ void KeyframeModel::saveToFile(const QString &path) const
             {"crf", m_exportCrf},
             {"bitrateMbps", m_exportBitrate},
             {"vidstab", m_exportVidstab},
+            {"vidstabInformed", m_exportVidstabInformed},
+            {"fileName", m_exportFileName},
         }},
         {"keyframes", arr},
     };
@@ -256,6 +272,8 @@ void KeyframeModel::loadFromFile(const QString &path)
     int expCrf = m_exportCrf;
     int expBitrate = m_exportBitrate;
     bool expVidstab = m_exportVidstab;
+    bool expVidstabInformed = m_exportVidstabInformed;
+    QString expFileName = m_exportFileName;
 
     QFile f(path);
     if (f.open(QIODevice::ReadOnly)) {
@@ -290,6 +308,9 @@ void KeyframeModel::loadFromFile(const QString &path)
             expCrf = qBound(0, exp.value("crf").toInt(expCrf), 51);
             expBitrate = qBound(1, exp.value("bitrateMbps").toInt(expBitrate), 100);
             if (exp.contains("vidstab")) expVidstab = exp.value("vidstab").toBool();
+            if (exp.contains("vidstabInformed")) expVidstabInformed = exp.value("vidstabInformed").toBool();
+            if (exp.contains("fileName") && !exp.value("fileName").toString().isEmpty())
+                expFileName = exp.value("fileName").toString();
         }
     }
     std::sort(loaded.begin(), loaded.end());
@@ -311,7 +332,9 @@ void KeyframeModel::loadFromFile(const QString &path)
                               && expCodec == m_exportCodec
                               && expCrf == m_exportCrf
                               && expBitrate == m_exportBitrate
-                              && expVidstab == m_exportVidstab;
+                              && expVidstab == m_exportVidstab
+                              && expVidstabInformed == m_exportVidstabInformed
+                              && expFileName == m_exportFileName;
 
     // No-op load (same contents + trim, or a missing file with an empty
     // model): skip the model reset so opening videos doesn't churn the
@@ -337,6 +360,8 @@ void KeyframeModel::loadFromFile(const QString &path)
     m_exportCrf = expCrf;
     m_exportBitrate = expBitrate;
     m_exportVidstab = expVidstab;
+    m_exportVidstabInformed = expVidstabInformed;
+    m_exportFileName = expFileName;
     emit trimChanged();
     emit exportSettingsChanged();
 }

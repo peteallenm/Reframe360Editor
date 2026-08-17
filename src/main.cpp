@@ -85,6 +85,8 @@ int main(int argc, char *argv[])
     parser.addOption(exportBitrateOption);
     QCommandLineOption exportVidstabOption("export-vidstab", "Enable FFmpeg vidstab post-processing stabilization");
     parser.addOption(exportVidstabOption);
+    QCommandLineOption exportVidstabHybridOption("export-vidstab-hybrid", "Hybrid stabilization (EXPERIMENTAL): vidstab-detected residuals folded into the native render (single-pass, no re-encode)");
+    parser.addOption(exportVidstabHybridOption);
     
     parser.process(app);
 
@@ -115,6 +117,7 @@ int main(int argc, char *argv[])
                 const int bitrate = (parser.value(exportBitrateOption).toInt() > 0)
                         ? parser.value(exportBitrateOption).toInt() : 12;
                 const bool vidstab = parser.isSet(exportVidstabOption);
+                const bool vidstabInformed = parser.isSet(exportVidstabHybridOption);
                 const bool enableImu = parser.isSet(imuOption);
                 const int projIdx = parser.isSet(projectionOption) ? parser.value(projectionOption).toInt() : -1;
 
@@ -131,13 +134,13 @@ int main(int argc, char *argv[])
                 });
                 QTimer *wait = new QTimer(&app);
                 wait->setInterval(100);
-                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab]() {
+                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab, vidstabInformed]() {
                     if (appController.duration() <= 0.0)
                         return;   // keep waiting for the decoder
                     wait->stop();
                     const double startTime = start;
                     const double endTime = (end >= 0.0) ? end : appController.duration();
-                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, gpu);
+                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, vidstabInformed, gpu);
 
                     // Poll until the export finishes, then exit with a code
                     // that reflects success/failure.

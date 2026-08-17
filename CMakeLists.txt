@@ -24,6 +24,7 @@ qt_add_executable(render360
     src/exporter.cpp
     src/colorgrade.cpp
     src/gpurenderer.cpp
+    src/vidstab.cpp
     src/flowrenderer.cpp
 )
 

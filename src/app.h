@@ -107,6 +107,8 @@ class App : public QObject
     Q_PROPERTY(int exportCrf READ exportCrf WRITE setExportCrf NOTIFY exportCrfChanged)
     Q_PROPERTY(int exportBitrate READ exportBitrate WRITE setExportBitrate NOTIFY exportBitrateChanged)
     Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportVidstabChanged)
+    Q_PROPERTY(bool exportVidstabInformed READ exportVidstabInformed WRITE setExportVidstabInformed NOTIFY exportVidstabInformedChanged)
+    Q_PROPERTY(QString exportFileName READ exportFileName WRITE setExportFileName NOTIFY exportFileNameChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -200,9 +202,14 @@ public:
     void setExportBitrate(int bitrate);
     bool exportVidstab() const { return m_keyframes->exportVidstab(); }
     void setExportVidstab(bool vidstab);
+    bool exportVidstabInformed() const { return m_keyframes->exportVidstabInformed(); }
+    void setExportVidstabInformed(bool informed);
+
+    QString exportFileName() const { return m_keyframes->exportFileName(); }
+    void setExportFileName(const QString &name);
 
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
-    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool gpuBackend = true);
+    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend = true);
     Q_INVOKABLE QString grabStill(int lens);
     Q_INVOKABLE void dragLook(double angleAboutUp, double angleAboutRight);
 
@@ -269,6 +276,8 @@ signals:
     void exportCrfChanged();
     void exportBitrateChanged();
     void exportVidstabChanged();
+    void exportVidstabInformedChanged();
+    void exportFileNameChanged();
 
 private:
     VideoDecoder *m_decoder;

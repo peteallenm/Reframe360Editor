@@ -137,6 +137,8 @@ App::App(QObject *parent)
         emit exportCrfChanged();
         emit exportBitrateChanged();
         emit exportVidstabChanged();
+        emit exportVidstabInformedChanged();
+        emit exportFileNameChanged();
         if (!m_restoringSidecar)
             saveKeyframes();
     });
@@ -831,7 +833,7 @@ void App::exportFrame(const QString &path, int width, int height)
                             snap.stateAt(m_currentTime));
 }
 
-void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool gpuBackend)
+void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend)
 {
     if (m_videoPath.isEmpty()) {
         m_exportStatus = tr("Export failed: no video loaded");
@@ -845,6 +847,9 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     setExportRunning(true);
     m_exportStatus = tr("Preparing export…");
     emit exportStatusChanged();
+    // Remember the output path so it can be restored the next time the export
+    // dialog opens for this video (persisted in the keyframe sidecar).
+    m_keyframes->setExportFileName(path);
 
     ExportSettings settings;
     settings.width = width;
@@ -854,6 +859,7 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     settings.crf = crf;
     settings.bitrateMbps = bitrateMbps;
     settings.vidstab = vidstab;
+    settings.vidstabInformed = vidstabInformed;
 
     ExportSnapshot snap = buildExportSnapshot();
     m_exporter->exportVideo(m_videoPath, path, settings, startTime, endTime,
@@ -918,6 +924,16 @@ void App::setExportBitrate(int bitrate)
 void App::setExportVidstab(bool vidstab)
 {
     m_keyframes->setExportVidstab(vidstab);
+}
+
+void App::setExportVidstabInformed(bool informed)
+{
+    m_keyframes->setExportVidstabInformed(informed);
+}
+
+void App::setExportFileName(const QString &name)
+{
+    m_keyframes->setExportFileName(name);
 }
 
 void App::setExportRunning(bool running)

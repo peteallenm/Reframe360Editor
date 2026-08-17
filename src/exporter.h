@@ -78,6 +78,8 @@ struct ExportSettings {
     int crf = 19;               // quality for CPU codecs (0..51)
     int bitrateMbps = 12;       // bitrate for NVENC (Mbit/s)
     bool vidstab = false;       // FFmpeg vidstab post-processing stabilization
+    bool vidstabInformed = false;  // Hybrid: vidstab-detected residuals folded
+                                   // into the native per-frame orientation
 };
 
 class Exporter : public QObject

@@ -18,6 +18,7 @@
 #include "videodecoder.h"
 #include "gpurenderer.h"
 #include "flowrenderer.h"
+#include "vidstab.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -412,6 +413,10 @@ public:
     // is found (seeking BACKWARD to targetSec on the first call). Returns false
     // on EOF/error.
     bool readFrameAt(double targetSec, DecodedFrame *out);
+
+    // Allow a second pass over the same clip (used by hybrid stabilization):
+    // the next readFrameAt() call re-seeks back to its own target.
+    void rewind() { m_seeked = false; }
 
     double duration() const { return m_duration; }
     bool isFullRange() const { return m_fullRange; }
@@ -820,9 +825,10 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         return;
     }
 
-    // When vidstab is enabled the render pass targets a temporary file; the
-    // final output is produced by the vidstab transform (which re-encodes with
-    // the chosen codec/bitrate and carries the metadata along).
+    // Classic vidstab re-encodes the render with vidstabtransform afterwards,
+    // so the render pass targets a temporary file. Hybrid stabilization skips
+    // that re-encode entirely: the analysis pass is written to a temp file and
+    // the final (single) encode goes straight to <outPath>.
     QString outFile = outPath;
     QTemporaryDir tmpDir;
     if (settings.vidstab)
@@ -847,17 +853,12 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
 
     // Metadata: the input filename plus a summary of the export settings.
     QFileInfo srcInfo(videoPath);
+    const QString stabilizer = settings.vidstabInformed ? tr("hybrid (vidstab, experimental)") :
+                               settings.vidstab ? tr("vidstab") : tr("none");
     const QString comment = tr("Resolution: %1x%2, FPS: %3, Codec: %4, Stabilization: %5")
                                 .arg(width).arg(height).arg(fps)
                                 .arg(settings.codec)
-                                .arg(settings.vidstab ? tr("vidstab") : tr("none"));
-    VideoWriter writer;
-    if (!writer.open(outFile, width, height, fpsd, settings.codec,
-                     settings.crf, settings.bitrateMbps,
-                     srcInfo.fileName(), comment, &err)) {
-        fail(err);
-        return;
-    }
+                                .arg(stabilizer);
 
     const double dur = reader.duration();
     double start = qMax(0.0, startTime);
@@ -866,50 +867,145 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         end = start + 1.0 / fpsd;
 
     const int totalFrames = qMax(1, (int)qCeil((end - start) * fpsd));
-    bool eof = false;
-    int framesWritten = 0;
 
+    // Shared per-pass render loop: decode, look up state, render at the given
+    // resolution and encode into <w>. Progress is reported over
+    // [base, base + scale]. Returns frames written, -1 on a fatal error.
     FlowEngine flow;
+    auto renderPass = [&](VideoWriter &w, int rw, int rh, bool withFlow,
+                          double base, double scale) -> int {
+        bool eof = false;
+        int written = 0;
+        for (int i = 0; i < totalFrames && !eof; ++i) {
+            const double t = start + (double)i / fpsd;
+            DecodedFrame frame;
+            if (!reader.readFrameAt(t, &frame)) {
+                eof = true;
+                break;
+            }
+            // Look up the state at the frame's actual presentation timestamp,
+            // not the idealized start + i/fps grid: the IMU sync must align to
+            // the real frame time (the same PTS the preview uses), otherwise
+            // VFR timing variations jitter the stabilization.
+            const double stateTime = (frame.timestamp >= 0.0) ? frame.timestamp : t;
+            ExportFrameState s = state(stateTime);
+            QImage rendered;
+            if (gpuReady) {
+                // Optical-flow stitching: estimate the parallax field for this
+                // frame and upload it before rendering. If flow was requested
+                // but the 4.4 context or a frame's computation fails, that
+                // frame renders without the warp.
+                if (withFlow && s.flowStitch) {
+                    if (!flow.prepare(s) || !flow.apply(frame, gpu))
+                        s.flowStitch = false;
+                }
+                if (!gpu.render(frame, s, rw, rh, &rendered, &err))
+                    return -1;
+            } else {
+                rendered = renderFrame(frame, s, rw, rh);
+            }
+            if (!w.writeFrame(rendered, &err))
+                return -1;
+            written++;
+            emit exportProgress(base + scale * ((double)(i + 1) / (double)totalFrames));
+        }
+        return written;
+    };
 
-    for (int i = 0; i < totalFrames && !eof; ++i) {
-        const double t = start + (double)i / fpsd;
-        DecodedFrame frame;
-        if (!reader.readFrameAt(t, &frame)) {
-            eof = true;
-            break;
-        }
-        // Look up the state at the frame's actual presentation timestamp, not
-        // the idealized start + i/fps grid: the IMU sync must align to the real
-        // frame time (the same PTS the preview uses), otherwise VFR timing
-        // variations and container jitter desync the stabilization.
-        const double stateTime = (frame.timestamp >= 0.0) ? frame.timestamp : t;
-        ExportFrameState s = state(stateTime);
-        QImage rendered;
-        if (gpuReady) {
-            // Optical-flow stitching: estimate the parallax field for this
-            // frame and upload it before rendering. If flow was requested but
-            // the 4.4 context or a frame's computation fails, that frame
-            // renders without the warp (a warning was logged once).
-            if (s.flowStitch) {
-                if (!flow.prepare(s) || !flow.apply(frame, gpu))
-                    s.flowStitch = false;
+    // Hybrid stabilization: a low-res analysis pass measures the residual
+    // jitter the native IMU leaves behind. vidstabdetect turns that into a
+    // per-frame motion file, which we convert into small counter-rotation
+    // quaternions and fold into the per-frame state for the final pass. Any
+    // failure here degrades gracefully to the plain (uncorrected) export.
+    QVector<VidStabTransform> corrections;
+    int analW = 0, analH = 0;
+    bool hybridOk = false;
+    if (settings.vidstabInformed) {
+        const int aW = qMax(320, (width / 4) & ~1);
+        const int aH = qMax(180, (height / 4) & ~1);
+        const QString analysisPath = tmpDir.filePath(QStringLiteral("analysis.mp4"));
+        const QString trfPath = tmpDir.filePath(QStringLiteral("transforms.trf"));
+
+        VideoWriter aw;
+        if (aw.open(analysisPath, aW, aH, fpsd, QStringLiteral("libx264"),
+                    23, 4, QString(), QString(), &err)) {
+            const int aFrames = renderPass(aw, aW, aH, /*withFlow*/ false, 0.0, 0.25);
+            QString ferr;
+            aw.finish(&ferr);
+            if (aFrames > 0) {
+                QFile::remove(trfPath);
+                QStringList detectArgs = {
+                    QStringLiteral("-i"), analysisPath,
+                    QStringLiteral("-vf"),
+                    QStringLiteral("vidstabdetect=stepsize=2:shakiness=6:accuracy=9:result=%1")
+                        .arg(trfPath),
+                    QStringLiteral("-f"), QStringLiteral("null"), QStringLiteral("-")
+                };
+                if (runFfmpeg(detectArgs, 0.25, 0.08, fps)) {
+                    VidStabAnalysis vs;
+                    if (vs.parseTrf(trfPath, &err) && vs.frameCount() > 1) {
+                        corrections = vs.corrections(20);  // 41-frame lowpass
+                        if (!corrections.isEmpty()) {
+                            analW = aW;
+                            analH = aH;
+                            hybridOk = true;
+                            qInfo().noquote() << "Hybrid stabilization:" << corrections.size()
+                                              << "corrections from" << analysisPath;
+                        }
+                    }
+                }
             }
-            if (!gpu.render(frame, s, width, height, &rendered, &err)) {
-                fail(err);
-                return;
-            }
-        } else {
-            rendered = renderFrame(frame, s, width, height);
         }
-        if (!writer.writeFrame(rendered, &err)) {
-            fail(err);
-            return;
-        }
-        framesWritten++;
-        // With vidstab enabled the video is re-encoded afterwards, so the
-        // render pass only maps onto the first half of the progress bar.
-        emit exportProgress((double)(i + 1) / (double)totalFrames
-                            * (settings.vidstab ? 0.5 : 1.0));
+        if (!hybridOk)
+            qWarning().noquote() << "Hybrid stabilization unavailable, exporting uncorrected:"
+                                 << err;
+        reader.rewind();  // reuse the same decoder for the final pass
+    }
+
+    // Fold the per-frame residual correction into the state the final pass
+    // sees. The correction is measured in the rendered view's screen axes, so
+    // it is conjugated through this frame's euler look into the stabilized
+    // world frame before composing with the native IMU orientation — otherwise
+    // it only cancels when the look angle is axis-aligned. Per the shader
+    // composition (ray_world = imuMatrix * euler * ray_view), absorbing a
+    // screen correction qS requires imu' = (euler * qS * euler^-1)^-1 * imu.
+    if (hybridOk) {
+        const int n = corrections.size();
+        const double aspect = (double)analW / (double)analH;
+        StateProvider baseState = state;
+        state = [baseState, corrections, start, fpsd, aspect, analW, analH, n](double t) {
+            ExportFrameState s = baseState(t);
+            const int idx = qBound(0, (int)qRound((t - start) * fpsd), n - 1);
+            const QQuaternion qS = VidStabAnalysis::correctionToQuaternion(
+                corrections[idx], degToRad(s.fov), aspect, analW, analH);
+            // eulerRotation(yaw,pitch,roll) = rotY * rotX * rotZ (shader order)
+            const QQuaternion qE = QQuaternion::fromAxisAndAngle(0.0f, 1.0f, 0.0f, (float)s.yaw)
+                                 * QQuaternion::fromAxisAndAngle(1.0f, 0.0f, 0.0f, (float)s.pitch)
+                                 * QQuaternion::fromAxisAndAngle(0.0f, 0.0f, 1.0f, (float)s.roll);
+            const QQuaternion qW = qE * qS * qE.conjugated();
+            s.imuOrientation = qW.conjugated() * s.imuOrientation;
+            return s;
+        };
+    }
+
+    VideoWriter writer;
+    if (!writer.open(outFile, width, height, fpsd, settings.codec,
+                     settings.crf, settings.bitrateMbps,
+                     srcInfo.fileName(), comment, &err)) {
+        fail(err);
+        return;
+    }
+
+    int framesWritten = 0;
+    if (settings.vidstabInformed)
+        framesWritten = renderPass(writer, width, height, /*withFlow*/ true, 0.33, 0.67);
+    else if (settings.vidstab)
+        framesWritten = renderPass(writer, width, height, /*withFlow*/ true, 0.0, 0.5);
+    else
+        framesWritten = renderPass(writer, width, height, /*withFlow*/ true, 0.0, 1.0);
+    if (framesWritten < 0) {
+        fail(err);
+        return;
     }
 
     // A range entirely past the end of the clip would otherwise produce an
@@ -924,8 +1020,10 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         return;
     }
 
-    // Optional FFmpeg vidstab post-processing: detect motion vectors, then
-    // transform + re-encode with the chosen codec/bitrate into the final file.
+    // Optional classic FFmpeg vidstab post-processing: detect motion vectors,
+    // then transform + re-encode with the chosen codec/bitrate into the final
+    // file. (Hybrid stabilization already returns a finished single-pass file,
+    // so it must not reach here.)
     if (settings.vidstab) {
         if (!runVidStab(outFile, outPath, settings, srcInfo.fileName(), comment)) {
             fail(tr("FFmpeg vidstab post-processing failed (is ffmpeg installed?)"));
