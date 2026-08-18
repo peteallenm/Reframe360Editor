@@ -44,6 +44,7 @@ static QByteArray adaptShader(const QByteArray &src)
     s.replace("layout(binding = 2) uniform sampler2D", "uniform sampler2D");
     s.replace("layout(binding = 3) uniform sampler2D", "uniform sampler2D");
     s.replace("layout(binding = 4) uniform sampler2D", "uniform sampler2D");
+    s.replace("layout(binding = 5) uniform sampler2D", "uniform sampler2D");
     // layout(location = N) needs GLSL 410 (or an extension) on NVIDIA's
     // compiler, so strip them and assign attribute locations explicitly via
     // QOpenGLShaderProgram::bindAttributeLocation before linking. With a
@@ -108,6 +109,7 @@ void GpuRenderer::destroy()
     if (m_uTex) { f->glDeleteTextures(1, &m_uTex); m_uTex = 0; }
     if (m_vTex) { f->glDeleteTextures(1, &m_vTex); m_vTex = 0; }
     if (m_flowTex) { f->glDeleteTextures(1, &m_flowTex); m_flowTex = 0; m_flowValid = false; }
+    if (m_seamTex) { f->glDeleteTextures(1, &m_seamTex); m_seamTex = 0; m_seamValid = false; }
     if (m_colorTex) { f->glDeleteTextures(1, &m_colorTex); m_colorTex = 0; }
     if (m_vbo) { f->glDeleteBuffers(1, &m_vbo); m_vbo = 0; }
     if (m_ebo) { f->glDeleteBuffers(1, &m_ebo); m_ebo = 0; }
@@ -150,6 +152,7 @@ bool GpuRenderer::initialize(QString *error)
     m_program->setUniformValue("u_texU", 2);
     m_program->setUniformValue("u_texV", 3);
     m_program->setUniformValue("u_flow", 4);
+    m_program->setUniformValue("u_seam", 5);
 
     QOpenGLFunctions_3_3_Core *f = m_functions;
     f->glGenTextures(1, &m_yTex);
@@ -324,6 +327,29 @@ void GpuRenderer::setFlowData(const QVector<float> &flow, int w, int h)
     m_flowValid = true;
 }
 
+void GpuRenderer::setSeamData(const QVector<float> &seam, int w)
+{
+    if (!m_ready || !m_context->makeCurrent(m_surface) || w <= 0
+        || seam.size() < w) {
+        m_seamValid = false;
+        return;
+    }
+    QOpenGLFunctions_3_3_Core *f = m_functions;
+    if (!m_seamTex)
+        f->glGenTextures(1, &m_seamTex);
+    f->glBindTexture(GL_TEXTURE_2D, m_seamTex);
+    QVector<uchar> packed(w);
+    for (int i = 0; i < w; ++i)
+        packed[i] = (uchar)qBound(0.0f, seam[i] * 255.0f, 255.0f);
+    f->glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, 1, 0, GL_RED,
+                    GL_UNSIGNED_BYTE, packed.constData());
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    m_seamValid = true;
+}
+
 bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
                          int width, int height, QImage *out, QString *error)
 {
@@ -443,6 +469,8 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
     m_program->setUniformValue("u_bandTheta0", GLfloat(s.bandTheta0));
     m_program->setUniformValue("u_bandTheta1", GLfloat(s.bandTheta1));
     m_program->setUniformValue("u_flowEncode", GLfloat(m_flowEncode));
+    m_program->setUniformValue("u_seamStitch", GLint((s.seamStitch && m_seamValid) ? 1 : 0));
+    m_program->setUniformValue("u_seamStrength", GLfloat(s.seamStrength));
 
     // Bind the YUV textures to sampler units 1..3 and the flow field to 4.
     f->glActiveTexture(GL_TEXTURE1);
@@ -454,6 +482,10 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
     if (s.flowStitch && m_flowValid) {
         f->glActiveTexture(GL_TEXTURE4);
         f->glBindTexture(GL_TEXTURE_2D, m_flowTex);
+    }
+    if (s.seamStitch && m_seamValid) {
+        f->glActiveTexture(GL_TEXTURE5);
+        f->glBindTexture(GL_TEXTURE_2D, m_seamTex);
     }
 
     f->glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);

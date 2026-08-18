@@ -27,6 +27,10 @@ LensViewer::LensViewer(QQuickItem *parent)
     , m_flowEncode(16.0)
     , m_flowTexture(nullptr)
     , m_flowTextureKey(-1)
+    , m_seamStitch(false)
+    , m_seamStrength(1.0)
+    , m_seamTexture(nullptr)
+    , m_seamTextureKey(-1)
 {
     setFlag(ItemHasContents, true);
 }
@@ -84,6 +88,15 @@ void LensViewer::setImuOrientation(const QQuaternion &q) { if (m_imuOrientation 
 void LensViewer::setFlowStitch(bool v) { if (m_flowStitch == v) return; m_flowStitch = v; emit flowStitchChanged(); update(); }
 void LensViewer::setFlowStrength(double v) { if (qFuzzyCompare(m_flowStrength, v)) return; m_flowStrength = v; emit flowStrengthChanged(); update(); }
 void LensViewer::setFlowEncode(double v) { if (qFuzzyCompare(m_flowEncode, v)) return; m_flowEncode = v; emit flowEncodeChanged(); update(); }
+
+void LensViewer::setSeamStitch(bool v) { if (m_seamStitch == v) return; m_seamStitch = v; emit seamStitchChanged(); update(); }
+void LensViewer::setSeamStrength(double v) { if (qFuzzyCompare(m_seamStrength, v)) return; m_seamStrength = v; emit seamStrengthChanged(); update(); }
+void LensViewer::setSeamImage(const QImage &img) {
+    if (m_seamImage.cacheKey() == img.cacheKey() && m_seamImage.isNull() == img.isNull()) return;
+    m_seamImage = img;
+    emit seamImageChanged();
+    update();
+}
 
 void LensViewer::setFlowImage(const QImage &img)
 {
@@ -249,6 +262,23 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     material->setFlowStrength((float)m_flowStrength);
     material->setFlowEncode((float)m_flowEncode);
     material->setBandTheta(kDefaultBandTheta0, kDefaultBandTheta1);
+
+    const QImage seamImg = m_seamImage;
+    if (m_seamStitch && !seamImg.isNull()) {
+        const qint64 key = seamImg.cacheKey();
+        if (key != m_seamTextureKey) {
+            delete m_seamTexture;
+            m_seamTexture = window()->createTextureFromImage(seamImg);
+            m_seamTextureKey = key;
+        }
+        material->setSeamTexture(m_seamTexture);
+        material->setSeamStitch(true);
+    } else {
+        if (m_seamTexture) { delete m_seamTexture; m_seamTexture = nullptr; m_seamTextureKey = -1; }
+        material->setSeamTexture(nullptr);
+        material->setSeamStitch(false);
+    }
+    material->setSeamStrength((float)m_seamStrength);
 
     node->markDirty(QSGNode::DirtyGeometry | QSGNode::DirtyMaterial);
     return node;

@@ -32,6 +32,9 @@ class LensViewer : public QQuickItem
     Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
     Q_PROPERTY(QImage flowImage READ flowImage WRITE setFlowImage NOTIFY flowImageChanged)
     Q_PROPERTY(double flowEncode READ flowEncode WRITE setFlowEncode NOTIFY flowEncodeChanged)
+    Q_PROPERTY(bool seamStitch READ seamStitch WRITE setSeamStitch NOTIFY seamStitchChanged)
+    Q_PROPERTY(double seamStrength READ seamStrength WRITE setSeamStrength NOTIFY seamStrengthChanged)
+    Q_PROPERTY(QImage seamImage READ seamImage WRITE setSeamImage NOTIFY seamImageChanged)
 
 public:
     explicit LensViewer(QQuickItem *parent = nullptr);
@@ -70,6 +73,12 @@ public:
     void setFlowImage(const QImage &img);
     double flowEncode() const { return m_flowEncode; }
     void setFlowEncode(double v);
+    bool seamStitch() const { return m_seamStitch; }
+    void setSeamStitch(bool v);
+    double seamStrength() const { return m_seamStrength; }
+    void setSeamStrength(double v);
+    QImage seamImage() const { return m_seamImage; }
+    void setSeamImage(const QImage &img);
 
 protected:
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
@@ -91,6 +100,9 @@ signals:
     void flowStrengthChanged();
     void flowImageChanged();
     void flowEncodeChanged();
+    void seamStitchChanged();
+    void seamStrengthChanged();
+    void seamImageChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -113,6 +125,11 @@ private:
     QImage m_flowImage;
     QSGTexture *m_flowTexture;
     qint64 m_flowTextureKey;
+    bool m_seamStitch;
+    double m_seamStrength;
+    QImage m_seamImage;
+    QSGTexture *m_seamTexture;
+    qint64 m_seamTextureKey;
 };
 
 #endif // LENSVIEWER_H

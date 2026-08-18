@@ -57,6 +57,8 @@ App::App(QObject *parent)
     , m_flowEncode(16.0)
     , m_flowPending(false)
     , m_flowLastTs(-1.0)
+    , m_seamStitch(false)
+    , m_seamStrength(1.0)
     , m_usePreview(false)
     , m_activeLens(2)
     , m_projection(0)
@@ -195,6 +197,8 @@ App::App(QObject *parent)
     connect(this, &App::flowStrengthChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowIterationsChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowAlphaChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::seamStitchChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::seamStrengthChanged, this, [this]() { saveSettings(); });
 
     // Colour grade changes persist automatically (same convention as the
     // projection / IMU settings).
@@ -562,6 +566,21 @@ void App::setFlowAlpha(double alpha)
         maybeComputeFlow();
 }
 
+void App::setSeamStitch(bool stitch)
+{
+    if (m_seamStitch == stitch) return;
+    m_seamStitch = stitch;
+    emit seamStitchChanged();
+    if (stitch && m_flowStitch) maybeComputeFlow();
+}
+
+void App::setSeamStrength(double strength)
+{
+    if (qFuzzyCompare(m_seamStrength, strength)) return;
+    m_seamStrength = strength;
+    emit seamStrengthChanged();
+}
+
 void App::maybeComputeFlow()
 {
     if (!m_flowStitch || !m_decoder || !m_decoder->hasFrame())
@@ -602,12 +621,14 @@ void App::maybeComputeFlow()
     emit flowRequested(frame, cal, settings);
 }
 
-void App::onFlowReady(const QImage &image, float encodeScale)
+void App::onFlowReady(const QImage &image, float encodeScale, const QImage &seamImage)
 {
     m_flowPending = false;
     m_flowEncode = encodeScale;
     m_flowImage = image.copy();  // deep copy: the worker must never touch it again
+    m_seamImage = seamImage.copy();
     emit flowImageReady();
+    emit seamImageChanged();
     // The worker is idle again. If playback has advanced past the frame we
     // just processed, run one more compute for the newest frame (latest-wins).
     // If the timestamp hasn't changed (paused), don't recompute the same frame.
@@ -986,6 +1007,8 @@ ExportSnapshot App::buildExportSnapshot() const
     s.base.flowStrength = (float)m_flowStrength;
     s.base.flowIterations = m_flowIterations;
     s.base.flowAlpha = (float)m_flowAlpha;
+    s.base.seamStitch = m_seamStitch;
+    s.base.seamStrength = (float)m_seamStrength;
     s.base.bandTheta0 = kDefaultBandTheta0;
     s.base.bandTheta1 = kDefaultBandTheta1;
     if (m_colorGrade) {
@@ -1033,6 +1056,8 @@ void App::loadSettings()
     setFlowStrength(s.value(QStringLiteral("flow/strength"), m_flowStrength).toDouble());
     setFlowIterations(qBound(1, s.value(QStringLiteral("flow/iterations"), m_flowIterations).toInt(), 200));
     setFlowAlpha(qBound(1.0, s.value(QStringLiteral("flow/alpha"), m_flowAlpha).toDouble(), 100.0));
+    setSeamStitch(s.value(QStringLiteral("seam/stitch"), m_seamStitch).toBool());
+    setSeamStrength(s.value(QStringLiteral("seam/strength"), m_seamStrength).toDouble());
 
     if (m_colorGrade) {
         auto load = [this, &s](const char *key, double def, void (ColorGrade::*setter)(double)) {
@@ -1070,6 +1095,8 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("flow/strength"), m_flowStrength);
     s.setValue(QStringLiteral("flow/iterations"), m_flowIterations);
     s.setValue(QStringLiteral("flow/alpha"), m_flowAlpha);
+    s.setValue(QStringLiteral("seam/stitch"), m_seamStitch);
+    s.setValue(QStringLiteral("seam/strength"), m_seamStrength);
 
     if (m_colorGrade) {
         s.setValue(QStringLiteral("grade/brightness"), m_colorGrade->brightness());

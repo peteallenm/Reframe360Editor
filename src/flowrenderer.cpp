@@ -42,6 +42,8 @@ void FlowRenderer::destroy()
     delete m_bandProgram; m_bandProgram = nullptr;
     delete m_gradProgram; m_gradProgram = nullptr;
     delete m_iterProgram; m_iterProgram = nullptr;
+    delete m_seamCostProgram; m_seamCostProgram = nullptr;
+    delete m_seamDpProgram; m_seamDpProgram = nullptr;
 
     if (m_yTex) { f->glDeleteTextures(1, &m_yTex); m_yTex = 0; }
     if (m_bandFront) { f->glDeleteTextures(1, &m_bandFront); m_bandFront = 0; }
@@ -49,6 +51,10 @@ void FlowRenderer::destroy()
     if (m_gradients) { f->glDeleteTextures(1, &m_gradients); m_gradients = 0; }
     if (m_flowA) { f->glDeleteTextures(1, &m_flowA); m_flowA = 0; }
     if (m_flowB) { f->glDeleteTextures(1, &m_flowB); m_flowB = 0; }
+    if (m_costTex) { f->glDeleteTextures(1, &m_costTex); m_costTex = 0; }
+    if (m_dpA) { f->glDeleteTextures(1, &m_dpA); m_dpA = 0; }
+    if (m_dpB) { f->glDeleteTextures(1, &m_dpB); m_dpB = 0; }
+    if (m_seamFbo) { f->glDeleteFramebuffers(1, &m_seamFbo); m_seamFbo = 0; }
     if (m_vbo) { f->glDeleteBuffers(1, &m_vbo); m_vbo = 0; }
     if (m_ebo) { f->glDeleteBuffers(1, &m_ebo); m_ebo = 0; }
     if (m_vao) { f->glDeleteVertexArrays(1, &m_vao); m_vao = 0; }
@@ -142,6 +148,10 @@ bool FlowRenderer::compilePrograms(QString *error)
         return false;
     if (!compile(loadResource(":/shaders_raw/shaders/hs_iteration.frag"), m_iterProgram, "hs_iteration", error))
         return false;
+    if (!compile(loadResource(":/shaders_raw/shaders/seam_cost.frag"), m_seamCostProgram, "seam_cost", error))
+        return false;
+    if (!compile(loadResource(":/shaders_raw/shaders/seam_dp.frag"), m_seamDpProgram, "seam_dp", error))
+        return false;
     return true;
 }
 
@@ -177,6 +187,26 @@ bool FlowRenderer::createBandTargets(QString *error)
         // (texel units). The shader's out vec2 writes R,G; B,A are don't-care.
         tex2d(m_flowA,     GL_RGBA16F, GL_RGBA, GL_FLOAT);
         tex2d(m_flowB,     GL_RGBA16F, GL_RGBA, GL_FLOAT);
+
+        f->glGenTextures(1, &m_costTex);
+        f->glGenTextures(1, &m_dpA);
+        f->glGenTextures(1, &m_dpB);
+        f->glBindTexture(GL_TEXTURE_2D, m_costTex);
+        f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, W, H, 0, GL_RGBA, GL_FLOAT, nullptr);
+        f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        auto dpTex = [f](quint32 tex) {
+            f->glBindTexture(GL_TEXTURE_2D, tex);
+            f->glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, W, H, 0, GL_RED, GL_FLOAT, nullptr);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        };
+        dpTex(m_dpA);
+        dpTex(m_dpB);
     }
 
     if (!m_vao) {
@@ -237,6 +267,11 @@ bool FlowRenderer::createBandTargets(QString *error)
         f->glBindFramebuffer(GL_FRAMEBUFFER, m_flowFbo);
         f->glDrawBuffer(GL_COLOR_ATTACHMENT0);
     }
+    if (!m_seamFbo) {
+        f->glGenFramebuffers(1, &m_seamFbo);
+        f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
+        f->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
     return true;
 }
 
@@ -264,6 +299,7 @@ bool FlowRenderer::initialize(QString *error)
 
 bool FlowRenderer::compute(const DecodedFrame &frame, const FlowCalibration &cal,
                            const FlowSettings &settings, QVector<float> *outFlow,
+                           QVector<float> *outSeam,
                            QString *error)
 {
     if (!m_ready) {
@@ -330,6 +366,98 @@ bool FlowRenderer::compute(const DecodedFrame &frame, const FlowCalibration &cal
     f->glActiveTexture(GL_TEXTURE0);
     f->glBindTexture(GL_TEXTURE_2D, m_yTex);
     drawQuad();
+
+    // ---- Pass 1b: seam cost volume ----
+    f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
+    f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_costTex, 0);
+    m_seamCostProgram->bind();
+    m_seamCostProgram->setUniformValue("u_bandFront", 0);
+    m_seamCostProgram->setUniformValue("u_bandRear", 1);
+    m_seamCostProgram->setUniformValue("u_harrisK", 0.04f);
+    m_seamCostProgram->setUniformValue("u_blockMatchWeight", 1.0f);
+    m_seamCostProgram->setUniformValue("u_blockMatchRadius", 16);
+    m_seamCostProgram->setUniformValue("u_equatorBiasWeight", 0.1f);
+    f->glActiveTexture(GL_TEXTURE0);
+    f->glBindTexture(GL_TEXTURE_2D, m_bandFront);
+    f->glActiveTexture(GL_TEXTURE1);
+    f->glBindTexture(GL_TEXTURE_2D, m_bandRear);
+    drawQuad();
+
+    // ---- Pass 1c: DP accumulation (W draws, one per column) ----
+    f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
+    f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dpA, 0);
+    f->glClearColor(0.f, 0.f, 0.f, 0.f);
+    f->glClear(GL_COLOR_BUFFER_BIT);
+
+    quint32 dpRead = m_dpA;
+    quint32 dpWrite = m_dpB;
+    for (int col = 0; col < W; ++col) {
+        f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
+        f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dpWrite, 0);
+        f->glEnable(GL_SCISSOR_TEST);
+        f->glScissor(col, 0, 1, H);
+        m_seamDpProgram->bind();
+        m_seamDpProgram->setUniformValue("u_cost", 0);
+        m_seamDpProgram->setUniformValue("u_dpIn", 1);
+        m_seamDpProgram->setUniformValue("u_col", col);
+        m_seamDpProgram->setUniformValue("u_width", W);
+        m_seamDpProgram->setUniformValue("u_height", H);
+        f->glActiveTexture(GL_TEXTURE0);
+        f->glBindTexture(GL_TEXTURE_2D, m_costTex);
+        f->glActiveTexture(GL_TEXTURE1);
+        f->glBindTexture(GL_TEXTURE_2D, dpRead);
+        drawQuad();
+        f->glDisable(GL_SCISSOR_TEST);
+        quint32 tmp = dpRead; dpRead = dpWrite; dpWrite = tmp;
+    }
+    // dpRead now holds the final cumulative cost
+
+    // ---- Pass 1d: CPU traceback ----
+    if (outSeam) {
+        outSeam->resize(W);
+        f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
+        f->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dpRead, 0);
+        f->glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        QVector<qfloat16> dpPacked(W * H);
+        f->glReadPixels(0, 0, W, H, GL_RED, GL_HALF_FLOAT, dpPacked.data());
+        auto dpAt = [&](int u, int v) -> float {
+            return float(dpPacked[v * W + u]);
+        };
+        // Clamp traceback to the central 60% of the band so the seam stays in
+        // the region where both lenses have valid fisheye coverage.
+        int vMin = (int)(0.2f * H);
+        int vMax = (int)(0.8f * H);
+        int bestV = vMin;
+        float minVal = 1e30f;
+        for (int v = vMin; v <= vMax; ++v) {
+            float val = dpAt(W - 1, v);
+            if (val < minVal) { minVal = val; bestV = v; }
+        }
+        int curV = bestV;
+        for (int u = W - 1; u >= 0; --u) {
+            (*outSeam)[u] = (float)curV / (float)(H - 1);
+            if (u > 0) {
+                int vL = qBound(vMin, curV - 1, vMax);
+                int vR = qBound(vMin, curV + 1, vMax);
+                float cL = dpAt(u - 1, vL);
+                float cC = dpAt(u - 1, curV);
+                float cR = dpAt(u - 1, vR);
+                if (cL <= cC && cL <= cR) curV = vL;
+                else if (cR <= cC && cR <= cL) curV = vR;
+            }
+        }
+
+        // Temporal smoothing: blend with previous seam to reduce flicker
+        if (!m_prevSeam.isEmpty() && m_prevSeam.size() == outSeam->size()) {
+            const float alpha = 0.7f;  // smoothing factor (0 = no smoothing, 1 = no change)
+            for (int i = 0; i < outSeam->size(); ++i)
+                (*outSeam)[i] = alpha * (*outSeam)[i] + (1.0f - alpha) * m_prevSeam[i];
+        }
+        m_prevSeam = *outSeam;
+    }
+
+    // Restore viewport for pass 2
+    f->glViewport(0, 0, W, H);
 
     // ---- Pass 2: spatio-temporal gradients. ----
     f->glBindFramebuffer(GL_FRAMEBUFFER, m_gradFbo);
@@ -427,6 +555,18 @@ QImage FlowRenderer::packFlowToImage(const QVector<float> &flow, int w, int h,
     return img;
 }
 
+QImage FlowRenderer::packSeamToImage(const QVector<float> &seam, int w)
+{
+    QImage img(w, 1, QImage::Format_Grayscale8);
+    if (w <= 0 || seam.size() < w)
+        return img;
+    for (int x = 0; x < w; ++x) {
+        float v = qBound(0.0f, seam[x], 1.0f);
+        img.scanLine(0)[x] = (uchar)(v * 255.0f);
+    }
+    return img;
+}
+
 // ---------------------------------------------------------------------------
 // FlowWorker
 // ---------------------------------------------------------------------------
@@ -450,8 +590,9 @@ void FlowWorker::computeFrame(const DecodedFrame &frame, const FlowCalibration &
         }
     }
     QVector<float> flow;
+    QVector<float> seam;
     QString err;
-    if (!m_renderer.compute(frame, cal, settings, &flow, &err)) {
+    if (!m_renderer.compute(frame, cal, settings, &flow, &seam, &err)) {
         if (!m_failed) {
             m_failed = true;
             emit flowFailed(err);
@@ -461,6 +602,7 @@ void FlowWorker::computeFrame(const DecodedFrame &frame, const FlowCalibration &
     m_failed = false;
     float encode = 16.0f;
     QImage img = FlowRenderer::packFlowToImage(flow, m_renderer.bandWidth(),
-                                               m_renderer.bandHeight(), &encode);
-    emit flowReady(img, encode);
+                                                m_renderer.bandHeight(), &encode);
+    QImage seamImg = FlowRenderer::packSeamToImage(seam, m_renderer.bandWidth());
+    emit flowReady(img, encode, seamImg);
 }

@@ -52,6 +52,8 @@ struct ExportFrameState {
     float flowAlpha = kDefaultFlowAlpha;
     float bandTheta0 = kDefaultBandTheta0;
     float bandTheta1 = kDefaultBandTheta1;
+    bool seamStitch = false;
+    float seamStrength = 1.0f;
 
     // Colour grading (mirrors the ColorGrade properties and project.frag
     // uniforms, so exported frames match the viewer).

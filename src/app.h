@@ -85,6 +85,9 @@ class App : public QObject
     Q_PROPERTY(double flowAlpha READ flowAlpha WRITE setFlowAlpha NOTIFY flowAlphaChanged)
     Q_PROPERTY(QImage flowImage READ flowImage NOTIFY flowImageReady)
     Q_PROPERTY(double flowEncode READ flowEncode NOTIFY flowImageReady)
+    Q_PROPERTY(bool seamStitch READ seamStitch WRITE setSeamStitch NOTIFY seamStitchChanged)
+    Q_PROPERTY(double seamStrength READ seamStrength WRITE setSeamStrength NOTIFY seamStrengthChanged)
+    Q_PROPERTY(QImage seamImage READ seamImage NOTIFY seamImageChanged)
     Q_PROPERTY(QString previewThumbnailPath READ previewThumbnailPath NOTIFY videoPathChanged)
     Q_PROPERTY(bool usePreviewThumbnail READ usePreviewThumbnail WRITE setUsePreviewThumbnail NOTIFY usePreviewThumbnailChanged)
     Q_PROPERTY(int activeLens READ activeLens WRITE setActiveLens NOTIFY activeLensChanged)
@@ -163,6 +166,11 @@ public:
     void setFlowAlpha(double v);
     QImage flowImage() const { return m_flowImage; }
     double flowEncode() const { return m_flowEncode; }
+    bool seamStitch() const { return m_seamStitch; }
+    void setSeamStitch(bool v);
+    double seamStrength() const { return m_seamStrength; }
+    void setSeamStrength(double v);
+    QImage seamImage() const { return m_seamImage; }
 
     int activeLens() const;
     void setActiveLens(int lens);
@@ -235,7 +243,7 @@ private:
     // Optical-flow preview: request a recompute for the current frame (queued
     // to the flow worker), and consume its packed result.
     void maybeComputeFlow();
-    void onFlowReady(const QImage &image, float encodeScale);
+    void onFlowReady(const QImage &image, float encodeScale, const QImage &seamImage);
 
 signals:
     void videoPathChanged();
@@ -254,6 +262,9 @@ signals:
     void flowStrengthChanged();
     void flowIterationsChanged();
     void flowAlphaChanged();
+    void seamStitchChanged();
+    void seamStrengthChanged();
+    void seamImageChanged();
     void flowImageReady();
     void usePreviewThumbnailChanged();
     void activeLensChanged();
@@ -332,6 +343,9 @@ private:
     // it against the decoder's newest frame to decide whether to run a follow-up
     // (so a paused playback doesn't recompute the same frame in a loop).
     double m_flowLastTs;
+    bool m_seamStitch;
+    double m_seamStrength;
+    QImage m_seamImage;
 };
 
 #endif // APP_H

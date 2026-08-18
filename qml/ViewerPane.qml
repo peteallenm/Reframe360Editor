@@ -28,6 +28,9 @@ Item {
             flowStrength: app.flowStrength
             flowImage: app.flowImage
             flowEncode: app.flowEncode
+            seamStitch: app.seamStitch
+            seamStrength: app.seamStrength
+            seamImage: app.seamImage
         }
 
         MouseArea {

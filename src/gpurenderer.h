@@ -61,6 +61,7 @@ public:
     // and sampled at sampler unit 4 by project.frag when state.flowStitch is
     // set. The matching decode scale is stored and uploaded as u_flowEncode.
     void setFlowData(const QVector<float> &flow, int w, int h);
+    void setSeamData(const QVector<float> &seam, int w);
 
 private:
     static QByteArray loadResource(const char *path);
@@ -87,6 +88,8 @@ private:
     quint32 m_uTex = 0;
     quint32 m_vTex = 0;
     quint32 m_flowTex = 0;
+    quint32 m_seamTex = 0;
+    bool m_seamValid = false;
     int m_fbW = 0;
     int m_fbH = 0;
     bool m_flowValid = false;

@@ -364,6 +364,8 @@ public:
         m_settings.iterations = s.flowIterations;
         m_settings.bandTheta0 = s.bandTheta0;
         m_settings.bandTheta1 = s.bandTheta1;
+        m_settings.seamStitch = s.seamStitch;
+        m_settings.seamStrength = s.seamStrength;
         m_ready = true;
         return true;
     }
@@ -375,8 +377,9 @@ public:
         if (!m_ready)
             return false;
         QVector<float> flow;
+        QVector<float> seam;
         QString err;
-        if (!m_renderer.compute(frame, m_cal, m_settings, &flow, &err)) {
+        if (!m_renderer.compute(frame, m_cal, m_settings, &flow, &seam, &err)) {
             if (!m_failed) {
                 m_failed = true;
                 qWarning().noquote() << "Flow computation failed for a frame, rendering without it:" << err;
@@ -384,6 +387,7 @@ public:
             return false;
         }
         gpu.setFlowData(flow, m_renderer.bandWidth(), m_renderer.bandHeight());
+        gpu.setSeamData(seam, m_renderer.bandWidth());
         return true;
     }
 
@@ -896,8 +900,10 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
                 // but the 4.4 context or a frame's computation fails, that
                 // frame renders without the warp.
                 if (withFlow && s.flowStitch) {
-                    if (!flow.prepare(s) || !flow.apply(frame, gpu))
+                    if (!flow.prepare(s) || !flow.apply(frame, gpu)) {
                         s.flowStitch = false;
+                        s.seamStitch = false;  // seam depends on flow pipeline
+                    }
                 }
                 if (!gpu.render(frame, s, rw, rh, &rendered, &err))
                     return -1;

@@ -7,6 +7,7 @@ layout(binding = 1) uniform sampler2D u_texY;
 layout(binding = 2) uniform sampler2D u_texU;
 layout(binding = 3) uniform sampler2D u_texV;
 layout(binding = 4) uniform sampler2D u_flow;  // optical-flow field (RG, encoded)
+layout(binding = 5) uniform sampler2D u_seam;  // 1D seam curve (W×1, R8)
 
 // NOTE: GpuRenderer::flattenUniformBlock turns every non-empty line in the
 // block below into "uniform <line>;", so standalone comment lines are NOT
@@ -14,7 +15,7 @@ layout(binding = 4) uniform sampler2D u_flow;  // optical-flow field (RG, encode
 // Keep comments on the same line as a member, after its semicolon.
 // Also NOTE: std140 arrays of scalars are strided to 16 bytes, so the padding
 // below MUST be scalar members (not float _padG[3]) to keep offsets 292..335
-// locked to the C++ ViewerUniforms struct (336 bytes total).
+// locked to the C++ ViewerUniforms struct (352 bytes total).
 layout(std140, binding = 0) uniform Uniforms {
     mat4 qt_Matrix;
     float qt_Opacity;
@@ -68,6 +69,9 @@ layout(std140, binding = 0) uniform Uniforms {
     float u_flowEncode;    // offset 324 (decode scale of the packed flow texture)
     float _padH0;          // offset 328 -> struct rounds to 336
     float _padH1;          // offset 332
+    int u_seamStitch;      // offset 336 (1 = use seam texture for blend placement)
+    float u_seamStrength;  // offset 340 (0 = equator, 1 = full seam)
+    float _padI[2];        // offset 344 -> struct rounds to 352
 };
 
 const float PI = 3.14159265359;
@@ -196,7 +200,28 @@ void main() {
         float v = texture(u_texV, uv_tex).r;
         rgb = yuvToRgb(y, u, v);
     } else {
-        float blend = smoothstep(u_blendStart, 1.0, r_front);
+        float blendStart = u_blendStart;
+        float blendEnd = 1.0;
+        if (u_seamStitch != 0) {
+            float u_band = mod(phi + PI, 2.0 * PI) / (2.0 * PI);
+            float seamV = texture(u_seam, vec2(u_band, 0.5)).r;
+            float seamTheta = mix(u_bandTheta0, u_bandTheta1, seamV);
+            float seamRFront = seamTheta / (PI * 0.5);
+            // Shift the blend center toward the seam.
+            float origWidth = 1.0 - u_blendStart;  // 0.1 (9°)
+            float origCenter = (u_blendStart + 1.0) * 0.5;  // 0.95
+            float center = mix(origCenter, seamRFront, u_seamStrength);
+            // Clamp center to maintain minimum width within bounds
+            float minHalfWidth = 0.025;  // 4.5° minimum
+            center = clamp(center, u_blendStart + minHalfWidth, 1.0 - minHalfWidth);
+            // Compute width: full width if possible, narrower if near edges
+            float halfWidth = origWidth * 0.5;  // 0.05
+            float maxHalfWidth = min(center - u_blendStart, 1.0 - center);
+            halfWidth = min(halfWidth, maxHalfWidth);
+            blendStart = center - halfWidth;
+            blendEnd = center + halfWidth;
+        }
+        float blend = smoothstep(blendStart, blendEnd, r_front);
 
         vec2 uv_f = vec2(uv_front.x, uv_front.y * 0.5);
         float yf = texture(u_texY, uv_f).r;

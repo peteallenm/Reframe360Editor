@@ -281,6 +281,36 @@ Item {
                                 min: 1; max: 100; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
                             }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                height: 1
+                                color: "#444"
+                                Layout.topMargin: 4
+                            }
+
+                            Label {
+                                text: qsTr("Seam Placement")
+                                font.bold: true
+                                font.pixelSize: 11
+                                Layout.fillWidth: true
+                            }
+
+                            CheckBox {
+                                id: seamCheck
+                                text: qsTr("Feature-driven seam")
+                                checked: app.seamStitch
+                                onCheckedChanged: app.seamStitch = checked
+                                enabled: flowCheck.checked
+                            }
+
+                            SliderRow {
+                                labelText: qsTr("Seam strength:")
+                                value: app.seamStrength
+                                onUserChange: (v) => app.seamStrength = v
+                                min: 0; max: 1; step: 0.05
+                                controlEnabled: flowCheck.checked && seamCheck.checked
+                            }
                         }
                     }
 

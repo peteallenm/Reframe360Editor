@@ -54,8 +54,12 @@ struct ViewerUniforms {
     float bandTheta1;       // offset 320  (radians)
     float flowEncode;       // offset 324  (decode scale of the packed flow)
     float _padH[2];         // offset 328  (std140 rounds the struct to 16B -> 336)
+    // --- Seam placement (std140-locked to project.frag) ---
+    int seamStitch;         // offset 336
+    float seamStrength;     // offset 340
+    float _padI[2];         // offset 344 (std140 rounds to 352)
 };
-static_assert(sizeof(ViewerUniforms) == 336, "ViewerUniforms must match std140 layout");
+static_assert(sizeof(ViewerUniforms) == 352, "ViewerUniforms must match std140 layout");
 
 ViewerMaterial::ViewerMaterial()
     : m_yTex(nullptr), m_uTex(nullptr), m_vTex(nullptr)
@@ -76,6 +80,7 @@ ViewerMaterial::ViewerMaterial()
     , m_flowTex(nullptr), m_flowStitch(false), m_flowStrength(1.0f)
     , m_bandTheta0(kDefaultBandTheta0), m_bandTheta1(kDefaultBandTheta1)
     , m_flowEncode(16.0f)
+    , m_seamTex(nullptr), m_seamStitch(false), m_seamStrength(1.0f)
 {
 }
 
@@ -94,6 +99,7 @@ int ViewerMaterial::compare(const QSGMaterial *other) const
     const ViewerMaterial *m = static_cast<const ViewerMaterial*>(other);
     if (m_yTex != m->m_yTex) return (intptr_t)m_yTex - (intptr_t)m->m_yTex;
     if (m_flowTex != m->m_flowTex) return (intptr_t)m_flowTex - (intptr_t)m->m_flowTex;
+    if (m_seamTex != m->m_seamTex) return (intptr_t)m_seamTex - (intptr_t)m->m_seamTex;
     return 0;
 }
 
@@ -194,6 +200,8 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.bandTheta0 = m_bandTheta0;
     u.bandTheta1 = m_bandTheta1;
     u.flowEncode = m_flowEncode;
+    u.seamStitch = m_seamStitch ? 1 : 0;
+    u.seamStrength = m_seamStrength;
 
     const float *mat = m_imuMatrix.constData();
     for (int i = 0; i < 16; i++) u.imuMatrix[i] = mat[i];
@@ -253,13 +261,14 @@ void ViewerMaterialShader::updateSampledImage(RenderState &state, int binding,
     case 2: tex = m->uTexture(); break;
     case 3: tex = m->vTexture(); break;
     case 4: tex = m->flowTexture(); break;
+    case 5: tex = m->seamTexture(); break;
     }
     if (tex) {
         tex->setFiltering(QSGTexture::Linear);
         tex->setMipmapFiltering(QSGTexture::None);
         // The flow's u axis is the periodic phi (front/back seam lives at the
         // u=0/1 wrap), so horizontal wrapping must not smear the seam texels.
-        tex->setHorizontalWrapMode(binding == 4 ? QSGTexture::Repeat : QSGTexture::ClampToEdge);
+        tex->setHorizontalWrapMode((binding == 4 || binding == 5) ? QSGTexture::Repeat : QSGTexture::ClampToEdge);
         tex->setVerticalWrapMode(QSGTexture::ClampToEdge);
         tex->commitTextureOperations(state.rhi(), state.resourceUpdateBatch());
         *texture = tex;

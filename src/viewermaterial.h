@@ -42,6 +42,9 @@ public:
     void setFlowStrength(float strength) { m_flowStrength = strength; }
     void setFlowEncode(float encode) { m_flowEncode = encode; }
     void setBandTheta(float theta0, float theta1) { m_bandTheta0 = theta0; m_bandTheta1 = theta1; }
+    void setSeamTexture(QSGTexture *seam) { m_seamTex = seam; }
+    void setSeamStitch(bool stitch) { m_seamStitch = stitch; }
+    void setSeamStrength(float strength) { m_seamStrength = strength; }
 
     // Colour grading values (see ColorGrade / project.frag for semantics).
     void setColorGrade(float brightness, float contrast, float saturation, float pop,
@@ -59,6 +62,7 @@ public:
     // u_flow sample on u_flowStitch, so the bound texture's contents never
     // matter when stitching is disabled.
     QSGTexture *flowTexture() const { return m_flowTex ? m_flowTex : m_yTex; }
+    QSGTexture *seamTexture() const { return m_seamTex ? m_seamTex : m_yTex; }
 
     QByteArray compileUniformData() const;
 
@@ -89,6 +93,9 @@ private:
     float m_flowStrength;
     float m_bandTheta0, m_bandTheta1;
     float m_flowEncode;
+    QSGTexture *m_seamTex;
+    bool m_seamStitch;
+    float m_seamStrength;
     float m_viewAspect;
     bool m_fullRange;
     float m_yaw, m_pitch, m_roll, m_fov;

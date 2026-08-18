@@ -78,6 +78,8 @@ struct FlowSettings {
     int iterations = kDefaultFlowIterations;
     float bandTheta0 = kDefaultBandTheta0;
     float bandTheta1 = kDefaultBandTheta1;
+    bool seamStitch = false;
+    float seamStrength = 1.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -115,13 +117,15 @@ public:
     // filled with kFlowBandWidth*kFlowBandHeight (du, dv) pairs in texels.
     bool compute(const DecodedFrame &frame, const FlowCalibration &cal,
                  const FlowSettings &settings, QVector<float> *outFlow,
-                 QString *error);
+                 QVector<float> *outSeam = nullptr,
+                 QString *error = nullptr);
 
     // Pack the raw flow into an RGBA8 image for the RHI preview path
     // (QQuickWindow::createTextureFromImage). *encodeOut receives the k used
     // so the consumer can set the u_flowEncode uniform.
     static QImage packFlowToImage(const QVector<float> &flow, int w, int h,
-                                  float *encodeOut);
+                                   float *encodeOut);
+    static QImage packSeamToImage(const QVector<float> &seam, int w);
 
 private:
     static QByteArray loadResource(const char *path);
@@ -137,6 +141,8 @@ private:
     QOpenGLShaderProgram *m_bandProgram = nullptr;
     QOpenGLShaderProgram *m_gradProgram = nullptr;
     QOpenGLShaderProgram *m_iterProgram = nullptr;
+    QOpenGLShaderProgram *m_seamCostProgram = nullptr;
+    QOpenGLShaderProgram *m_seamDpProgram = nullptr;
 
     quint32 m_vao = 0;
     quint32 m_vbo = 0;
@@ -149,9 +155,14 @@ private:
     quint32 m_gradients = 0;
     quint32 m_flowA = 0;
     quint32 m_flowB = 0;
+    quint32 m_costTex = 0;
+    quint32 m_dpA = 0;
+    quint32 m_dpB = 0;
+    quint32 m_seamFbo = 0;
     quint32 m_yTex = 0;
     int m_yW = 0;
     int m_yH = 0;
+    QVector<float> m_prevSeam;
     bool m_ready = false;
 };
 
@@ -170,7 +181,7 @@ public slots:
                       const FlowSettings &settings);
 
 signals:
-    void flowReady(const QImage &image, float encodeScale);
+    void flowReady(const QImage &image, float encodeScale, const QImage &seamImage);
     void flowFailed(const QString &message);
 
 private:
