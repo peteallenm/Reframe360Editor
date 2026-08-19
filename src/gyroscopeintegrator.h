@@ -22,11 +22,27 @@ public:
     // 180°-flipped fisheye video for display; the shader applies the conjugate,
     // so it samples kFlipRoll * Q_cam^-1 * ray. imuToCamera is the header's
     // IMU->camera quaternion (config[4..7]).
+    // accelKp/accelKi are the Mahony complementary-filter gains. accelKi
+    // (>0) accumulates the gravity-alignment error while the camera is still
+    // and feeds it back to cancel gyro bias, eliminating slow roll drift.
     void integrate(const QVector<ImuSample> &samples, double sampleRate,
-                   const QQuaternion &imuToCamera);
+                   const QQuaternion &imuToCamera,
+                   float accelKp = 0.35f, float accelKi = 0.005f);
     // smoothingMs: same semantics as orientationAt(); applied at the caller's
     // (video) frame rate to avoid 400 Hz -> 30 fps aliasing of high-freq jitter.
+    // This returns the "virtual camera" path — a deliberately smooth trajectory
+    // that the output video should follow.
     QQuaternion orientationAtTime(double time, float smoothingMs = 0.0f) const;
+
+    // Returns the full-bandwidth, unsmoothed orientation at the given time
+    // using slerp interpolation between the two bracketing integrated
+    // quaternions. This is the actual camera orientation at the exposure
+    // midpoint — never smooth this. The stabilization correction is:
+    //   q_applied = q_virtual^{-1} * q_actual
+    // where q_virtual comes from orientationAtTime() (smoothed) and q_actual
+    // comes from this method (unsmoothed). High-frequency shake cancels
+    // exactly while intentional motion follows the smooth virtual path.
+    QQuaternion orientationAtTimeUnsmoothed(double time) const;
 
     // Pure interpolation over copied sample data, so orientations can be
     // evaluated from a worker thread (e.g. the exporter) without racing

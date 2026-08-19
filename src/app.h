@@ -6,6 +6,7 @@
 #include <QUrl>
 #include <QQuaternion>
 #include <QImage>
+#include <algorithm>
 
 class QTimer;
 class QThread;
@@ -17,6 +18,7 @@ class QThread;
 #include "keyframe.h"
 #include "exporter.h"
 #include "flowrenderer.h"
+#include "imudriftcalibrator.h"
 
 // Immutable snapshot of everything the exporter needs, captured at export
 // start so the export worker thread never touches live GUI state. Per-time
@@ -52,11 +54,34 @@ struct ExportSnapshot {
             s.fov = f;
         }
         if (imuStabilize && !imuOrientations.isEmpty()) {
-            QQuaternion q = GyroscopeIntegrator::orientationAt(imuOrientations,
-                                                               imuTimestamps,
-                                                               t * (1.0 + drift) + syncOffset,
-                                                               imuSmoothingMs);
-            s.imuOrientation = q;
+            const double tImu = t * (1.0 + drift) + syncOffset;
+            // Two-signal architecture: q_actual^{-1} * q_virtual
+            // q_actual: full-bandwidth slerp (unsmoothed) — shake cancels exactly
+            // q_virtual: Gaussian-smoothed — smooth intentional motion path
+            // The shader applies imuOrientation.conjugated(), giving
+            // q_virtual^{-1} * q_actual as the stabilization correction.
+            QQuaternion qActual = GyroscopeIntegrator::orientationAt(
+                imuOrientations, imuTimestamps, tImu, 0.0f);
+            // For q_actual we need unsmoothed slerp, not the 33ms-minimum
+            // Gaussian window. Compute it inline:
+            if (imuOrientations.size() >= 2 && tImu > imuTimestamps.first()
+                && tImu < imuTimestamps.last()) {
+                const auto it = std::lower_bound(imuTimestamps.begin(),
+                                                 imuTimestamps.end(), tImu);
+                int idx = (it == imuTimestamps.end()) ? imuTimestamps.size() - 1
+                                                      : (int)(it - imuTimestamps.begin());
+                if (idx > 0 && imuTimestamps[idx] > tImu) idx--;
+                if (idx + 1 < imuOrientations.size()) {
+                    double dtIdx = imuTimestamps[idx + 1] - imuTimestamps[idx];
+                    float frac = (dtIdx > 0.0) ? (float)((tImu - imuTimestamps[idx]) / dtIdx) : 0.0f;
+                    frac = qBound(0.0f, frac, 1.0f);
+                    qActual = QQuaternion::slerp(imuOrientations[idx],
+                                                 imuOrientations[idx + 1], frac);
+                }
+            }
+            QQuaternion qVirtual = GyroscopeIntegrator::orientationAt(
+                imuOrientations, imuTimestamps, tImu, imuSmoothingMs);
+            s.imuOrientation = qActual.conjugated() * qVirtual;
         } else {
             s.imuOrientation = QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
         }
@@ -79,6 +104,7 @@ class App : public QObject
     Q_PROPERTY(double imuSmoothing READ imuSmoothing WRITE setImuSmoothing NOTIFY imuSmoothingChanged)
     Q_PROPERTY(double imuSyncOffset READ imuSyncOffset WRITE setImuSyncOffset NOTIFY imuSyncOffsetChanged)
     Q_PROPERTY(double imuDrift READ imuDrift WRITE setImuDrift NOTIFY imuDriftChanged)
+    Q_PROPERTY(double imuAccelKi READ imuAccelKi WRITE setImuAccelKi NOTIFY imuAccelKiChanged)
     Q_PROPERTY(bool flowStitch READ flowStitch WRITE setFlowStitch NOTIFY flowStitchChanged)
     Q_PROPERTY(double flowStrength READ flowStrength WRITE setFlowStrength NOTIFY flowStrengthChanged)
     Q_PROPERTY(int flowIterations READ flowIterations WRITE setFlowIterations NOTIFY flowIterationsChanged)
@@ -112,6 +138,9 @@ class App : public QObject
     Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportVidstabChanged)
     Q_PROPERTY(bool exportVidstabInformed READ exportVidstabInformed WRITE setExportVidstabInformed NOTIFY exportVidstabInformedChanged)
     Q_PROPERTY(QString exportFileName READ exportFileName WRITE setExportFileName NOTIFY exportFileNameChanged)
+    Q_PROPERTY(bool calibrationRunning READ calibrationRunning NOTIFY calibrationRunningChanged)
+    Q_PROPERTY(double calibrationProgress READ calibrationProgress NOTIFY calibrationProgressChanged)
+    Q_PROPERTY(QString calibrationStatus READ calibrationStatus NOTIFY calibrationStatusChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -155,6 +184,9 @@ public:
 
     double imuDrift() const;
     void setImuDrift(double drift);
+
+    double imuAccelKi() const;
+    void setImuAccelKi(double ki);
 
     bool flowStitch() const { return m_flowStitch; }
     void setFlowStitch(bool v);
@@ -224,6 +256,16 @@ public:
     Q_INVOKABLE void addKeyframeAtCurrent();
     Q_INVOKABLE void applyKeyframeInterpolation();
 
+    // IMU drift calibration: samples frames across the current video, detects
+    // the horizon in each, and finds the drift that minimizes the IMU-vs-horizon
+    // roll error. Runs in a background thread; progress/result surface via
+    // calibrationRunning/Progress/Status properties.
+    Q_INVOKABLE void calibrateImuDrift();
+
+    bool calibrationRunning() const { return m_calibrationRunning; }
+    double calibrationProgress() const { return m_calibrationProgress; }
+    QString calibrationStatus() const { return m_calibrationStatus; }
+
 private:
     QQuaternion viewQuatFromEuler() const;
     void extractEulerFromQuat(const QQuaternion &q, double &yaw, double &pitch, double &roll) const;
@@ -235,6 +277,11 @@ private:
     void setExportRunning(bool running);
     void setExportProgress(double progress);
     ExportSnapshot buildExportSnapshot() const;
+    void integrateImu();
+    // IMU<->video clock drift estimated from the two stream durations. The IMU
+    // and video are recorded on independent clocks of slightly different
+    // rates, so drift = (imuDuration - videoDuration) / videoDuration.
+    double autoImuDrift() const;
 
     // IMU-stabilized view quaternion at an arbitrary time (thread-safe: only
     // reads fixed integrator data).
@@ -258,6 +305,7 @@ signals:
     void imuSmoothingChanged();
     void imuSyncOffsetChanged();
     void imuDriftChanged();
+    void imuAccelKiChanged();
     void flowStitchChanged();
     void flowStrengthChanged();
     void flowIterationsChanged();
@@ -289,6 +337,9 @@ signals:
     void exportVidstabChanged();
     void exportVidstabInformedChanged();
     void exportFileNameChanged();
+    void calibrationRunningChanged();
+    void calibrationProgressChanged();
+    void calibrationStatusChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -322,6 +373,7 @@ private:
     double m_imuSmoothing;
     double m_imuSyncOffset;
     double m_imuDrift;
+    double m_imuAccelKi;
     bool m_usePreview;
     int m_activeLens;
     int m_projection;
@@ -346,6 +398,11 @@ private:
     bool m_seamStitch;
     double m_seamStrength;
     QImage m_seamImage;
+
+    ImuDriftCalibrator *m_driftCalibrator;
+    bool m_calibrationRunning;
+    double m_calibrationProgress;
+    QString m_calibrationStatus;
 };
 
 #endif // APP_H

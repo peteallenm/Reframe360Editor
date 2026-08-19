@@ -213,6 +213,21 @@ Item {
 
                             RowLayout {
                                 enabled: imuCheck.checked
+                                Label { text: qsTr("Drift corr:"); Layout.preferredWidth: 80 }
+                                ToolTip.text: qsTr("Mahony integral gain: accumulates the gravity-alignment error while the camera is still and feeds it back to cancel gyro bias, eliminating slow roll drift. 0 disables the correction.")
+                                ToolTip.visible: hovered
+                                Slider {
+                                    id: kiSlider
+                                    Layout.fillWidth: true
+                                    from: 0.0; to: 0.05
+                                    value: app.imuAccelKi
+                                    onMoved: app.imuAccelKi = value
+                                }
+                                Label { text: kiSlider.value.toFixed(4); Layout.preferredWidth: 50 }
+                            }
+
+                            RowLayout {
+                                enabled: imuCheck.checked
                                 Label { text: qsTr("Sync offset:"); Layout.preferredWidth: 80 }
                                 Slider {
                                     id: syncSlider
@@ -237,6 +252,28 @@ Item {
                                     onMoved: app.imuDrift = value
                                 }
                                 Label { text: (driftSlider.value * 1000).toFixed(1) + " ms/s"; Layout.preferredWidth: 50 }
+                            }
+
+                            RowLayout {
+                                enabled: imuCheck.checked
+                                Layout.fillWidth: true
+                                spacing: 6
+
+                                Button {
+                                    text: qsTr("Calibrate")
+                                    enabled: !app.calibrationRunning && imuCheck.checked
+                                    onClicked: app.calibrateImuDrift()
+                                }
+
+                                Label {
+                                    text: app.calibrationRunning
+                                          ? qsTr("Calibrating… %1%").arg((app.calibrationProgress * 100).toFixed(0))
+                                          : app.calibrationStatus
+                                    font.pixelSize: 11
+                                    color: app.calibrationRunning ? "#aaa" : "#8f8"
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
                             }
                         }
                     }

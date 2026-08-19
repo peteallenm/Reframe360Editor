@@ -5,28 +5,20 @@
 #include <QDebug>
 #include <iostream>
 
-// Mahony-style complementary filter gains.
-static const float kAccelKp    = 0.35f;   // proportional gain, rad/s per rad of tilt
+// Mahony-style complementary filter gains. accelKp is the proportional gain
+// (deg/s per rad of tilt error); accelKi is the integral gain, both passed in
+// via integrate() so the user can tune them. The integral term accumulates the
+// gravity-alignment error while the camera is still and feeds it back into the
+// body rate, estimating and cancelling the gyro bias that would otherwise
+// integrate into slow, unbounded orientation drift (most visible in roll).
+// accelKi too high causes oscillation/overshoot during fast motion.
 static const float kGyroGate   = 60.0f;   // deg/s: below this the accel is trusted
 static const float kMagLow     = 0.9f;    // |accel| window (g) for "camera still"
 static const float kMagHigh    = 1.1f;
-// One-pole IIR low-pass coefficient for the camera-frame gyro (~88 Hz cutoff
-// at 400 Hz sampling). Attenuates high-frequency gyro noise that would
-// otherwise integrate into orientation jitter, while leaving real motion (well
-// below ~10 Hz) untouched. Gentle enough not to add perceptible lag to quick
-// rolls. alpha = fraction of the new sample: 1 = no filtering.
-static const float kGyroFilterAlpha = 0.75f;
-// Rate-adaptive smoothing gates for orientationAt(): the Gaussian window
-// scales with the local camera angular rate so that fast/shakey motion (where
-// high-frequency jitter lives) gets the full user-selected window, while slow
-// smooth motion shrinks toward the 33 ms exposure average — a large Gaussian
-// on a slow pan adds lag instead of removing jitter, which reads out as
-// low-frequency wander in the residual. Below kRateSlow the window keeps only
-// kRateLowRatio of the user's requested window; at/above kRateFast it uses the
-// full window; linear ramp in between.
-static const float kRateSlow     = 15.0f;  // deg/s: below this = near-still camera
-static const float kRateFast     = 90.0f;  // deg/s: at/above this = full smoothing
-static const float kRateLowRatio = 0.5f;   // fraction of the user window kept when still
+// IIR low-pass filter removed: quaternion integration is itself an integrator;
+// sensor noise at 400 Hz integrates to almost nothing. The one-pole IIR
+// (alpha=0.55, ~50 Hz cutoff) added ~2-3 ms of group delay which at 300°/s
+// shake rate caused ~0.9° of instantaneous error — visible in 360 renders.
 // World frame convention: +Y is the world "up" vector used to seed and correct
 // the orientation (the Mahony filter drives current^-1 * kWorldUp toward the
 // measured acceleration). For a level camera the accelerometer reads
@@ -51,31 +43,50 @@ GyroscopeIntegrator::GyroscopeIntegrator(QObject *parent)
 
 QVector3D GyroscopeIntegrator::computeGyroBias(const QVector<ImuSample> &samples) const
 {
-    // Compute mean gyro during the first samples with low total rate
-    // (camera should be still at the start).
-    double sumX = 0.0, sumY = 0.0, sumZ = 0.0;
-    int count = 0;
-    const int maxBiasSamples = 400;  // 1 second at 400 Hz
+    // Find the quietest 0.5 s window anywhere in the recording and use its
+    // mean gyro as the bias. Scanning the whole recording (not just the first
+    // second) handles clips that start mid-motion. The Mahony integral term
+    // then refines this estimate continuously during still moments.
+    const int winSamples = qMax(1, (int)(0.5 * m_sampleRate));  // 0.5 s window
+    const int maxScan = qMin(samples.size(), (int)(20 * m_sampleRate)); // cap at 20 s
+    if (samples.size() < winSamples)
+        return QVector3D(0.0f, 0.0f, 0.0f);
 
-    for (int i = 0; i < qMin(maxBiasSamples, samples.size()); i++) {
-        float rate = std::abs(samples[i].gyro.x())
-                   + std::abs(samples[i].gyro.y())
-                   + std::abs(samples[i].gyro.z());
-        if (rate < 30.0f) {  // low total rate -> stationary
-            sumX += samples[i].gyro.x();
-            sumY += samples[i].gyro.y();
-            sumZ += samples[i].gyro.z();
-            count++;
+    // Sliding window of total |gyro| rate; keep the window with the lowest sum.
+    double bestSum = 0.0, bestX = 0.0, bestY = 0.0, bestZ = 0.0;
+    bool haveBest = false;
+    double sum = 0.0, sumX = 0.0, sumY = 0.0, sumZ = 0.0;
+    const int n = qMin(samples.size(), maxScan);
+    for (int i = 0; i < n; i++) {
+        sum  += std::abs(samples[i].gyro.x()) + std::abs(samples[i].gyro.y())
+              + std::abs(samples[i].gyro.z());
+        sumX += samples[i].gyro.x();
+        sumY += samples[i].gyro.y();
+        sumZ += samples[i].gyro.z();
+        if (i >= winSamples) {
+            const int j = i - winSamples;
+            sum  -= std::abs(samples[j].gyro.x()) + std::abs(samples[j].gyro.y())
+                  + std::abs(samples[j].gyro.z());
+            sumX -= samples[j].gyro.x();
+            sumY -= samples[j].gyro.y();
+            sumZ -= samples[j].gyro.z();
+        }
+        if (i + 1 >= winSamples && (!haveBest || sum < bestSum)) {
+            bestSum = sum;
+            bestX = sumX; bestY = sumY; bestZ = sumZ;
+            haveBest = true;
         }
     }
 
-    if (count > 0)
-        return QVector3D((float)(sumX / count), (float)(sumY / count), (float)(sumZ / count));
+    if (haveBest)
+        return QVector3D((float)(bestX / winSamples), (float)(bestY / winSamples),
+                         (float)(bestZ / winSamples));
     return QVector3D(0.0f, 0.0f, 0.0f);
 }
 
 void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sampleRate,
-                                    const QQuaternion &imuToCamera)
+                                    const QQuaternion &imuToCamera,
+                                    float accelKp, float accelKi)
 {
     m_sampleRate = sampleRate;
     m_orientations.clear();
@@ -151,9 +162,12 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         }
     }
 
-    // One-pole IIR filter state for the camera-frame gyro (see kGyroFilterAlpha).
-    QVector3D gyroFiltered(0.0f, 0.0f, 0.0f);
-    bool gyroFilterInitialized = false;
+    // Mahony integral term: accumulates the gravity-alignment error while the
+    // accel is trusted, estimating and cancelling the gyro bias. It keeps
+    // running across fast-motion sections (the accumulator is not reset when
+    // the proportional gate closes), so roll/pitch drift does not re-accumulate
+    // once the correction converges.
+    QVector3D integralFB(0.0f, 0.0f, 0.0f);
 
     for (int i = 0; i < samples.size(); i++) {
         m_timestamps.append(samples[i].timestamp);
@@ -176,19 +190,13 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
         QVector3D gyroCorr = samples[i].gyro - bias;                 // sensor axes
         QVector3D gyroCam = qInv.rotatedVector(gyroCorr);            // camera axes
 
-        // One-pole IIR low-pass to reject high-frequency gyro noise before it
-        // is integrated (and before the gate below is evaluated).
-        if (gyroFilterInitialized) {
-            gyroFiltered = kGyroFilterAlpha * gyroCam
-                         + (1.0f - kGyroFilterAlpha) * gyroFiltered;
-        } else {
-            gyroFiltered = gyroCam;
-            gyroFilterInitialized = true;
-        }
-
-        float cx = gyroFiltered.x();  // camera X <- pitch
-        float cy = gyroFiltered.y();  // camera Y <- -yaw
-        float cz = gyroFiltered.z();  // camera Z <- -roll
+        // Use the camera-frame gyro directly without IIR filtering.
+        // Quaternion integration is itself an integrator; sensor noise at
+        // 400 Hz integrates to almost nothing. The removed IIR (alpha=0.55)
+        // added ~2-3 ms lag which caused ~0.9° error at 300°/s shake rate.
+        float cx = gyroCam.x();  // camera X <- pitch
+        float cy = gyroCam.y();  // camera Y <- -yaw
+        float cz = gyroCam.z();  // camera Z <- -roll
 
         // Accelerometer gravity correction (body-frame angular velocity).
         QVector3D accel = qInv.rotatedVector(samples[i].accel);  // camera axes
@@ -232,13 +240,28 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
                 err = QVector3D::crossProduct(upPred, upMeas); // rad (≈ sin θ)
             }
 
-            // Add the (scaled) correction to the body-frame rate (rad/s -> deg/s).
+            // Accumulate the integral term (deg/s bias estimate) only while the
+            // accel is trusted — that is the only time err carries real signal.
+            // err is in rad (≈ sin θ); convert to degrees for consistency with
+            // the proportional term's gain.
             const float radToDeg = 180.0f / M_PI;
-            const float gain = kAccelKp * gateFactor * radToDeg;
+            integralFB += err * (accelKi * radToDeg) * dt;
+
+            // Add the proportional correction to the body-frame rate (rad->deg).
+            const float gain = accelKp * gateFactor * radToDeg;
             cx += err.x() * gain;
             cy += err.y() * gain;
             cz += err.z() * gain;
         }
+
+        // The integral term (estimated gyro bias) is applied to the body rate
+        // unconditionally: its accumulation is gated above, but the feedback
+        // must persist even while the proportional gate is closed, otherwise
+        // the bias correction vanishes during exactly the fast-motion sections
+        // where drift would otherwise re-accumulate.
+        cx += integralFB.x();
+        cy += integralFB.y();
+        cz += integralFB.z();
 
         float gxRad = qDegreesToRadians(cx);
         float gyRad = qDegreesToRadians(cy);
@@ -259,6 +282,32 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
 QQuaternion GyroscopeIntegrator::orientationAtTime(double time, float smoothingMs) const
 {
     return orientationAt(m_orientations, m_timestamps, time, smoothingMs);
+}
+
+QQuaternion GyroscopeIntegrator::orientationAtTimeUnsmoothed(double time) const
+{
+    if (m_orientations.isEmpty()) return QQuaternion();
+
+    if (time <= m_timestamps.first())
+        return m_orientations.first();
+    if (time >= m_timestamps.last())
+        return m_orientations.last();
+
+    // Binary search for the bracketing index
+    const auto it = std::lower_bound(m_timestamps.begin(), m_timestamps.end(), time);
+    int i = (it == m_timestamps.end()) ? m_timestamps.size() - 1
+                                       : (int)(it - m_timestamps.begin());
+    if (i > 0 && m_timestamps[i] > time) i--;
+
+    // Slerp between the two bracketing quaternions (no Gaussian smoothing)
+    if (i + 1 >= m_orientations.size())
+        return m_orientations.last();
+
+    double dt = m_timestamps[i + 1] - m_timestamps[i];
+    float t = (dt > 0.0) ? (float)((time - m_timestamps[i]) / dt) : 0.0f;
+    t = qBound(0.0f, t, 1.0f);
+
+    return QQuaternion::slerp(m_orientations[i], m_orientations[i + 1], t);
 }
 
 QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orientations,
@@ -284,26 +333,6 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
         if (i > 0 && timestamps[i] > time) i--;
     }
 
-    // Estimate the local camera angular rate (deg/s) from the pre-computed
-    // orientation chain (angle between orientations +/-span samples apart over
-    // their timestamps) so the smoothing window can adapt to the motion.
-    float rateDegS = 0.0f;
-    {
-        const int span = 5;  // +/-5 samples (~25 ms at 400 Hz)
-        const int a = qMax(0, i - span);
-        const int b = qMin(timestamps.size() - 1, i + span);
-        if (b > a) {
-            QQuaternion qa = orientations[a];
-            const QQuaternion &qb = orientations[b];
-            if (QQuaternion::dotProduct(qa, qb) < 0.0f)
-                qa = QQuaternion(-qa.scalar(), -qa.x(), -qa.y(), -qa.z());
-            const float angRad = 2.0f * qAcos(qAbs(QQuaternion::dotProduct(qa, qb)));
-            const float dtS = (float)(timestamps[b] - timestamps[a]);
-            if (dtS > 0.0f)
-                rateDegS = qRadiansToDegrees(angRad) / dtS;
-        }
-    }
-
     // Minimum window = one 30 fps video frame (~33 ms, ~13 IMU samples at 400 Hz)
     // so even at smoothingMs = 0 we average over the frame exposure time, giving
     // ~11 dB jitter reduction for free. Larger windows use a Gaussian profile
@@ -311,21 +340,11 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
     // no box-filter side lobes. All orientations are pre-computed, so this
     // centered window looks ahead in the array without any real-time latency.
     //
-    // The user's smoothingMs sets the window ceiling and the 33 ms exposure
-    // average the floor; the local rate scales between them (kRateSlow/Fast,
-    // kRateLowRatio) so slow pans don't accumulate Gaussian lag and fast shakes
-    // get the full attenuation.
+    // The user's smoothingMs sets the window and the 33 ms exposure average is
+    // the floor. (The old rate-adaptive scaling between them was removed: it
+    // starved slow pans of smoothing while offering no benefit on fast shakes.)
     const float minWindowMs = 33.0f;
-    const float userWindowMs = qMax(minWindowMs, smoothingMs);
-    float ratio = 1.0f;
-    if (rateDegS < kRateSlow) {
-        ratio = kRateLowRatio;
-    } else if (rateDegS < kRateFast) {
-        ratio = kRateLowRatio
-              + (1.0f - kRateLowRatio) * (rateDegS - kRateSlow) / (kRateFast - kRateSlow);
-    }
-    const float windowMs = qMax(minWindowMs,
-                                minWindowMs + (userWindowMs - minWindowMs) * ratio);
+    const float windowMs = qMax(minWindowMs, smoothingMs);
     const float halfMs = windowMs / 2.0f;
     const float sigmaMs = windowMs / 4.0f;
 

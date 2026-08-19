@@ -10,6 +10,7 @@ set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 ShaderTools OpenGL)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
 qt_add_executable(render360
     src/main.cpp
@@ -26,6 +27,8 @@ qt_add_executable(render360
     src/gpurenderer.cpp
     src/vidstab.cpp
     src/flowrenderer.cpp
+    src/horizondetector.cpp
+    src/imudriftcalibrator.cpp
 )
 
 qt_add_qml_module(render360
@@ -72,6 +75,7 @@ qt_add_resources(render360 "shaders_raw"
 target_include_directories(render360 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${FFMPEG_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
 )
 
 target_link_libraries(render360 PRIVATE
@@ -79,6 +83,7 @@ target_link_libraries(render360 PRIVATE
     Qt6::QuickControls2
     Qt6::OpenGL
     ${FFMPEG_LIBRARIES}
+    ${OpenCV_LIBS}
     OpenGL::GL
 )
 

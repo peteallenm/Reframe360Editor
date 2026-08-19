@@ -50,6 +50,7 @@ App::App(QObject *parent)
     // offset that works at t=0 (~0.17 s) grows to ~0.26 s by 24 s.
     , m_imuSyncOffset(0.17)
     , m_imuDrift(0.0038)
+    , m_imuAccelKi(0.005)
     , m_flowStitch(false)
     , m_flowStrength(1.0)
     , m_flowIterations(kDefaultFlowIterations)
@@ -67,6 +68,10 @@ App::App(QObject *parent)
     , m_exportStatus()
     , m_exportStart(0.0)
     , m_exportEnd(0.0)
+    , m_driftCalibrator(new ImuDriftCalibrator(this))
+    , m_calibrationRunning(false)
+    , m_calibrationProgress(0.0)
+    , m_calibrationStatus()
 {
     connect(m_decoder, &VideoDecoder::durationChanged, this, [this]() {
         // Keep the export trim range inside the newly known clip length.
@@ -179,6 +184,36 @@ App::App(QObject *parent)
         QTimer::singleShot(2500, this, [this]() { setExportRunning(false); });
     });
 
+    // IMU drift calibration: the calibrator runs in a background thread and
+    // reports progress/result via queued signal connections (cross-thread safe).
+    connect(m_driftCalibrator, &ImuDriftCalibrator::progressChanged, this,
+            [this](double fraction, const QString &status) {
+        m_calibrationProgress = fraction;
+        m_calibrationStatus = status;
+        emit calibrationProgressChanged();
+        emit calibrationStatusChanged();
+    }, Qt::QueuedConnection);
+    connect(m_driftCalibrator, &ImuDriftCalibrator::calibrationFinished, this,
+            [this](double drift, double residualDeg) {
+        m_calibrationRunning = false;
+        m_calibrationProgress = 1.0;
+        m_calibrationStatus = tr("Drift: %1 ms/s (RMS %2°)")
+                                  .arg(drift * 1000.0, 0, 'f', 2)
+                                  .arg(residualDeg, 0, 'f', 1);
+        emit calibrationRunningChanged();
+        emit calibrationProgressChanged();
+        emit calibrationStatusChanged();
+        // Apply the calibrated drift (this persists it in the sidecar).
+        setImuDrift(drift);
+    }, Qt::QueuedConnection);
+    connect(m_driftCalibrator, &ImuDriftCalibrator::calibrationFailed, this,
+            [this](const QString &error) {
+        m_calibrationRunning = false;
+        m_calibrationStatus = tr("Calibration failed: %1").arg(error);
+        emit calibrationRunningChanged();
+        emit calibrationStatusChanged();
+    }, Qt::QueuedConnection);
+
     m_viewQuat = viewQuatFromEuler();
 
     int defaultIdx = m_calibrationPresets->defaultPresetIndex();
@@ -192,6 +227,7 @@ App::App(QObject *parent)
     connect(this, &App::imuSmoothingChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuSyncOffsetChanged, this, [this]() { saveSettings(); });
     connect(this, &App::imuDriftChanged, this, [this]() { saveSettings(); });
+    connect(this, &App::imuAccelKiChanged, this, [this]() { saveSettings(); });
     connect(this, &App::projectionChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowStitchChanged, this, [this]() { saveSettings(); });
     connect(this, &App::flowStrengthChanged, this, [this]() { saveSettings(); });
@@ -298,13 +334,20 @@ void App::setVideoPath(const QString &path)
         }
         if (QFileInfo::exists(imuPath)) {
             m_imuParser->loadFile(imuPath);
-            // integrate() seeds the orientation from the accelerometer (so the
-            // default view is level, +Y = up) and then tracks the camera with
-            // the gyro, so the orientations are already gravity-aligned; no
-            // separate static per-clip gravity alignment is needed.
-            m_gyroIntegrator->integrate(m_imuParser->samples(),
-                                        m_imuParser->imuSampleRate(),
-                                        m_imuParser->initialQuaternion());
+
+            // IMU<->video drift: a value tuned for this video and stored in
+            // its keyframe sidecar wins; otherwise use the auto-calculated
+            // estimate from the relative stream durations. Only emit when it
+            // actually changed so the QML slider tracks the applied value.
+            double drift = autoImuDrift();
+            if (m_keyframes->hasImuDrift())
+                drift = m_keyframes->imuDrift();
+            if (!qFuzzyCompare(m_imuDrift, drift)) {
+                m_imuDrift = drift;
+                emit imuDriftChanged();
+            }
+
+            integrateImu();
         }
 
         emit videoLoaded();
@@ -511,6 +554,63 @@ void App::setImuDrift(double drift)
 
     m_imuDrift = drift;
     emit imuDriftChanged();
+
+    // Persist the tuned drift in this video's keyframe sidecar so re-opening
+    // the video restores it (the auto-calculated value is only the fallback
+    // when the sidecar has no stored drift). Skipped during sidecar restore.
+    if (!m_videoPath.isEmpty() && !m_restoringSidecar) {
+        m_keyframes->setImuDrift(drift);
+        saveKeyframes();
+    }
+}
+
+double App::imuAccelKi() const
+{
+    return m_imuAccelKi;
+}
+
+void App::setImuAccelKi(double ki)
+{
+    // Integral gain is clamped to >= 0 (0 disables the drift correction, e.g.
+    // for debugging); the upper bound keeps the filter from overshooting.
+    ki = qBound(0.0, ki, 0.10);
+    if (qFuzzyCompare(m_imuAccelKi, ki))
+        return;
+
+    m_imuAccelKi = ki;
+    emit imuAccelKiChanged();
+
+    if (m_imuParser->isLoaded())
+        integrateImu();
+}
+
+double App::autoImuDrift() const
+{
+    // The IMU and video streams are recorded on independent clocks, so their
+    // durations never quite match. The fractional difference is the drift that
+    // accumulates over the clip: imuTime == videoTime * (1 + drift) + offset.
+    const double imuDur = m_imuParser->duration();
+    const double videoDur = m_decoder->duration();
+    if (imuDur > 0.0 && videoDur > 0.0)
+        return (imuDur - videoDur) / videoDur;
+    return m_imuDrift;
+}
+
+void App::integrateImu()
+{
+    if (!m_imuParser->isLoaded())
+        return;
+    // integrate() seeds the orientation from the accelerometer (so the
+    // default view is level, +Y = up) and then tracks the camera with the
+    // gyro, so the orientations are already gravity-aligned; no separate
+    // static per-clip gravity alignment is needed. Re-run whenever the
+    // Mahony integral gain (imuAccelKi) changes so the bias estimate is
+    // recomputed with the new feedback strength.
+    m_gyroIntegrator->integrate(m_imuParser->samples(),
+                                m_imuParser->imuSampleRate(),
+                                m_imuParser->initialQuaternion(),
+                                0.35f,
+                                (float)m_imuAccelKi);
 }
 
 void App::setFlowStitch(bool stitch)
@@ -786,6 +886,48 @@ void App::applyKeyframeInterpolation()
     emit fovChanged();
 }
 
+void App::calibrateImuDrift()
+{
+    if (m_calibrationRunning) {
+        m_calibrationStatus = tr("Calibration already in progress");
+        emit calibrationStatusChanged();
+        return;
+    }
+    if (m_videoPath.isEmpty()) {
+        m_calibrationStatus = tr("No video loaded");
+        emit calibrationStatusChanged();
+        return;
+    }
+    if (!m_imuParser->isLoaded()) {
+        m_calibrationStatus = tr("No IMU data available");
+        emit calibrationStatusChanged();
+        return;
+    }
+    if (!m_gyroIntegrator || m_gyroIntegrator->orientations().isEmpty()) {
+        m_calibrationStatus = tr("IMU integration not ready");
+        emit calibrationStatusChanged();
+        return;
+    }
+
+    // Snapshot the integrator data (thread-safe: the worker gets its own copy).
+    QVector<QQuaternion> orientations = m_gyroIntegrator->orientations();
+    QVector<double> timestamps = m_gyroIntegrator->timestamps();
+
+    // Sample ~20 frames for a 139 s clip; scale down for shorter clips.
+    double dur = m_decoder->duration();
+    int numSamples = qBound(10, (int)(dur / 7.0), 30);
+
+    m_calibrationRunning = true;
+    m_calibrationProgress = 0.0;
+    m_calibrationStatus = tr("Starting calibration…");
+    emit calibrationRunningChanged();
+    emit calibrationProgressChanged();
+    emit calibrationStatusChanged();
+
+    m_driftCalibrator->startCalibration(m_videoPath, orientations, timestamps,
+                                         m_imuSyncOffset, m_imuDrift, numSamples);
+}
+
 CalibrationPresetModel* App::calibrationPresets() const
 {
     return m_calibrationPresets;
@@ -815,20 +957,27 @@ QQuaternion App::imuOrientationAt(double time) const
         // direction lives in a gravity-aligned frame and the default 0/0/0
         // view is level.
         //
-        // Smoothing slider (0..1) maps to a Gaussian window of up to 300 ms,
-        // applied at the video frame rate in the integrator (avoids 400 Hz ->
-        // 30 fps aliasing of high-frequency jitter). The window is rate-adaptive
-        // inside orientationAt(): it scales up to the slider value during
-        // fast/shakey motion and shrinks toward the 33 ms exposure average on
-        // slow smooth pans, so Gaussian lag doesn't read out as low-freq wander.
-        // 0.5 (default) = 150 ms ceiling.
+        // Two-signal architecture (q_virtual^{-1} * q_actual):
+        // - q_actual: full-bandwidth, unsmoothed orientation at the frame's
+        //   exposure midpoint. Never smooth this — high-frequency shake must
+        //   cancel exactly.
+        // - q_virtual: deliberately smooth "virtual tripod" path (Gaussian-
+        //   smoothed). Smoothing slider (0..1) maps to a window of up to 300 ms.
+        // - The shader applies imuOrientation.conjugated(), so we return
+        //   q_actual^{-1} * q_virtual, which makes the shader apply
+        //   q_virtual^{-1} * q_actual — cancelling shake exactly while
+        //   following the smooth virtual path for intentional motion.
         //
         // Sync is a linear model offset(t) = m_imuSyncOffset + m_imuDrift*t
         // (the IMU and video clocks run at slightly different rates, so the
         // offset that aligns the start of the clip is ~0.07 s too small by 24 s).
+        const double tImu = time * (1.0 + m_imuDrift) + m_imuSyncOffset;
         const float smoothingMs = (float)(m_imuSmoothing * 300.0);
-        return m_gyroIntegrator->orientationAtTime(
-                    time * (1.0 + m_imuDrift) + m_imuSyncOffset, smoothingMs);
+        const QQuaternion qActual = m_gyroIntegrator->orientationAtTimeUnsmoothed(tImu);
+        const QQuaternion qVirtual = m_gyroIntegrator->orientationAtTime(tImu, smoothingMs);
+        // Return q_actual^{-1} * q_virtual so the shader's conjugate gives
+        // q_virtual^{-1} * q_actual (the stabilization correction).
+        return qActual.conjugated() * qVirtual;
     }
     return QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
 }
@@ -1049,6 +1198,7 @@ void App::loadSettings()
     setImuSmoothing(s.value(QStringLiteral("imu/smoothing"), m_imuSmoothing).toDouble());
     setImuSyncOffset(s.value(QStringLiteral("imu/syncOffset"), m_imuSyncOffset).toDouble());
     setImuDrift(s.value(QStringLiteral("imu/drift"), m_imuDrift).toDouble());
+    setImuAccelKi(s.value(QStringLiteral("imu/accelKi"), m_imuAccelKi).toDouble());
     // Clamp to the valid projection ids so a stale/corrupt settings value can
     // never put the QML combo box out of range.
     setProjection(qBound(0, s.value(QStringLiteral("projection"), m_projection).toInt(), 3));
@@ -1090,6 +1240,7 @@ void App::saveSettings() const
     s.setValue(QStringLiteral("imu/smoothing"), m_imuSmoothing);
     s.setValue(QStringLiteral("imu/syncOffset"), m_imuSyncOffset);
     s.setValue(QStringLiteral("imu/drift"), m_imuDrift);
+    s.setValue(QStringLiteral("imu/accelKi"), m_imuAccelKi);
     s.setValue(QStringLiteral("projection"), m_projection);
     s.setValue(QStringLiteral("flow/stitch"), m_flowStitch);
     s.setValue(QStringLiteral("flow/strength"), m_flowStrength);

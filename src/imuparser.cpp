@@ -2,6 +2,7 @@
 #include <QFile>
 #include <QDebug>
 #include <cmath>
+#include <algorithm>
 
 ImuParser::ImuParser(QObject *parent)
     : QObject(parent)
@@ -14,6 +15,7 @@ ImuParser::ImuParser(QObject *parent)
 
 bool ImuParser::loadFile(const QString &path)
 {
+    m_loaded = false;
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
         qWarning() << "Failed to open IMU file:" << path;
@@ -154,6 +156,8 @@ bool ImuParser::loadFile(const QString &path)
         const int16_t *t1 = rec + i * 4;   // accelX, gyroPitch, gyroYaw, gyroRoll
         // 0, 0, accelY, accelZ (same packet, one record before t1)
         const int16_t *t3 = (i - 1 >= 0) ? rec + (i - 1) * 4 : nullptr;
+        // t2 counter record is two records before t1 (file order: t2, t3, t1)
+        const int16_t *t2rec = (i - 2 >= 0) ? rec + (i - 2) * 4 : nullptr;
 
         ImuSample s;
         s.timestamp = t;
@@ -163,13 +167,66 @@ bool ImuParser::loadFile(const QString &path)
         s.accel = QVector3D((float)(t1[0] / accelScale),
                             (float)(t3 ? t3[2] : 0) / accelScale,
                             (float)(t3 ? t3[3] : 0) / accelScale);  // X,Y,Z in g
+        // Extract the 32-bit hardware counter from the t2 record
+        s.counter = 0;
+        if (t2rec) {
+            s.counter = (uint32_t)(uint16_t)t2rec[2]
+                      | ((uint32_t)(uint16_t)t2rec[3] << 16);
+        }
         m_rawData.append(s);
         t += dt;
+    }
+
+    // 3) Recompute timestamps from hardware counters for accurate timing.
+    //    The counter increments by ~2500 per sample (~1 MHz / 400 Hz). Using
+    //    the counter instead of index/400 handles dropped packets (counter
+    //    jumps of ~5000 instead of ~2500) and clock jitter. The 32-bit
+    //    unsigned subtraction naturally handles wrap (~71 min at 1 MHz).
+    if (m_rawData.size() >= 2) {
+        // Estimate f_counter from the median counter increment
+        QVector<uint32_t> increments;
+        increments.reserve(m_rawData.size() - 1);
+        for (int i = 1; i < m_rawData.size(); i++) {
+            uint32_t delta = m_rawData[i].counter - m_rawData[i-1].counter;
+            if (delta > 0 && delta < 20000) // sanity: skip wraps/drops
+                increments.append(delta);
+        }
+
+        if (!increments.isEmpty()) {
+            std::sort(increments.begin(), increments.end());
+            uint32_t medianIncrement = increments[increments.size() / 2];
+
+            if (medianIncrement > 0) {
+                double fCounter = (double)medianIncrement * m_imuSampleRate;
+                qDebug() << "IMU counter rate:" << fCounter << "Hz"
+                         << "(median increment:" << medianIncrement << ")";
+
+                // Detect dropped packets (increment ~2× median)
+                int droppedPackets = 0;
+                for (int i = 1; i < m_rawData.size(); i++) {
+                    uint32_t delta = m_rawData[i].counter - m_rawData[i-1].counter;
+                    if (delta > (uint32_t)(medianIncrement * 1.8))
+                        droppedPackets++;
+                }
+                if (droppedPackets > 0)
+                    qDebug() << "IMU: detected" << droppedPackets << "dropped packets";
+
+                // Recompute timestamps using accumulated deltas (handles 32-bit wrap)
+                double accumulatedDelta = 0.0;
+                m_rawData[0].timestamp = 0.0;
+                for (int i = 1; i < m_rawData.size(); i++) {
+                    uint32_t delta = m_rawData[i].counter - m_rawData[i-1].counter;
+                    accumulatedDelta += (double)delta;
+                    m_rawData[i].timestamp = accumulatedDelta / fCounter;
+                }
+            }
+        }
     }
 
     qDebug() << "IMU parsed:" << m_rawData.size() << "samples from" << n << "records";
     if (!m_rawData.isEmpty())
         qDebug() << "IMU time range:" << m_rawData.first().timestamp
                  << "to" << m_rawData.last().timestamp;
+    m_loaded = !m_rawData.isEmpty();
     return true;
 }

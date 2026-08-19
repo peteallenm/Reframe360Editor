@@ -238,7 +238,7 @@ void KeyframeModel::saveToFile(const QString &path) const
         });
     }
     QJsonObject root{
-        {"version", 3},
+        {"version", 4},
         {"in", m_trimIn},        // export trim start marker
         {"out", m_trimOut},      // export trim end marker
         {"export", QJsonObject{
@@ -254,6 +254,10 @@ void KeyframeModel::saveToFile(const QString &path) const
         }},
         {"keyframes", arr},
     };
+    // Per-video IMU clock drift is optional; only stored once the user has
+    // tuned it (or a sidecar was created with one).
+    if (m_imuDrift >= 0.0)
+        root.insert(QStringLiteral("imuDrift"), m_imuDrift);
 
     QFile f(path);
     if (f.open(QIODevice::WriteOnly))
@@ -265,6 +269,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     QVector<Keyframe> loaded;
     double trimIn = 0.0;
     double trimOut = 0.0;
+    double imuDrift = -1.0;   // absent in old sidecars -> not stored
     int expWidth = m_exportWidth;
     int expHeight = m_exportHeight;
     double expFps = m_exportFps;
@@ -295,6 +300,8 @@ void KeyframeModel::loadFromFile(const QString &path)
             // Optional export trim markers (absent in v1 sidecars -> 0/0).
             trimIn  = root.value("in").toDouble(0.0);
             trimOut = root.value("out").toDouble(0.0);
+            // Optional per-video IMU clock drift (absent -> not stored).
+            imuDrift = root.value("imuDrift").toDouble(-1.0);
             // Optional last-used export options (absent in older sidecars ->
             // keep the current in-memory defaults).
             const QJsonObject exp = root.value("export").toObject();
@@ -343,6 +350,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     if (loaded == m_keyframes
         && qFuzzyCompare(trimIn, m_trimIn)
         && qFuzzyCompare(trimOut, m_trimOut)
+        && qFuzzyCompare(imuDrift, m_imuDrift)
         && exportUnchanged)
         return;
 
@@ -353,6 +361,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     endResetModel();
     m_trimIn = trimIn;
     m_trimOut = trimOut;
+    m_imuDrift = imuDrift;
     m_exportWidth = expWidth;
     m_exportHeight = expHeight;
     m_exportFps = expFps;

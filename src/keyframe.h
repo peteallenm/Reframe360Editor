@@ -78,6 +78,13 @@ public:
     Keyframe keyframeAt(int index) const;
     int count() const { return (int)m_keyframes.size(); }
 
+    // Per-video IMU<->video clock drift (s/s) persisted in the same sidecar
+    // file so each video remembers its own tuned value. -1.0 = not stored;
+    // the caller then falls back to the auto-calculated value.
+    void setImuDrift(double d) { m_imuDrift = d; }
+    double imuDrift() const { return m_imuDrift; }
+    bool hasImuDrift() const { return m_imuDrift >= 0.0; }
+
     void interpolate(double time, double &yaw, double &pitch, double &roll, double &fov) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }
 
@@ -119,6 +126,7 @@ private:
     bool m_exportVidstab = false;
     bool m_exportVidstabInformed = false;
     QString m_exportFileName;  // last-used output MP4 path (persisted per-video)
+    double m_imuDrift = -1.0;  // -1.0 = not stored in the sidecar
 };
 
 #endif // KEYFRAME_H
