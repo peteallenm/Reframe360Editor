@@ -1,0 +1,122 @@
+#ifndef VISUALROTATION_H
+#define VISUALROTATION_H
+
+#include <QObject>
+#include <QVector>
+#include <QQuaternion>
+#include <QVector3D>
+#include <QString>
+#include <QThread>
+#include <functional>
+
+#include <opencv2/core.hpp>
+
+class CalibrationProfile;
+
+struct VisualRotationPair {
+    double t0, t1;           // timestamps of the two frames
+    QQuaternion deltaR;      // rotation from t0 to t1
+    int inliers;             // number of matches after outlier rejection
+    double rmsDeg;           // RMS residual in degrees
+};
+
+Q_DECLARE_METATYPE(VisualRotationPair)
+
+class VisualRotationComputer : public QObject {
+    Q_OBJECT
+public:
+    explicit VisualRotationComputer(QObject *parent = nullptr);
+    ~VisualRotationComputer();
+
+    void compute(const QString &videoPath,
+                 const CalibrationProfile *calibration,
+                 int frameSkip = 3);  // process every (frameSkip+1)th frame
+
+    // Which fisheye halves contribute correspondences to the rotation solve.
+    // Bit 0 = front, bit 1 = rear; default = both. Diagnostic hook: the two
+    // halves are normally pooled into a single Kabsch solve, so if one half's
+    // bearing convention were wrong its correspondences would pull the solved
+    // rotation toward identity and the pooled result would under-measure.
+    // Solving each half alone isolates that.
+    // Analyse only the first N seconds (0 = whole clip). Decoding stops at the
+    // limit, so a short window is cheap AND is sampled densely: the
+    // MAX_DECODED_FRAMES budget is spread over the limit rather than the whole
+    // clip, which matters when looking at high-frequency motion.
+    void setTimeLimit(double seconds) { m_timeLimit = seconds; }
+
+    enum LensMask { LensFront = 1, LensRear = 2, LensBoth = 3 };
+    void setLensMask(int mask) { m_lensMask = mask; }
+    int lensMask() const { return m_lensMask; }
+
+    struct LensParams {
+        double cx, cy;       // center in normalized half-frame coords
+        double radius;        // fisheye radius in normalized coords
+        double k1, k2;        // distortion coefficients
+        double rotation;      // lens rotation in degrees
+        bool hflip;           // horizontal flip flag
+        bool isRear;          // false for front, true for rear
+        // Mirror the azimuth when back-projecting. The rear lens looks along
+        // +Z while the front looks along -Z, so the two images see the sphere
+        // from opposite sides and the shared azimuth convention gives the rear
+        // bearings the opposite handedness. Explicit rather than implied by
+        // isRear so the convention can be A/B tested.
+        bool mirrorAzimuth = false;
+    };
+
+    // Bearing back-projection: pixel in half-frame normalized coords → unit vector
+    static QVector3D pixelToBearing(double px, double py, const LensParams &lens);
+
+signals:
+    void progressChanged(double fraction, const QString &status);
+    void rotationComputed(const QVector<VisualRotationPair> &pairs);
+    void computationFailed(const QString &error);
+
+private:
+    struct FrameData {
+        double timestamp;
+        cv::Mat grayFront;    // grayscale front fisheye half
+        cv::Mat grayRear;     // grayscale rear fisheye half
+    };
+
+    // ORB output for one frame, computed ONCE up front. The adaptive hop search
+    // revisits the same frame as both the B of one pair and the A of the next
+    // (and again on every narrowed retry), so detecting inside matchFeatures
+    // re-ran ORB about twice per frame for nothing.
+    struct FrameFeatures {
+        std::vector<cv::KeyPoint> kpFront, kpRear;
+        cv::Mat descFront, descRear;
+    };
+
+    // Decode frames from video, returning timestamps and grayscale half-images
+    bool decodeFrames(const QString &videoPath, int frameSkip,
+                      QVector<FrameData> &frames,
+                      std::function<bool(double, const QString&)> progressCb);
+
+    // Detect ORB features and match between consecutive frame pairs
+    bool matchFeatures(const FrameData &frameA, const FrameData &frameB,
+                       const FrameFeatures &featA, const FrameFeatures &featB,
+                       const LensParams &frontLens, const LensParams &rearLens,
+                       QVector<QVector3D> &bearingsA,
+                       QVector<QVector3D> &bearingsB,
+                       int lensMask = LensBoth);
+
+    // Detect ORB on every frame, spread across all cores.
+    static void computeFeatures(const QVector<FrameData> &frames,
+                                QVector<FrameFeatures> &out,
+                                int lensMask,
+                                const std::function<void(int)> &progressCb);
+
+    // Solve rotation from matched bearing pairs using SVD (Kabsch/Wahba).
+    // initialGuess seeds the first iteration (use the previous pair's rotation
+    // so fast, sustained rotation keeps features within the inlier threshold
+    // instead of collapsing to zero inliers).
+    QQuaternion solveRotation(const QVector<QVector3D> &bearingsA,
+                              const QVector<QVector3D> &bearingsB,
+                              int &inliers, double &rmsDeg,
+                              const QQuaternion &initialGuess = QQuaternion());
+
+    int m_lensMask = LensBoth;
+    double m_timeLimit = 0.0;
+};
+
+#endif // VISUALROTATION_H
