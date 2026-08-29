@@ -1,6 +1,7 @@
 #include "gpurenderer.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
@@ -40,11 +41,12 @@ static QByteArray adaptShader(const QByteArray &src)
     s.replace("#version 430", "#version 330");
     s.replace("#version 450", "#version 330");
     s.replace("#version 460", "#version 330");
-    s.replace("layout(binding = 1) uniform sampler2D", "uniform sampler2D");
-    s.replace("layout(binding = 2) uniform sampler2D", "uniform sampler2D");
-    s.replace("layout(binding = 3) uniform sampler2D", "uniform sampler2D");
-    s.replace("layout(binding = 4) uniform sampler2D", "uniform sampler2D");
-    s.replace("layout(binding = 5) uniform sampler2D", "uniform sampler2D");
+    // Any binding index: a sampler added to project.frag under a new binding
+    // (the curve LUT at 6 was one) must not silently break the export shader
+    // -- when it did, the exporter fell back to the CPU path unannounced.
+    static const QRegularExpression samplerBinding(
+        QStringLiteral("layout\\(binding\\s*=\\s*\\d+\\)\\s*uniform sampler2D"));
+    s = QString::fromUtf8(s).replace(samplerBinding, QStringLiteral("uniform sampler2D")).toUtf8();
     // layout(location = N) needs GLSL 410 (or an extension) on NVIDIA's
     // compiler, so strip them and assign attribute locations explicitly via
     // QOpenGLShaderProgram::bindAttributeLocation before linking. With a

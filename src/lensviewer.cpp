@@ -208,6 +208,11 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         frame = m_decoder->currentFrame();
         if (auto *app = qobject_cast<App *>(m_app))
             imuQ = app->imuOrientationAt(frame.timestamp);
+        static const bool kAudit = !qgetenv("RENDER360_VIEW_AUDIT").isEmpty();
+        if (kAudit)
+            qInfo("Preview frame: t=%.4f %dx%d yaw=%.2f pitch=%.2f roll=%.2f fov=%.1f lens=%d proj=%d imuQ=(%.4f,%.4f,%.4f,%.4f)",
+                  frame.timestamp, frame.width, frame.height, m_yaw, m_pitch, m_roll, m_fov, m_activeLens, m_projection,
+                  imuQ.scalar(), imuQ.x(), imuQ.y(), imuQ.z());
     }
     QMatrix4x4 imuMat;
     imuMat.rotate(imuQ.conjugated());

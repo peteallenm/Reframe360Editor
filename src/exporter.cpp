@@ -191,8 +191,11 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
         double zy = sr * v.x + cr * v.y;
         double xz = v.z;
         double xx = zx;
-        double xy = cp * zy + sp * xz;
-        double xzz = -sp * zy + cp * xz;
+        // rotX columns in the shader are (1,0,0),(0,cp,sp),(0,-sp,cp):
+        // y' = cp*y - sp*z, z' = sp*y + cp*z. (Was the transpose -- pitch
+        // rendered inverted whenever the GPU path was unavailable.)
+        double xy = cp * zy - sp * xz;
+        double xzz = sp * zy + cp * xz;
         return Vec3{cy * xx + sy * xzz, xy, -sy * xx + cy * xzz};
     };
 
@@ -904,6 +907,10 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
             // VFR timing variations jitter the stabilization.
             const double stateTime = (frame.timestamp >= 0.0) ? frame.timestamp : t;
             ExportFrameState s = state(stateTime);
+            if (i == 0)   // one-line audit of the first frame's view state (compare with the preview)
+                qInfo("Export first frame: t=%.4f yaw=%.2f pitch=%.2f roll=%.2f fov=%.1f lens=%d proj=%d imuQ=(%.4f,%.4f,%.4f,%.4f)",
+                      stateTime, s.yaw, s.pitch, s.roll, s.fov, s.activeLens, s.projection,
+                      s.imuOrientation.scalar(), s.imuOrientation.x(), s.imuOrientation.y(), s.imuOrientation.z());
             QImage rendered;
             if (gpuReady) {
                 // Optical-flow stitching: estimate the parallax field for this
