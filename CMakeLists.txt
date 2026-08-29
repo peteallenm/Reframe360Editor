@@ -86,10 +86,8 @@ qt_add_resources(render360 "shaders_raw"
         shaders/quad.vert
         shaders/project.frag
         shaders/band_extract.frag
-        shaders/hs_gradients.frag
-        shaders/hs_iteration.frag
+        shaders/disp_match.frag
         shaders/seam_cost.frag
-        shaders/seam_dp.frag
 )
 
 target_include_directories(render360 PRIVATE

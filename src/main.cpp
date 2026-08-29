@@ -122,6 +122,17 @@ int main(int argc, char *argv[])
 
     App appController;
 
+    // View options apply to headless exports as well as the GUI, so set them
+    // before the headless branch starts its export (they used to be applied
+    // only on the GUI path below, which made --lens/--projection/--imu silent
+    // no-ops for --export-video).
+    if (parser.isSet(projectionOption))
+        appController.setProjection(parser.value(projectionOption).toInt());
+    if (parser.isSet(lensOption))
+        appController.setActiveLens(parser.value(lensOption).toInt());
+    if (parser.isSet(imuOption))
+        appController.setImuStabilize(true);
+
     if (parser.isSet(headlessOption)) {
         if (parser.isSet(videoOption)) {
             QString videoPath = parser.value(videoOption);

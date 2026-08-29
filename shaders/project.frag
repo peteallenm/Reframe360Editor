@@ -223,57 +223,49 @@ void main() {
         }
         float blend = smoothstep(blendStart, blendEnd, r_front);
 
-        vec2 uv_f = vec2(uv_front.x, uv_front.y * 0.5);
-        float yf = texture(u_texY, uv_f).r;
-        float uf = texture(u_texU, uv_f).r;
-        float vf = texture(u_texV, uv_f).r;
-        vec3 rgb_f = yuvToRgb(yf, uf, vf);
-
-        vec2 uv_r = vec2(uv_rear.x, uv_rear.y * 0.5 + 0.5);
-        float yr = texture(u_texY, uv_r).r;
-        float ur = texture(u_texU, uv_r).r;
-        float vr = texture(u_texV, uv_r).r;
-        vec3 rgb_r = yuvToRgb(yr, ur, vr);
-
-        // ---- Optical-flow parallax stitching (see OpticalFlow.md) ----
-        // Only the transition band (where both lenses contribute) is warped:
-        // w = 4*blend*(1-blend) is a tent peaking at blend=0.5 (the seam
-        // centre) and 0 at pure front (blend=0) / pure rear (blend=1), so the
-        // regions that render from a single lens stay geometrically
-        // unmodified. The flow field lives in the camera-native band
-        // (phi in [0,2pi), theta in [bandTheta0, bandTheta1]) and stores the
-        // rear-vs-front displacement in normalized band units, so we warp the
-        // rear sample to align with the front before blending.
-        if (u_flowStitch != 0) {
-            float w = 4.0 * blend * (1.0 - blend);
-            if (w > 0.0) {
-                float u_band = mod(phi + PI, 2.0 * PI) / (2.0 * PI);
-                float v_band = clamp((theta - u_bandTheta0) / (u_bandTheta1 - u_bandTheta0), 0.0, 1.0);
-                vec2 enc = texture(u_flow, vec2(u_band, v_band)).rg;
-                vec2 nduv = (enc - 0.5) / u_flowEncode * u_flowStrength;
-
-                float phi2 = mod(u_band + nduv.x, 1.0) * 2.0 * PI - PI;
-                float theta2 = mix(u_bandTheta0, u_bandTheta1,
-                                   clamp(v_band + nduv.y, 0.0, 1.0));
-                vec3 ray2 = vec3(sin(theta2) * cos(phi2),
-                                 sin(theta2) * sin(phi2), -cos(theta2));
-
-                // Project the warped direction into the REAR fisheye (same
-                // math as the geometric rear sample above).
-                float theta_rear2 = PI - theta2;
-                float r_rear2 = theta_rear2 / (PI * 0.5);
-                float r_dist2 = r_rear2 * (1.0 + u_rearK1 * r_rear2 * r_rear2 + u_rearK2 * r_rear2 * r_rear2 * r_rear2 * r_rear2);
-                vec2 off2 = rotateVec2(vec2(cos(phi2), sin(phi2)), radians(u_rearRotation)) * r_dist2 * u_rearRadius;
-                if (mod(float(u_hflipFlags), 4.0) >= 2.0)
-                    off2.x = -off2.x;
-                vec2 uv_r2 = u_rearCenter + off2;
-                vec2 uv_tex2 = vec2(uv_r2.x, uv_r2.y * 0.5 + 0.5);
-                vec3 rgb_warped = yuvToRgb(texture(u_texY, uv_tex2).r,
-                                           texture(u_texU, uv_tex2).r,
-                                           texture(u_texV, uv_tex2).r);
-                rgb_r = mix(rgb_r, rgb_warped, w);
-            }
+        // ---- Parallax stitching (see disp_match.frag / OpticalFlow.md) ----
+        // The flow texture holds the DISPARITY of the rear view relative to
+        // the front along theta: rear(theta + dtheta) shows the same scene
+        // point as front(theta). Both images are warped toward a common
+        // intermediate so they coincide everywhere inside the blend band while
+        // each stays UNWARPED at its own edge:
+        //     front sampled at theta - blend       * dtheta
+        //     rear  sampled at theta + (1 - blend) * dtheta
+        // At blend = 0 that is the plain front image, at blend = 1 the plain
+        // rear image, and for any blend in between the two samples refer to
+        // the same scene point. (The previous one-sided warp faded the rear
+        // correction out with a tent, which bent the rear image across the
+        // band and let the ghosting back in toward the edges.)
+        float theta_f = theta;
+        float theta_r = theta;
+        if (u_flowStitch != 0 && blend > 0.0 && blend < 1.0) {
+            float u_band = mod(phi + PI, 2.0 * PI) / (2.0 * PI);
+            float v_band = clamp((theta - u_bandTheta0) / (u_bandTheta1 - u_bandTheta0), 0.0, 1.0);
+            vec2 enc = texture(u_flow, vec2(u_band, v_band)).rg;
+            float ndv = (enc.g - 0.5) / u_flowEncode * u_flowStrength;   // normalized band units
+            float dtheta = ndv * (u_bandTheta1 - u_bandTheta0);
+            theta_f = theta - blend * dtheta;
+            theta_r = theta + (1.0 - blend) * dtheta;
         }
+
+        // Front sample at (theta_f, phi).
+        float r_f = theta_f / (PI * 0.5);
+        float r_f_dist = r_f * (1.0 + u_frontK1 * r_f * r_f + u_frontK2 * r_f * r_f * r_f * r_f);
+        vec2 off_f = rotateVec2(vec2(cos(phi), sin(phi)), radians(u_frontRotation)) * r_f_dist * u_frontRadius;
+        if (mod(float(u_hflipFlags), 2.0) != 0.0)
+            off_f.x = -off_f.x;
+        vec2 uv_f = vec2((u_frontCenter + off_f).x, (u_frontCenter + off_f).y * 0.5);
+        vec3 rgb_f = yuvToRgb(texture(u_texY, uv_f).r, texture(u_texU, uv_f).r, texture(u_texV, uv_f).r);
+
+        // Rear sample at (theta_r, phi).
+        float theta_rr = PI - theta_r;
+        float r_r = theta_rr / (PI * 0.5);
+        float r_r_dist = r_r * (1.0 + u_rearK1 * r_r * r_r + u_rearK2 * r_r * r_r * r_r * r_r);
+        vec2 off_r = rotateVec2(vec2(cos(phi), sin(phi)), radians(u_rearRotation)) * r_r_dist * u_rearRadius;
+        if (mod(float(u_hflipFlags), 4.0) >= 2.0)
+            off_r.x = -off_r.x;
+        vec2 uv_r = vec2((u_rearCenter + off_r).x, (u_rearCenter + off_r).y * 0.5 + 0.5);
+        vec3 rgb_r = yuvToRgb(texture(u_texY, uv_r).r, texture(u_texU, uv_r).r, texture(u_texV, uv_r).r);
 
         rgb = mix(rgb_f, rgb_r, blend);
     }

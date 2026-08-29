@@ -32,11 +32,21 @@ inline constexpr int kFlowBandHeight = 128;
 inline constexpr float kDefaultBandTheta0 = 75.0f * 3.14159265358979323846f / 180.0f;
 inline constexpr float kDefaultBandTheta1 = 105.0f * 3.14159265358979323846f / 180.0f;
 
-// Horn-Schunck defaults (see OpticalFlow.md). alpha is the smoothness weight:
-// higher = smoother (less high-frequency seam noise) but softer at object
-// boundaries. Tunable live via the app's flowAlpha slider (1..100).
-inline constexpr float kDefaultFlowAlpha = 20.0f;
-inline constexpr int kDefaultFlowIterations = 60;
+// Parallax matcher defaults. The stage is a 1-D disparity search along theta
+// (see disp_match.frag), so the two tunables are:
+//   flowIterations -> maximum parallax searched, in band texels (4.3/deg at
+//                     512x128 over a 30 deg band; 30 texels = 7 deg, enough for
+//                     objects ~0.3 m from the camera)
+//   flowAlpha      -> smoothing radius in band texels (Gaussian, confidence-
+//                     weighted; see disp_smooth.frag)
+// The old Horn-Schunck meanings (iteration count / smoothness weight) are gone;
+// the property names are kept so existing settings files still load.
+inline constexpr float kDefaultFlowAlpha = 6.0f;       // smoothing radius, texels
+inline constexpr int kDefaultFlowIterations = 30;      // max parallax, texels
+inline constexpr int kDispSmoothPasses = 3;
+inline constexpr int kMatchStep = 2;                 // match at band/2 resolution
+inline constexpr float kDispBilateralSigma = 3.0f;   // texels; depth edges sharper than this survive
+inline constexpr float kDispTemporalAlpha = 0.5f;      // weight of the NEW frame
 
 // The flow field is packed into an RG/RGBA texture as (ndu*k + 0.5, ndv*k + 0.5)
 // where ndu = du/bandWidth (normalized band units, so project.frag needs no
@@ -86,11 +96,12 @@ struct FlowSettings {
 // FlowRenderer — offscreen GL engine for the Horn-Schunck displacement field.
 //
 //   pass 1 (band_extract.frag, MRT): band_front / band_rear luma
-//   pass 2 (hs_gradients.frag):       Ix, Iy (central diffs of avg), It
-//   pass 3 (hs_iteration.frag, xN):   Jacobi relaxation, ping-pong RGBA16F
+//   pass 2 (disp_match.frag):         1-D ZNCC disparity along theta + confidence
+//   pass 3 (disp_smooth.frag, x2N):   confidence-weighted separable smoothing
 //
-// Flow is returned as a QVector<float> of (du, dv) pairs in texel units
-// (band texture 512x128). QOpenGLContext is thread-affine: the context +
+// The result is returned in the flow format the rest of the pipeline already
+// speaks: a QVector<float> of (du, dv) pairs in texel units, with du always 0
+// (parallax between back-to-back lenses is purely along theta). QOpenGLContext is thread-affine: the context +
 // surface must be created on the thread that calls compute(). The preview
 // path uses FlowWorker; the export path instantiates FlowRenderer directly on
 // the export worker thread.
@@ -129,6 +140,10 @@ public:
 
 private:
     static QByteArray loadResource(const char *path);
+    // Pull-push hole filling of the gated matches, then bilateral smoothing.
+    static void fillAndSmooth(const QVector<float> &dIn, const QVector<float> &cIn,
+                              int W, int H, int radius,
+                              QVector<float> *dOut, QVector<float> *cOut);
     bool createContext(QString *error);
     bool compilePrograms(QString *error);
     bool createBandTargets(QString *error);
@@ -139,10 +154,8 @@ private:
     QOpenGLContext *m_context = nullptr;
     QOpenGLFunctions_4_4_Core *m_functions = nullptr;
     QOpenGLShaderProgram *m_bandProgram = nullptr;
-    QOpenGLShaderProgram *m_gradProgram = nullptr;
-    QOpenGLShaderProgram *m_iterProgram = nullptr;
+    QOpenGLShaderProgram *m_matchProgram = nullptr;
     QOpenGLShaderProgram *m_seamCostProgram = nullptr;
-    QOpenGLShaderProgram *m_seamDpProgram = nullptr;
 
     quint32 m_vao = 0;
     quint32 m_vbo = 0;
@@ -156,13 +169,13 @@ private:
     quint32 m_flowA = 0;
     quint32 m_flowB = 0;
     quint32 m_costTex = 0;
-    quint32 m_dpA = 0;
-    quint32 m_dpB = 0;
     quint32 m_seamFbo = 0;
     quint32 m_yTex = 0;
     int m_yW = 0;
     int m_yH = 0;
     QVector<float> m_prevSeam;
+    QVector<float> m_prevFlow;     // temporal smoothing of the disparity field
+    int m_overlapV0 = 0, m_overlapV1 = 0;   // last measured overlap rows (gl bottom-up)
     bool m_ready = false;
 };
 

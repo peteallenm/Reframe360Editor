@@ -341,7 +341,7 @@ Item {
                     GroupBox {
                         title: qsTr("Flow Stitching")
                         Layout.fillWidth: true
-                        ToolTip.text: qsTr("Estimates the parallax displacement between the two lenses in the seam band (Horn-Schunck optical flow) and warps the rear view to align with the front before blending, removing seam ghosting on near objects.")
+                        ToolTip.text: qsTr("Measures the parallax between the two lenses across the seam band (a 1-D match along the meridians, where the parallax of back-to-back lenses lives) and morphs both views toward each other before blending, so near and far objects line up at the same time.")
                         ToolTip.visible: hovered
 
                         ColumnLayout {
@@ -363,19 +363,22 @@ Item {
                                 controlEnabled: flowCheck.checked
                             }
 
+                            // Max parallax searched, in seam-band texels (about 4.3 per
+                            // degree). 30 = 7 deg, enough for objects ~0.3 m away.
                             SliderRow {
-                                labelText: qsTr("Iterations:")
+                                labelText: qsTr("Max parallax:")
                                 value: app.flowIterations
                                 onUserChange: (v) => app.flowIterations = v
-                                min: 20; max: 100; step: 1; decimals: 0
+                                min: 4; max: 60; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
                             }
 
+                            // Smoothing radius of the disparity field, in texels.
                             SliderRow {
                                 labelText: qsTr("Smoothness:")
                                 value: app.flowAlpha
                                 onUserChange: (v) => app.flowAlpha = v
-                                min: 1; max: 100; step: 1; decimals: 0
+                                min: 1; max: 30; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
                             }
 
