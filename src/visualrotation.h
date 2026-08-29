@@ -96,6 +96,10 @@ private:
         cv::Mat descFront, descRear;
     };
 
+    // Pick the file to decode for analysis: the camera's *_thm proxy when it
+    // matches the original frame-for-frame, else the original.
+    static QString chooseDecodeSource(const QString &videoPath);
+
     // Decode frames from video, returning timestamps and grayscale half-images
     bool decodeFrames(const QString &videoPath, int frameSkip,
                       QVector<FrameData> &frames,
@@ -113,6 +117,8 @@ private:
     static void computeFeatures(const QVector<FrameData> &frames,
                                 QVector<FrameFeatures> &out,
                                 int lensMask,
+                                const LensParams &frontLens,
+                                const LensParams &rearLens,
                                 const std::function<void(int)> &progressCb);
 
     // Solve rotation from matched bearing pairs using SVD (Kabsch/Wahba).

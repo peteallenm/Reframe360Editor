@@ -20,8 +20,10 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <QFileInfo>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 static constexpr double PI = 3.14159265358979323846;
 static constexpr int TARGET_WIDTH = 640;
@@ -45,6 +47,67 @@ static constexpr int MAX_DECODED_FRAMES = 1400;
 // Instrumentation for the AutoSync cost breakdown.
 static QAtomicInt g_detectCalls;
 static QAtomicInt g_solveCalls;
+
+
+// ---------------------------------------------------------------------------
+// Proxy selection (see decodeFrames)
+// ---------------------------------------------------------------------------
+namespace {
+struct StreamFacts { bool ok = false; qint64 frames = 0; double duration = 0.0; int w = 0, h = 0; };
+
+StreamFacts probeStream(const QString &path)
+{
+    StreamFacts f;
+    AVFormatContext *ctx = nullptr;
+    if (avformat_open_input(&ctx, path.toUtf8().constData(), nullptr, nullptr) < 0) return f;
+    if (avformat_find_stream_info(ctx, nullptr) >= 0) {
+        const int idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (idx >= 0) {
+            const AVStream *st = ctx->streams[idx];
+            f.frames = st->nb_frames;
+            f.duration = (st->duration != AV_NOPTS_VALUE)
+                       ? st->duration * av_q2d(st->time_base)
+                       : (double)ctx->duration / AV_TIME_BASE;
+            f.w = st->codecpar->width; f.h = st->codecpar->height;
+            f.ok = true;
+        }
+    }
+    avformat_close_input(&ctx);
+    return f;
+}
+} // namespace
+
+QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath)
+{
+    if (!qgetenv("RENDER360_NO_PROXY").isEmpty())
+        return videoPath;
+
+    const QFileInfo fi(videoPath);
+    const QString proxy = fi.absolutePath() + QLatin1Char('/') + fi.completeBaseName()
+                        + QLatin1String("_thm.") + fi.suffix();
+    if (!QFileInfo::exists(proxy))
+        return videoPath;
+
+    const StreamFacts a = probeStream(videoPath);
+    const StreamFacts b = probeStream(proxy);
+    if (!a.ok || !b.ok) return videoPath;
+
+    // Same frame count and (within one frame period) same duration, and the
+    // proxy must still be at least as wide as the analysis resolution.
+    const bool sameFrames = (a.frames > 0 && a.frames == b.frames);
+    const bool sameDuration = std::abs(a.duration - b.duration) < 0.05;
+    const bool bigEnough = b.w >= TARGET_WIDTH;
+    if (sameFrames && sameDuration && bigEnough) {
+        qInfo() << "VisualRotation: decoding proxy" << QFileInfo(proxy).fileName()
+                << "(" << b.w << "x" << b.h << "," << b.frames << "frames) in place of the"
+                << a.w << "x" << a.h << "original";
+        return proxy;
+    }
+    qInfo() << "VisualRotation: proxy" << QFileInfo(proxy).fileName()
+            << "does not match the original (frames" << b.frames << "vs" << a.frames
+            << ", duration" << b.duration << "vs" << a.duration << ") -- decoding the original";
+    return videoPath;
+}
 
 // ---------------------------------------------------------------------------
 // Lens model inversion: pixel (normalized half-frame coords) → bearing vector
@@ -139,10 +202,22 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
     AVStream *videoStream = nullptr;
     int videoStreamIndex = -1;
 
+    // Decode the camera's low-resolution PROXY when it exists and matches.
+    //
+    // The YI writes a *_thm.MP4 beside every clip: same encoder, same frame
+    // count, same PTS, same GOP structure, at 720x1440 instead of 2880x5760.
+    // Feature extraction here downscales to TARGET_WIDTH (640) regardless, so
+    // decoding 16.6 MP per frame only to throw 95 % of it away was the single
+    // largest cost of AutoSync -- measured 116 s of a 130 s run on YIVR_0845.
+    // The proxy is accepted only if its frame count and duration match the
+    // main file exactly; otherwise (or with RENDER360_NO_PROXY set) the main
+    // file is decoded as before.
+    const QString decodePath = chooseDecodeSource(videoPath);
+
     // Open video
-    int ret = avformat_open_input(&formatCtx, videoPath.toUtf8().constData(), nullptr, nullptr);
+    int ret = avformat_open_input(&formatCtx, decodePath.toUtf8().constData(), nullptr, nullptr);
     if (ret < 0) {
-        qWarning() << "VisualRotation: failed to open video:" << videoPath;
+        qWarning() << "VisualRotation: failed to open video:" << decodePath;
         return false;
     }
 
@@ -367,15 +442,48 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
 // OpenCV's existing thread pool, and each worker owns its own ORB instance
 // because cv::ORB is not documented as thread-safe for concurrent detect calls.
 // ---------------------------------------------------------------------------
+// Valid-image mask for one fisheye half: pixels whose distorted radius is
+// inside the lens circle. ORB was detecting on the whole square, so up to 21 %
+// of its 800 features landed in the black corners outside the image circle;
+// those then went through the undistort's qBound(0, r, 1) clamp, which maps
+// every out-of-circle pixel onto the rim, and produced correspondences that
+// were geometrically meaningless. The mask uses the same normalisation as
+// pixelToBearing so the two agree exactly.
+static cv::Mat lensMaskFor(const VisualRotationComputer::LensParams &lens, int w, int h)
+{
+    cv::Mat m(h, w, CV_8UC1, cv::Scalar(0));
+    const double rotRad = -lens.rotation * PI / 180.0;
+    const double c = cos(rotRad), sn = sin(rotRad);
+    for (int y = 0; y < h; y++) {
+        uchar *row = m.ptr<uchar>(y);
+        const double py = (y + 0.5) / h;
+        for (int x = 0; x < w; x++) {
+            const double px = (x + 0.5) / w;
+            double dx = px - lens.cx, dy = py - lens.cy;
+            if (lens.hflip) dx = -dx;
+            const double dx2 = dx * c - dy * sn, dy2 = dx * sn + dy * c;
+            const double rDist = sqrt(dx2 * dx2 + dy2 * dy2) / lens.radius;
+            row[x] = (rDist <= 1.0) ? 255 : 0;
+        }
+    }
+    return m;
+}
+
 void VisualRotationComputer::computeFeatures(const QVector<FrameData> &frames,
                                              QVector<FrameFeatures> &out,
                                              int lensMask,
+                                             const LensParams &frontLens,
+                                             const LensParams &rearLens,
                                              const std::function<void(int)> &progressCb)
 {
     const bool useFront = (lensMask & LensFront) != 0;
     const bool useRear  = (lensMask & LensRear) != 0;
     const int n = frames.size();
     out.resize(n);
+    if (n == 0) return;
+
+    const cv::Mat maskFront = lensMaskFor(frontLens, frames[0].grayFront.cols, frames[0].grayFront.rows);
+    const cv::Mat maskRear  = lensMaskFor(rearLens,  frames[0].grayRear.cols,  frames[0].grayRear.rows);
 
     QAtomicInt done(0);
     // Chunked so progress can be reported from THIS thread; emitting Qt signals
@@ -387,12 +495,12 @@ void VisualRotationComputer::computeFeatures(const QVector<FrameData> &frames,
             auto orb = cv::ORB::create(ORB_FEATURES);
             for (int i = r.start; i < r.end; i++) {
                 if (useFront) {
-                    orb->detectAndCompute(frames[i].grayFront, cv::noArray(),
+                    orb->detectAndCompute(frames[i].grayFront, maskFront,
                                           out[i].kpFront, out[i].descFront);
                     g_detectCalls.fetchAndAddRelaxed(1);
                 }
                 if (useRear) {
-                    orb->detectAndCompute(frames[i].grayRear, cv::noArray(),
+                    orb->detectAndCompute(frames[i].grayRear, maskRear,
                                           out[i].kpRear, out[i].descRear);
                     g_detectCalls.fetchAndAddRelaxed(1);
                 }
@@ -537,49 +645,64 @@ QQuaternion VisualRotationComputer::solveRotation(const QVector<QVector3D> &bear
     // tighten toward a floor relative to the running RMS each iteration. Keeps
     // the good features while dropping genuine mismatches without the whole
     // solve collapsing to zero inliers.
+    //
+    // All per-correspondence arithmetic is scalar. The previous version built
+    // two heap cv::Mat_<double>(3,1) per correspondence per iteration and ran a
+    // full gemm dispatch for each 3x3 outer product -- with ~800 correspondences
+    // x 6 iterations x 3 loops x ~900 solves that was the dominant cost of the
+    // match+solve stage. Only the 3x3 SVD still goes through OpenCV.
+    double Rm[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) Rm[r][c] = R.at<double>(r, c);
+
+    auto residualAngle = [&](const double M[3][3], const QVector3D &p, const QVector3D &q) {
+        const double rx = M[0][0]*p.x() + M[0][1]*p.y() + M[0][2]*p.z();
+        const double ry = M[1][0]*p.x() + M[1][1]*p.y() + M[1][2]*p.z();
+        const double rz = M[2][0]*p.x() + M[2][1]*p.y() + M[2][2]*p.z();
+        const double dot = qBound(-1.0, rx*q.x() + ry*q.y() + rz*q.z(), 1.0);
+        return std::acos(dot);
+    };
+
     {
         double outlierThreshRad = OUTLIER_INITIAL_DEG * PI / 180.0;
         std::vector<bool> bestMask;
         int bestInliers = 0;
         double bestRms = 999.0;
-        cv::Mat bestR;
+        double bestR[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
 
+        cv::Mat H(3, 3, CV_64F), U, S, Vt;
         for (int iter = 0; iter < MAX_OUTLIER_ITERATIONS; ++iter) {
-            // Build covariance matrix H = sum(q_i * p_i^T) for inliers
-            cv::Mat H = cv::Mat::zeros(3, 3, CV_64F);
+            // H = sum(q_i * p_i^T) over inliers.
+            double h[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
             int inlierCount = 0;
             for (int i = 0; i < n; ++i) {
                 if (!inlierMask[i]) continue;
                 const auto &p = bearingsA[i];
                 const auto &q = bearingsB[i];
-                cv::Mat pVec = (cv::Mat_<double>(3, 1) << p.x(), p.y(), p.z());
-                cv::Mat qVec = (cv::Mat_<double>(3, 1) << q.x(), q.y(), q.z());
-                H += qVec * pVec.t();
+                const double pv[3] = {p.x(), p.y(), p.z()};
+                const double qv[3] = {q.x(), q.y(), q.z()};
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++)
+                        h[r][c] += qv[r] * pv[c];
                 inlierCount++;
             }
             if (inlierCount < 3) break;
 
-            cv::Mat U, S, Vt;
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) H.at<double>(r, c) = h[r][c];
             cv::SVD::compute(H, S, U, Vt);
-            R = Vt.t() * U.t();
-            if (cv::determinant(R) < 0) {
+            cv::Mat Rcv = Vt.t() * U.t();
+            if (cv::determinant(Rcv) < 0) {
                 cv::Mat V = Vt.t();
                 V.col(2) *= -1;
-                R = V * U.t();
+                Rcv = V * U.t();
             }
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) Rm[r][c] = Rcv.at<double>(r, c);
 
             // Residuals + candidate keep-set under the current threshold.
             std::vector<bool> newMask(n, false);
             double sumSq = 0.0;
             int keepCount = 0;
             for (int i = 0; i < n; ++i) {
-                const auto &p = bearingsA[i];
-                const auto &q = bearingsB[i];
-                cv::Mat pVec = (cv::Mat_<double>(3, 1) << p.x(), p.y(), p.z());
-                cv::Mat qVec = (cv::Mat_<double>(3, 1) << q.x(), q.y(), q.z());
-                cv::Mat Rp = R * pVec;
-                double dot = qBound(-1.0, Rp.dot(qVec), 1.0);
-                double angle = acos(dot);
+                const double angle = residualAngle(Rm, bearingsA[i], bearingsB[i]);
                 if (angle <= outlierThreshRad) {
                     newMask[i] = true;
                     sumSq += angle * angle;
@@ -595,7 +718,7 @@ QQuaternion VisualRotationComputer::solveRotation(const QVector<QVector3D> &bear
                 if (keepCount > bestInliers || curRms < bestRms) {
                     bestInliers = keepCount;
                     bestRms = curRms;
-                    bestR = R.clone();
+                    std::memcpy(bestR, Rm, sizeof(Rm));
                     bestMask = newMask;
                 }
             }
@@ -615,7 +738,7 @@ QQuaternion VisualRotationComputer::solveRotation(const QVector<QVector3D> &bear
         // Switch back to the best subset (a single bad tighten can otherwise
         // drop more features than intended).
         if (bestInliers >= 3) {
-            R = bestR.clone();
+            std::memcpy(Rm, bestR, sizeof(Rm));
             inlierMask = bestMask;
         }
     }
@@ -626,19 +749,14 @@ QQuaternion VisualRotationComputer::solveRotation(const QVector<QVector3D> &bear
         int finalInliers = 0;
         for (int i = 0; i < n; ++i) {
             if (!inlierMask[i]) continue;
-            const auto &p = bearingsA[i];
-            const auto &q = bearingsB[i];
-            cv::Mat pVec = (cv::Mat_<double>(3, 1) << p.x(), p.y(), p.z());
-            cv::Mat qVec = (cv::Mat_<double>(3, 1) << q.x(), q.y(), q.z());
-            cv::Mat Rp = R * pVec;
-            double dot = qBound(-1.0, Rp.dot(qVec), 1.0);
-            double angle = acos(dot);
+            const double angle = residualAngle(Rm, bearingsA[i], bearingsB[i]);
             sumSqFinal += angle * angle;
             finalInliers++;
         }
         inliers = finalInliers;
         rmsDeg = (finalInliers > 0) ? sqrt(sumSqFinal / finalInliers) * 180.0 / PI : 999.0;
     }
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) R.at<double>(r, c) = Rm[r][c];
 
     // Convert rotation matrix to quaternion
     double trace = R.at<double>(0, 0) + R.at<double>(1, 1) + R.at<double>(2, 2);
@@ -755,11 +873,12 @@ void VisualRotationComputer::compute(const QString &videoPath,
             // Detect ORB on every frame up front, in parallel, instead of
             // inside the hop search where each frame was re-detected.
             QVector<FrameFeatures> feats;
-            computeFeatures(frames, feats, lensMask, [&](int nDone) {
+            computeFeatures(frames, feats, lensMask, frontLens, rearLens, [&](int nDone) {
                 emit progressChanged(0.5 + 0.15 * (double)nDone / qMax(1, frames.size()),
                                      QStringLiteral("Detecting features..."));
             });
 
+            const qint64 msFeatures = tMatch.elapsed();
             emit progressChanged(0.65, QStringLiteral("Matching features..."));
 
             // 2. Match features and solve rotations with motion-adaptive density.
@@ -772,9 +891,6 @@ void VisualRotationComputer::compute(const QString &videoPath,
             //    Net effect: still regions are sampled coarsely (few, large
             //    hops) and fast regions densely (small hops) — motion-adaptive
             //    density with no memory cost beyond the decoded frames.
-            QVector<VisualRotationPair> pairs;
-            QQuaternion prevRotation;   // motion-continuity seed for the solver
-
             const int maxHop = frameSkip + 1;   // accepted wide hop (DEFAULT_FRAME_STRIDE)
             constexpr int minHop = 1;
             // Quality bar for accepting a hop: enough inliers and not an absurd
@@ -782,67 +898,89 @@ void VisualRotationComputer::compute(const QString &videoPath,
             constexpr int HOP_MIN_INLIERS = 3;
             constexpr double HOP_MAX_RMS_DEG = 30.0;
 
-            int i = 0;
-            while (i < frames.size() - 1) {
-                int k = maxHop;
-                int attempts = 0;
-                QQuaternion bestD; bool bestValid = false;
-                int bestInl = 0; double bestRms = 999.0;
-                int bestK = 1;
+            // The greedy walk over one contiguous frame range [lo, hi].
+            auto walk = [&](int lo, int hi, QVector<VisualRotationPair> &outPairs) {
+                QQuaternion prevRotation;
+                int i = lo;
+                while (i < hi) {
+                    int k = maxHop;
+                    QQuaternion bestD; bool bestValid = false;
+                    int bestInl = 0; double bestRms = 999.0;
+                    int bestK = 1;
 
-                // Try progressively smaller hops until we get a reliable solve
-                // or reach minHop.
-                while (k >= minHop && i + k < frames.size()) {
-                    attempts++;
-                    double fraction = 0.65 + 0.35 * (double)(i + k) / frames.size();
-                    emit progressChanged(fraction, QStringLiteral("Processing frame %1/%2").arg(i + k).arg(frames.size()));
+                    while (k >= minHop && i + k <= hi) {
+                        QVector<QVector3D> bA, bB;
+                        if (!matchFeatures(frames[i], frames[i + k], feats[i], feats[i + k],
+                                           frontLens, rearLens, bA, bB, lensMask)) {
+                            k = k / 2;
+                            if (k < minHop) k = minHop;
+                            if (i + k > hi) break;
+                            continue;
+                        }
 
-                    QVector<QVector3D> bA, bB;
-                    if (!matchFeatures(frames[i], frames[i + k], feats[i], feats[i + k],
-                                       frontLens, rearLens, bA, bB, lensMask)) {
-                        k = k / 2;
-                        if (k < minHop) k = minHop;
-                        if (i + k >= frames.size()) { k = minHop; if (i + k >= frames.size()) break; }
-                        continue;
+                        int inl = 0; double rms = 0.0;
+                        g_solveCalls.fetchAndAddRelaxed(1);
+                        QQuaternion dR = solveRotation(bA, bB, inl, rms, prevRotation);
+
+                        if (inl >= HOP_MIN_INLIERS && rms <= HOP_MAX_RMS_DEG) {
+                            bestValid = true;
+                            bestD = dR; bestInl = inl; bestRms = rms; bestK = k;
+                            break;  // this hop is reliable — accept it
+                        }
+                        if (inl > bestInl && inl >= 3) {
+                            bestValid = true;
+                            bestD = dR; bestInl = inl; bestRms = rms; bestK = k;
+                        }
+                        if (k <= 1)
+                            break;
+                        k = (k + 1) / 2;   // halve toward the nearest frame
                     }
 
-                    int inl = 0; double rms = 0.0;
-                    g_solveCalls.fetchAndAddRelaxed(1);
-                    QQuaternion dR = solveRotation(bA, bB, inl, rms, prevRotation);
-
-                    if (inl >= HOP_MIN_INLIERS && rms <= HOP_MAX_RMS_DEG) {
-                        bestValid = true;
-                        bestD = dR; bestInl = inl; bestRms = rms; bestK = k;
-                        break;  // this hop is reliable — accept it
+                    if (bestValid) {
+                        VisualRotationPair pair;
+                        pair.t0 = frames[i].timestamp;
+                        pair.t1 = frames[i + bestK].timestamp;
+                        pair.deltaR = bestD;
+                        pair.inliers = bestInl;
+                        pair.rmsDeg = bestRms;
+                        outPairs.append(pair);
+                        prevRotation = bestD;
                     }
-
-                    // Unreliable: the hop is too wide for the motion here.
-                    // Record the best seen (fallback) and try a narrower hop.
-                    if (inl > bestInl && inl >= 3) {
-                        bestValid = true;
-                        bestD = dR; bestInl = inl; bestRms = rms; bestK = k;
-                    }
-                    if (k <= 1)
-                        break;
-                    k = (k + 1) / 2;   // halve toward the nearest frame
+                    i += (bestValid && bestK >= 1) ? bestK : 1;  // always advance
                 }
+            };
 
-                if (bestValid) {
-                    VisualRotationPair pair;
-                    pair.t0 = frames[i].timestamp;
-                    pair.t1 = frames[i + bestK].timestamp;
-                    pair.deltaR = bestD;
-                    pair.inliers = bestInl;
-                    pair.rmsDeg = bestRms;
-                    pairs.append(pair);
-                    prevRotation = bestD;
-                }
-                i += (bestValid && bestK >= 1) ? bestK : 1;  // always advance
+            // 2. Match features and solve rotations with motion-adaptive density
+            //    (greedy hop walk, see walk()). The walk is sequential within a
+            //    range but has no state that matters across a range boundary
+            //    (prevRotation is only a solver seed), so split the frames into
+            //    one contiguous segment per core and walk them concurrently.
+            //    Segments share their boundary frame, so the only cost is that
+            //    a hop cannot straddle a boundary -- at most one pair per split
+            //    is shorter than it would otherwise have been. Pairs come out
+            //    ordered because the segments are concatenated in order.
+            QVector<VisualRotationPair> pairs;
+            {
+                const int nFrames = frames.size();
+                const int nSeg = qBound(1, qMin(cv::getNumThreads(), nFrames / 40), 16);
+                QVector<QVector<VisualRotationPair>> segPairs(nSeg);
+                QAtomicInt segsDone(0);
+                cv::parallel_for_(cv::Range(0, nSeg), [&](const cv::Range &r) {
+                    for (int sIdx = r.start; sIdx < r.end; sIdx++) {
+                        const int lo = (int)((qint64)(nFrames - 1) * sIdx / nSeg);
+                        const int hi = (int)((qint64)(nFrames - 1) * (sIdx + 1) / nSeg);
+                        walk(lo, hi, segPairs[sIdx]);
+                        segsDone.fetchAndAddRelaxed(1);
+                    }
+                }, nSeg);
+                for (const auto &sp : segPairs) pairs += sp;
+                emit progressChanged(0.99, QStringLiteral("Processing frame %1/%2")
+                                     .arg(nFrames).arg(nFrames));
             }
 
-            qInfo("VisualRotation timing: decode %lld ms (%d frames), match+solve %lld ms, "
-                  "%d detectAndCompute calls, %d solves, %d pairs",
-                  msDecode, (int)frames.size(), tMatch.elapsed(),
+            qInfo("VisualRotation timing: decode %lld ms (%d frames), features %lld ms, "
+                  "match+solve %lld ms, %d detectAndCompute calls, %d solves, %d pairs",
+                  msDecode, (int)frames.size(), msFeatures, tMatch.elapsed() - msFeatures,
                   g_detectCalls.loadRelaxed(), g_solveCalls.loadRelaxed(), (int)pairs.size());
             emit progressChanged(1.0, QStringLiteral("Complete"));
             emit rotationComputed(pairs);
