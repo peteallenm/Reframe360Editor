@@ -121,6 +121,11 @@ static double smoothstep01(double e0, double e1, double x)
 static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                           int outW, int outH)
 {
+    // Tone-curve LUT (256x1 RGBA8888) or null when curves are identity.
+    const QImage lutImg = (s.curves && !s.curveLut.isNull())
+                          ? s.curveLut.convertToFormat(QImage::Format_RGBA8888) : QImage();
+    const uchar *lutLine = lutImg.isNull() ? nullptr : lutImg.constScanLine(0);
+
     QImage img(outW, outH, QImage::Format_RGB888);
 
     const quint8 *Y = reinterpret_cast<const quint8 *>(frame.yData.constData());
@@ -297,6 +302,12 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                 px3[0] = (quint8)qRound(qBound(0.0, r, 255.0));
                 px3[1] = (quint8)qRound(qBound(0.0, g, 255.0));
                 px3[2] = (quint8)qRound(qBound(0.0, b, 255.0));
+                // Tone curves last (mirror of project.frag's u_curveLut lookup).
+                if (lutLine) {
+                    px3[0] = lutLine[px3[0] * 4 + 0];
+                    px3[1] = lutLine[px3[1] * 4 + 1];
+                    px3[2] = lutLine[px3[2] * 4 + 2];
+                }
             }
         }
     };

@@ -8,6 +8,7 @@ layout(binding = 2) uniform sampler2D u_texU;
 layout(binding = 3) uniform sampler2D u_texV;
 layout(binding = 4) uniform sampler2D u_flow;  // optical-flow field (RG, encoded)
 layout(binding = 5) uniform sampler2D u_seam;  // 1D seam curve (W×1, R8)
+layout(binding = 6) uniform sampler2D u_curveLut; // tone curves, 256x1 RGBA8 (R/G/B LUTs)
 
 // NOTE: GpuRenderer::flattenUniformBlock turns every non-empty line in the
 // block below into "uniform <line>;", so standalone comment lines are NOT
@@ -71,7 +72,8 @@ layout(std140, binding = 0) uniform Uniforms {
     float _padH1;          // offset 332
     int u_seamStitch;      // offset 336 (1 = use seam texture for blend placement)
     float u_seamStrength;  // offset 340 (0 = equator, 1 = full seam)
-    float _padI[2];        // offset 344 -> struct rounds to 352
+    int u_curves;          // offset 344 (1 = apply the tone-curve LUT)
+    float _padI1;          // offset 348 -> struct rounds to 352
 };
 
 const float PI = 3.14159265359;
@@ -305,6 +307,17 @@ void main() {
     // Contrast about 0.5 (1 = neutral) then brightness offset (0 = neutral).
     rgb = (rgb - 0.5) * u_contrast + 0.5;
     rgb += u_brightness;
+    rgb = clamp(rgb, 0.0, 1.0);
 
-    fragColor = vec4(clamp(rgb, 0.0, 1.0), qt_Opacity);
+    // Tone curves last: master then per-channel, pre-baked into one LUT per
+    // output channel (see ColorGrade::rebuildLut). Texel centres: 256 entries
+    // over [0,1] -> sample at (v*255 + 0.5)/256.
+    if (u_curves != 0) {
+        vec3 lu = (rgb * 255.0 + 0.5) / 256.0;
+        rgb = vec3(texture(u_curveLut, vec2(lu.r, 0.5)).r,
+                   texture(u_curveLut, vec2(lu.g, 0.5)).g,
+                   texture(u_curveLut, vec2(lu.b, 0.5)).b);
+    }
+
+    fragColor = vec4(rgb, qt_Opacity);
 }

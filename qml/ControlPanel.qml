@@ -3,15 +3,19 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
+// Side panel. Tabs are grouped by WHEN you touch them:
+//   View      framing you keyframe while watching (yaw/pitch/roll/FOV, projection)
+//   Stabilise set once per clip: stabilisation mode + Auto sync (+ Advanced)
+//   Stitch    everything about the two lenses: lens mode, parallax, calibration
+//   Colour    primaries + tone curves
+// A status strip under the tabs shows the per-clip state from any tab.
 Item {
     id: controlPanel
 
     // A labelled slider whose value is bound to a target property and written
-    // back through an explicit callback. Each instance binds its value/onUserChange
-    // directly (e.g. value: app.colorGrade.brightness), so no dynamic property
-    // lookup is involved anywhere. onMoved fires only on user interaction, and
-    // the Binding keeps the handle in sync with external changes (Reset All,
-    // settings load) even after the user has dragged it.
+    // back through an explicit callback. onValueChanged fires only while the
+    // user drags (pressed), and the Binding keeps the handle in sync with
+    // external changes (Reset, settings load) even after the user has dragged.
     component SliderRow: RowLayout {
         id: row
         Layout.fillWidth: true
@@ -24,6 +28,7 @@ Item {
         property int decimals: 2
         property string suffixText: ""
         property bool controlEnabled: true
+        property string tip: ""
         enabled: row.controlEnabled
 
         Label {
@@ -36,8 +41,9 @@ Item {
             from: row.min
             to: row.max
             stepSize: row.step
-            // Write back while the user is dragging (same pattern as the View
-            // tab's yaw/pitch sliders), so the preview updates live.
+            hoverEnabled: row.tip.length > 0
+            ToolTip.text: row.tip
+            ToolTip.visible: hovered && row.tip.length > 0
             onValueChanged: { if (pressed && row.onUserChange) row.onUserChange(value) }
             Binding {
                 target: slider
@@ -51,16 +57,31 @@ Item {
         }
     }
 
-    component SectionHeader: Label {
-        id: header
-        property string sectionTitle: ""
-        property color accent: "#ddd"
-        text: header.sectionTitle
-        font.bold: true
-        font.pixelSize: 12
-        color: header.accent
+    // A collapsible section for rarely-needed controls.
+    component Disclosure: ColumnLayout {
+        id: disc
+        property string title: ""
+        property bool open: false
+        default property alias content: discContent.data
         Layout.fillWidth: true
-        Layout.topMargin: 6
+        spacing: 4
+
+        RowLayout {
+            Layout.fillWidth: true
+            Label {
+                text: (disc.open ? "▾  " : "▸  ") + disc.title
+                font.pixelSize: 12
+                color: "#bbb"
+                Layout.fillWidth: true
+                MouseArea { anchors.fill: parent; onClicked: disc.open = !disc.open; cursorShape: Qt.PointingHandCursor }
+            }
+        }
+        ColumnLayout {
+            id: discContent
+            visible: disc.open
+            Layout.fillWidth: true
+            spacing: 8
+        }
     }
 
     ColumnLayout {
@@ -73,9 +94,43 @@ Item {
             Layout.fillWidth: true
             Material.elevation: 2
 
-            TabButton { text: qsTr("View") }
-            TabButton { text: qsTr("Colours") }
-            TabButton { text: qsTr("Lens") }
+            // Four tabs in a 340 px panel: keep the labels short and the font small
+            // enough that none of them elides.
+            TabButton { text: qsTr("View"); font.pixelSize: 12 }
+            TabButton { text: qsTr("Stabilise"); font.pixelSize: 12 }
+            TabButton { text: qsTr("Stitch"); font.pixelSize: 12 }
+            TabButton { text: qsTr("Colour"); font.pixelSize: 12 }
+        }
+
+        // Per-clip state, visible from any tab.
+        Rectangle {
+            Layout.fillWidth: true
+            height: 22
+            color: "#262626"
+            Label {
+                anchors.fill: parent
+                anchors.leftMargin: 10
+                anchors.rightMargin: 10
+                verticalAlignment: Text.AlignVCenter
+                font.pixelSize: 11
+                color: "#9a9a9a"
+                elide: Text.ElideRight
+                text: {
+                    var parts = []
+                    if (!app.videoPath) return qsTr("No clip loaded")
+                    parts.push(app.imuStabilize
+                               ? (app.imuSmoothing > 0.9 ? qsTr("Hold world steady") : qsTr("Follow camera"))
+                               : qsTr("Not stabilised"))
+                    if (app.imuStabilize)
+                        parts.push(app.autoSyncRunning ? qsTr("syncing…")
+                                                       : qsTr("sync %1 s").arg(app.imuSyncOffset.toFixed(3)))
+                    parts.push(app.activeLens === 2
+                               ? (app.flowStitch ? qsTr("stitch: parallax") : qsTr("stitch: plain blend"))
+                               : (app.activeLens === 0 ? qsTr("front lens only") : qsTr("rear lens only")))
+                    if (app.colorGrade.curvesActive) parts.push(qsTr("curves"))
+                    return parts.join("  ·  ")
+                }
+            }
         }
 
         StackLayout {
@@ -83,7 +138,7 @@ Item {
             Layout.fillHeight: true
             currentIndex: panelTabs.currentIndex
 
-            // =========================== View tab ===========================
+            // =========================== View ===========================
             ScrollView {
                 contentWidth: availableWidth
                 clip: true
@@ -105,7 +160,6 @@ Item {
                             RowLayout {
                                 Label { text: qsTr("Yaw:"); Layout.preferredWidth: 60 }
                                 Slider {
-                                    id: yawSlider
                                     Layout.fillWidth: true
                                     from: -180; to: 180; stepSize: 1
                                     value: app.yaw
@@ -113,11 +167,9 @@ Item {
                                 }
                                 Label { text: app.yaw.toFixed(0) + "°"; Layout.preferredWidth: 50 }
                             }
-
                             RowLayout {
                                 Label { text: qsTr("Pitch:"); Layout.preferredWidth: 60 }
                                 Slider {
-                                    id: pitchSlider
                                     Layout.fillWidth: true
                                     // Pitch is clamped away from the vertical poles to keep
                                     // yaw/roll from swapping (see App::setPitch).
@@ -127,11 +179,9 @@ Item {
                                 }
                                 Label { text: app.pitch.toFixed(0) + "°"; Layout.preferredWidth: 50 }
                             }
-
                             RowLayout {
                                 Label { text: qsTr("Roll:"); Layout.preferredWidth: 60 }
                                 Slider {
-                                    id: rollSlider
                                     Layout.fillWidth: true
                                     from: -180; to: 180; stepSize: 1
                                     value: app.roll
@@ -139,11 +189,9 @@ Item {
                                 }
                                 Label { text: app.roll.toFixed(0) + "°"; Layout.preferredWidth: 50 }
                             }
-
                             RowLayout {
                                 Label { text: qsTr("FOV:"); Layout.preferredWidth: 60 }
                                 Slider {
-                                    id: fovSlider
                                     Layout.fillWidth: true
                                     from: 10; to: 180; stepSize: 1
                                     value: app.fov
@@ -151,40 +199,45 @@ Item {
                                 }
                                 Label { text: app.fov.toFixed(0) + "°"; Layout.preferredWidth: 50 }
                             }
-                        }
-                    }
 
-                    GroupBox {
-                        title: qsTr("Lens Selection")
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
-                            anchors.fill: parent
-                            spacing: 8
-
-                            ComboBox {
-                                id: lensCombo
+                            Label {
+                                text: qsTr("Drag the video to look around. Keyframes (timeline) record these four values.")
+                                font.pixelSize: 10
+                                color: "#888"
+                                wrapMode: Text.Wrap
                                 Layout.fillWidth: true
-                                model: [qsTr("Front Lens"), qsTr("Rear Lens"), qsTr("Auto Stitch")]
-                                currentIndex: app.activeLens
-                                onCurrentIndexChanged: app.activeLens = currentIndex
-                            }
-
-                            RowLayout {
-                                Label { text: qsTr("Projection:"); Layout.preferredWidth: 80 }
-                                ComboBox {
-                                    id: projectionCombo
-                                    Layout.fillWidth: true
-                                    model: [qsTr("Perspective"), qsTr("Equirectangular"), qsTr("Stereographic"), qsTr("SportsView")]
-                                    currentIndex: app.projection
-                                    onCurrentIndexChanged: app.projection = currentIndex
-                                }
                             }
                         }
                     }
 
                     GroupBox {
-                        title: qsTr("IMU Stabilization")
+                        title: qsTr("Projection")
+                        Layout.fillWidth: true
+                        ComboBox {
+                            anchors.fill: parent
+                            model: [qsTr("Perspective"), qsTr("Equirectangular"), qsTr("Stereographic"), qsTr("SportsView")]
+                            currentIndex: app.projection
+                            onCurrentIndexChanged: app.projection = currentIndex
+                        }
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
+
+            // ========================= Stabilise =========================
+            ScrollView {
+                contentWidth: availableWidth
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 16
+
+                    Item { height: 16 }
+
+                    GroupBox {
+                        title: qsTr("Stabilisation")
                         Layout.fillWidth: true
 
                         ColumnLayout {
@@ -193,155 +246,174 @@ Item {
 
                             CheckBox {
                                 id: imuCheck
-                                text: qsTr("Auto-stabilize")
+                                text: qsTr("Stabilise (motion sensor)")
                                 checked: app.imuStabilize
                                 onCheckedChanged: app.imuStabilize = checked
                             }
 
-                            RowLayout {
-                                enabled: imuCheck.checked
-                                Label { text: qsTr("Smoothing:"); Layout.preferredWidth: 80 }
-                                Slider {
-                                    id: smoothingSlider
-                                    Layout.fillWidth: true
-                                    from: 0.0; to: 1.0
-                                    value: app.imuSmoothing
-                                    hoverEnabled: true
-                                    ToolTip.text: smoothingSlider.value > 0.9
-                                        ? qsTr("Hold world steady: cancels all camera rotation (even 360°) so the scene is pinned to its first frame.")
-                                        : qsTr("Remove shake, keep motion: smooths out high-frequency jitter while pans/tilts still follow the camera.")
-                                    ToolTip.visible: hovered
-                                    onMoved: app.imuSmoothing = value
-                                }
-                                Label { text: smoothingSlider.value.toFixed(2); Layout.preferredWidth: 40 }
-                            }
-
-                            // The "Drift corr" (Mahony integral gain) slider was removed: per-sample
-                            // accelerometer feedback proved harmful on this camera's footage and
-                            // the integrator no longer uses it. Drift is handled automatically
-                            // (measured bias, gravity re-level, visual fusion).
-                            
-
-                            RowLayout {
-                                enabled: imuCheck.checked
-                                Label { text: qsTr("Sync offset:"); Layout.preferredWidth: 80 }
-                                Slider {
-                                    id: syncSlider
-                                    Layout.fillWidth: true
-                                    from: 0; to: 0.3
-                                    value: app.imuSyncOffset
-                                    stepSize: 0.01
-                                    onMoved: app.imuSyncOffset = value
-                                }
-                                Label { text: syncSlider.value.toFixed(2) + "s"; Layout.preferredWidth: 50 }
-                            }
-
-                            RowLayout {
-                                enabled: imuCheck.checked
-                                Label { text: qsTr("Drift:"); Layout.preferredWidth: 80 }
-                                Slider {
-                                    id: driftSlider
-                                    Layout.fillWidth: true
-                                    // +-1e-3 s/s. The old +-0.01 range let the
-                                    // slider reach 20x what two crystal clocks
-                                    // can physically disagree by, so most of
-                                    // its travel produced nonsense.
-                                    from: -0.001; to: 0.001
-                                    value: app.imuDrift
-                                    stepSize: 0.00001
-                                    onMoved: app.imuDrift = value
-                                }
-                                Label { text: (driftSlider.value * 1000).toFixed(2) + " ms/s"; Layout.preferredWidth: 50 }
-                            }
-
+                            // The two behaviours used to be the ends of one slider with a
+                            // hidden threshold at 0.9. They are different things, so they
+                            // are a choice; the smoothing amount only exists in Follow mode.
+                            Label { text: qsTr("Mode"); font.pixelSize: 11; color: "#aaa"; enabled: imuCheck.checked }
                             RowLayout {
                                 enabled: imuCheck.checked
                                 Layout.fillWidth: true
-                                spacing: 6
+                                property real followAmount: app.imuSmoothing > 0.9 ? 0.5 : app.imuSmoothing
+                                RadioButton {
+                                    id: followMode
+                                    text: qsTr("Follow camera")
+                                    checked: app.imuSmoothing <= 0.9
+                                    onClicked: app.imuSmoothing = parent.followAmount
+                                    ToolTip.text: qsTr("Removes shake but keeps your pans and tilts.")
+                                    ToolTip.visible: hovered
+                                }
+                                RadioButton {
+                                    id: holdMode
+                                    text: qsTr("Hold world steady")
+                                    checked: app.imuSmoothing > 0.9
+                                    onClicked: app.imuSmoothing = 1.0
+                                    ToolTip.text: qsTr("Cancels all camera rotation: the scene stays fixed and you choose where to look with the View controls.")
+                                    ToolTip.visible: hovered
+                                }
+                            }
 
+                            SliderRow {
+                                labelText: qsTr("Smoothing:")
+                                value: Math.min(app.imuSmoothing, 0.9)
+                                onUserChange: (v) => app.imuSmoothing = v
+                                min: 0; max: 0.9; step: 0.01
+                                controlEnabled: imuCheck.checked && followMode.checked
+                                visible: followMode.checked
+                                tip: qsTr("How much of the camera's own motion to keep. Low = follows the camera closely, high = smooth, floaty motion.")
+                            }
+
+                            Rectangle { Layout.fillWidth: true; height: 1; color: "#444"; Layout.topMargin: 4 }
+
+                            // Auto sync: aligns the sensor clock to the video and runs the
+                            // optical yaw correction. Everything else is automatic.
+                            RowLayout {
+                                enabled: imuCheck.checked
+                                Layout.fillWidth: true
+                                spacing: 8
                                 Button {
                                     text: qsTr("Auto sync")
                                     enabled: !app.autoSyncRunning && imuCheck.checked
                                     onClicked: app.autoSyncAndCalibrate()
+                                    ToolTip.text: qsTr("Aligns the motion sensor to the video by tracking the picture, then adds optical yaw-drift correction. Takes ~20 s on a 2-minute clip.")
+                                    ToolTip.visible: hovered
                                 }
-
                                 Label {
                                     id: autoSyncLabel
                                     text: app.autoSyncRunning
                                           ? qsTr("Syncing… %1%").arg((app.autoSyncProgress * 100).toFixed(0))
-                                          : app.autoSyncStatus
+                                          : (app.autoSyncStatus.length ? app.autoSyncStatus
+                                                                       : qsTr("Sync offset %1 s").arg(app.imuSyncOffset.toFixed(3)))
                                     font.pixelSize: 11
                                     color: app.autoSyncRunning ? "#aaa" : "#8f8"
                                     Layout.fillWidth: true
-                                    // Take only the space left over. Without this the
-                                    // label's implicitWidth is the FULL untruncated
-                                    // status text, which propagates up through the
-                                    // GroupBox and forces the whole panel wider than
-                                    // the window — elide affects painting, not the
-                                    // width the layout asks for.
                                     Layout.preferredWidth: 0
                                     Layout.minimumWidth: 0
                                     elide: Text.ElideRight
-                                    // Status messages can be long (a rejected
-                                    // calibration explains why); the full text lives
-                                    // in the tooltip rather than in the layout.
-                                    // Label is not a hoverable Control, so hover
-                                    // comes from a HoverHandler.
                                     HoverHandler { id: autoSyncHover }
                                     ToolTip.text: autoSyncLabel.text
                                     ToolTip.visible: autoSyncHover.hovered && autoSyncLabel.truncated
                                 }
                             }
 
-                            // A stored gyro calibration is re-applied silently on
-                            // every load, so a bad one is otherwise invisible and
-                            // permanent. These are the undo and the (deliberately
-                            // manual) promote — Auto sync never writes the
-                            // camera-wide default by itself.
-                            // A GridLayout, not a RowLayout: three side-by-side
-                            // buttons demand the SUM of their widths as a minimum,
-                            // which is what pushed this panel past the window edge.
-                            // Wrapped into two columns with each button free to
-                            // shrink, the minimum is one button wide.
-                            GridLayout {
-                                enabled: imuCheck.checked && !app.autoSyncRunning
-                                Layout.fillWidth: true
-                                columns: 2
-                                columnSpacing: 6
-                                rowSpacing: 6
+                            Disclosure {
+                                title: qsTr("Advanced")
+                                enabled: imuCheck.checked
 
-                                Button {
-                                    text: qsTr("Clear video cal")
-                                    Layout.fillWidth: true
-                                    ToolTip.text: qsTr("Discard this video's stored gyro calibration and re-integrate from the raw IMU.")
-                                    ToolTip.visible: hovered
-                                    onClicked: app.clearGyroCalibration()
+                                SliderRow {
+                                    labelText: qsTr("Sync offset:")
+                                    value: app.imuSyncOffset
+                                    onUserChange: (v) => app.imuSyncOffset = v
+                                    min: 0; max: 0.3; step: 0.001; decimals: 3; suffixText: " s"
+                                    tip: qsTr("Sensor time minus video time. Auto sync measures this; only touch it if the stabilisation looks a fraction of a second early or late.")
+                                }
+                                SliderRow {
+                                    labelText: qsTr("Clock drift:")
+                                    value: app.imuDrift * 1000
+                                    onUserChange: (v) => app.imuDrift = v / 1000
+                                    min: -1; max: 1; step: 0.01; decimals: 2; suffixText: " ms/s"
+                                    tip: qsTr("Relative rate of the two clocks. Two crystal clocks differ by well under 0.5 ms/s; Auto sync leaves this at 0 unless it can measure otherwise.")
                                 }
 
-                                Button {
-                                    text: qsTr("Clear camera cal")
+                                Label {
+                                    text: qsTr("Gyro calibration is fitted by Auto sync and accepted only when physically plausible. These manage what is stored.")
+                                    font.pixelSize: 10
+                                    color: "#888"
+                                    wrapMode: Text.Wrap
                                     Layout.fillWidth: true
-                                    ToolTip.text: qsTr("Discard the camera-wide gyro calibration that is applied to every clip without one of its own.")
-                                    ToolTip.visible: hovered
-                                    onClicked: app.clearCameraGyroDefaults()
                                 }
-
-                                Button {
-                                    text: qsTr("Set as camera default")
+                                GridLayout {
+                                    enabled: !app.autoSyncRunning
                                     Layout.fillWidth: true
-                                    Layout.columnSpan: 2
-                                    ToolTip.text: qsTr("Apply this video's calibration to every future clip that has none of its own.")
-                                    ToolTip.visible: hovered
-                                    onClicked: app.saveGyroCalibrationAsCameraDefault()
+                                    columns: 2
+                                    columnSpacing: 6
+                                    rowSpacing: 6
+                                    Button {
+                                        text: qsTr("Clear video cal")
+                                        Layout.fillWidth: true
+                                        ToolTip.text: qsTr("Discard this video's stored gyro calibration and re-integrate from the raw sensor.")
+                                        ToolTip.visible: hovered
+                                        onClicked: app.clearGyroCalibration()
+                                    }
+                                    Button {
+                                        text: qsTr("Clear camera cal")
+                                        Layout.fillWidth: true
+                                        ToolTip.text: qsTr("Discard the camera-wide gyro calibration applied to every clip without one of its own.")
+                                        ToolTip.visible: hovered
+                                        onClicked: app.clearCameraGyroDefaults()
+                                    }
+                                    Button {
+                                        text: qsTr("Set as camera default")
+                                        Layout.fillWidth: true
+                                        Layout.columnSpan: 2
+                                        ToolTip.text: qsTr("Apply this video's calibration to every future clip that has none of its own.")
+                                        ToolTip.visible: hovered
+                                        onClicked: app.saveGyroCalibrationAsCameraDefault()
+                                    }
                                 }
                             }
                         }
                     }
 
+                    Item { Layout.fillHeight: true }
+                }
+            }
+
+            // =========================== Stitch ===========================
+            ScrollView {
+                contentWidth: availableWidth
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 16
+
+                    Item { height: 16 }
+
                     GroupBox {
-                        title: qsTr("Flow Stitching")
+                        title: qsTr("Lenses")
                         Layout.fillWidth: true
-                        ToolTip.text: qsTr("Measures the parallax between the two lenses across the seam band (a 1-D match along the meridians, where the parallax of back-to-back lenses lives) and morphs both views toward each other before blending, so near and far objects line up at the same time.")
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: [qsTr("Front lens only"), qsTr("Rear lens only"), qsTr("Both (stitched)")]
+                                currentIndex: app.activeLens
+                                onCurrentIndexChanged: app.activeLens = currentIndex
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: qsTr("Parallax Correction")
+                        Layout.fillWidth: true
+                        enabled: app.activeLens === 2
+                        ToolTip.text: qsTr("Measures how far apart the two lenses see each part of the seam and morphs both views toward each other, so near and far objects line up at the same time.")
                         ToolTip.visible: hovered
 
                         ColumnLayout {
@@ -354,56 +426,40 @@ Item {
                                 checked: app.flowStitch
                                 onCheckedChanged: app.flowStitch = checked
                             }
-
                             SliderRow {
                                 labelText: qsTr("Strength:")
                                 value: app.flowStrength
                                 onUserChange: (v) => app.flowStrength = v
                                 min: 0; max: 2; step: 0.05
                                 controlEnabled: flowCheck.checked
+                                tip: qsTr("1 = the measured parallax. Lower if the seam looks over-corrected.")
                             }
-
-                            // Max parallax searched, in seam-band texels (about 4.3 per
-                            // degree). 30 = 7 deg, enough for objects ~0.3 m away.
                             SliderRow {
                                 labelText: qsTr("Max parallax:")
                                 value: app.flowIterations
                                 onUserChange: (v) => app.flowIterations = v
                                 min: 4; max: 60; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
+                                tip: qsTr("Search range, in seam-band texels (about 4 per degree). 30 covers objects down to ~30 cm.")
                             }
-
-                            // Smoothing radius of the disparity field, in texels.
                             SliderRow {
                                 labelText: qsTr("Smoothness:")
                                 value: app.flowAlpha
                                 onUserChange: (v) => app.flowAlpha = v
                                 min: 1; max: 30; step: 1; decimals: 0
                                 controlEnabled: flowCheck.checked
+                                tip: qsTr("Smoothing radius of the parallax map. Higher hides noise, lower follows object edges more tightly.")
                             }
 
-                            Rectangle {
-                                Layout.fillWidth: true
-                                height: 1
-                                color: "#444"
-                                Layout.topMargin: 4
-                            }
-
-                            Label {
-                                text: qsTr("Seam Placement")
-                                font.bold: true
-                                font.pixelSize: 11
-                                Layout.fillWidth: true
-                            }
+                            Rectangle { Layout.fillWidth: true; height: 1; color: "#444"; Layout.topMargin: 4 }
 
                             CheckBox {
                                 id: seamCheck
-                                text: qsTr("Feature-driven seam")
+                                text: qsTr("Feature-avoiding seam")
                                 checked: app.seamStitch
                                 onCheckedChanged: app.seamStitch = checked
                                 enabled: flowCheck.checked
                             }
-
                             SliderRow {
                                 labelText: qsTr("Seam strength:")
                                 value: app.seamStrength
@@ -414,11 +470,77 @@ Item {
                         }
                     }
 
+                    GroupBox {
+                        title: qsTr("Lens Calibration")
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 8
+
+                            ComboBox {
+                                id: presetCombo
+                                Layout.fillWidth: true
+                                model: app.calibrationPresets
+                                textRole: "name"
+                                onActivated: {
+                                    app.calibrationPresets.loadPreset(currentIndex, app.currentCalibration)
+                                    presetNameField.text = presetCombo.currentText
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+                                TextField {
+                                    id: presetNameField
+                                    Layout.fillWidth: true
+                                    placeholderText: qsTr("Profile name")
+                                }
+                                Button {
+                                    text: qsTr("Save")
+                                    enabled: presetNameField.text.trim().length > 0
+                                    onClicked: {
+                                        app.calibrationPresets.savePreset(presetNameField.text, app.currentCalibration)
+                                        presetNameField.clear()
+                                    }
+                                }
+                                Button {
+                                    text: qsTr("Delete")
+                                    enabled: presetCombo.count > 0
+                                    onClicked: app.calibrationPresets.removePreset(presetCombo.currentIndex)
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 6
+                                Button {
+                                    text: qsTr("Set as default")
+                                    Layout.fillWidth: true
+                                    enabled: presetCombo.count > 0
+                                    onClicked: {
+                                        app.calibrationPresets.setDefaultPreset(presetCombo.currentIndex)
+                                        app.calibrationPresets.loadPreset(presetCombo.currentIndex, app.currentCalibration)
+                                    }
+                                }
+                                Button {
+                                    text: qsTr("Edit calibration…")
+                                    Layout.fillWidth: true
+                                    onClicked: calibrationDialog.open()
+                                }
+                            }
+                            Label {
+                                text: qsTr("Default profile: ") + (app.calibrationPresets.defaultPresetName() || qsTr("(none)"))
+                                font.pixelSize: 11
+                                color: "#aaa"
+                            }
+                        }
+                    }
+
                     Item { Layout.fillHeight: true }
                 }
             }
 
-            // ======================= Colours tab =====================
+            // =========================== Colour ===========================
             ScrollView {
                 contentWidth: availableWidth
                 clip: true
@@ -430,19 +552,12 @@ Item {
                     Item { height: 16 }
 
                     GroupBox {
-                        title: qsTr("Image Adjustment")
+                        title: qsTr("Primaries")
                         Layout.fillWidth: true
 
                         ColumnLayout {
                             anchors.fill: parent
                             spacing: 10
-
-                            Label {
-                                text: qsTr("Image")
-                                font.bold: true
-                                font.pixelSize: 12
-                                Layout.fillWidth: true
-                            }
 
                             SliderRow {
                                 labelText: qsTr("Brightness:")
@@ -467,135 +582,26 @@ Item {
                                 value: app.colorGrade.pop
                                 onUserChange: (v) => app.colorGrade.pop = v
                                 min: -1; max: 1
-                            }
-
-                            Rectangle {
-                                Layout.fillWidth: true
-                                height: 1
-                                color: "#444"
-                                Layout.topMargin: 6
-                            }
-
-                            Label {
-                                text: qsTr("Colours")
-                                font.bold: true
-                                font.pixelSize: 12
-                                Layout.fillWidth: true
-                            }
-
-                            SectionHeader { sectionTitle: qsTr("Brightness (Lows / Low Mids / High Mids / Highs)") }
-                            SliderRow { labelText: qsTr("Lows:");      value: app.colorGrade.brightLows;      onUserChange: (v) => app.colorGrade.brightLows = v;      min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Low Mids:");  value: app.colorGrade.brightLowMids;    onUserChange: (v) => app.colorGrade.brightLowMids = v;    min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("High Mids:"); value: app.colorGrade.brightHighMids;   onUserChange: (v) => app.colorGrade.brightHighMids = v;   min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Highs:");     value: app.colorGrade.brightHighs;      onUserChange: (v) => app.colorGrade.brightHighs = v;      min: -1; max: 1 }
-
-                            SectionHeader { sectionTitle: qsTr("Red"); accent: "#ef9a9a" }
-                            SliderRow { labelText: qsTr("Lows:");  value: app.colorGrade.redLows;  onUserChange: (v) => app.colorGrade.redLows = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Mids:");  value: app.colorGrade.redMids;  onUserChange: (v) => app.colorGrade.redMids = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Highs:"); value: app.colorGrade.redHighs; onUserChange: (v) => app.colorGrade.redHighs = v; min: -1; max: 1 }
-
-                            SectionHeader { sectionTitle: qsTr("Green"); accent: "#a5d6a7" }
-                            SliderRow { labelText: qsTr("Lows:");  value: app.colorGrade.greenLows;  onUserChange: (v) => app.colorGrade.greenLows = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Mids:");  value: app.colorGrade.greenMids;  onUserChange: (v) => app.colorGrade.greenMids = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Highs:"); value: app.colorGrade.greenHighs; onUserChange: (v) => app.colorGrade.greenHighs = v; min: -1; max: 1 }
-
-                            SectionHeader { sectionTitle: qsTr("Blue"); accent: "#90caf9" }
-                            SliderRow { labelText: qsTr("Lows:");  value: app.colorGrade.blueLows;  onUserChange: (v) => app.colorGrade.blueLows = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Mids:");  value: app.colorGrade.blueMids;  onUserChange: (v) => app.colorGrade.blueMids = v;  min: -1; max: 1 }
-                            SliderRow { labelText: qsTr("Highs:"); value: app.colorGrade.blueHighs; onUserChange: (v) => app.colorGrade.blueHighs = v; min: -1; max: 1 }
-
-                            Button {
-                                text: qsTr("Reset All")
-                                Layout.fillWidth: true
-                                Layout.topMargin: 8
-                                onClicked: app.colorGrade.reset()
+                                tip: qsTr("Midtone contrast (clarity).")
                             }
                         }
                     }
 
-                    Item { Layout.fillHeight: true }
-                }
-            }
-
-            // ======================== Lens tab =======================
-            ScrollView {
-                contentWidth: availableWidth
-                clip: true
-
-                ColumnLayout {
-                    width: parent.width
-                    spacing: 16
-
-                    Item { height: 16 }
-
                     GroupBox {
-                        title: qsTr("Calibration")
+                        title: qsTr("Curves")
                         Layout.fillWidth: true
+                        ToolTip.text: qsTr("Tone curves: Master shapes brightness for all channels; Red/Green/Blue tint the shadows, midtones or highlights. Applied after the primaries.")
+                        ToolTip.visible: hovered
 
-                        ColumnLayout {
+                        CurveEditor {
                             anchors.fill: parent
-                            spacing: 8
-
-                            ComboBox {
-                                id: presetCombo
-                                Layout.fillWidth: true
-                                model: app.calibrationPresets
-                                textRole: "name"
-                                onActivated: {
-                                    app.calibrationPresets.loadPreset(currentIndex, app.currentCalibration)
-                                    // Keep the loaded profile's name in the field so Save updates it.
-                                    presetNameField.text = presetCombo.currentText
-                                }
-                            }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 4
-
-                                TextField {
-                                    id: presetNameField
-                                    Layout.fillWidth: true
-                                    placeholderText: qsTr("Profile name")
-                                }
-
-                                Button {
-                                    text: qsTr("Save")
-                                    enabled: presetNameField.text.trim().length > 0
-                                    onClicked: {
-                                        app.calibrationPresets.savePreset(presetNameField.text, app.currentCalibration)
-                                        presetNameField.clear()
-                                    }
-                                }
-
-                                Button {
-                                    text: qsTr("Delete")
-                                    enabled: presetCombo.count > 0
-                                    onClicked: app.calibrationPresets.removePreset(presetCombo.currentIndex)
-                                }
-                            }
-
-                            Button {
-                                text: qsTr("Set as Default Profile")
-                                Layout.fillWidth: true
-                                enabled: presetCombo.count > 0
-                                onClicked: {
-                                    app.calibrationPresets.setDefaultPreset(presetCombo.currentIndex)
-                                    app.calibrationPresets.loadPreset(presetCombo.currentIndex, app.currentCalibration)
-                                }
-                            }
-
-                            Label {
-                                text: qsTr("Default profile: ") + (app.calibrationPresets.defaultPresetName() || qsTr("(none)"))
-                                font.pixelSize: 11
-                                color: "#aaa"
-                            }
-
-                            Button {
-                                text: qsTr("Edit Calibration...")
-                                Layout.fillWidth: true
-                                onClicked: calibrationDialog.open()
-                            }
                         }
+                    }
+
+                    Button {
+                        text: qsTr("Reset all colour")
+                        Layout.fillWidth: true
+                        onClicked: app.colorGrade.reset()
                     }
 
                     Item { Layout.fillHeight: true }

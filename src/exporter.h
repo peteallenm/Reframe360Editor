@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QQuaternion>
+#include <QImage>
 #include <functional>
 
 #include "flowrenderer.h"
@@ -65,6 +66,9 @@ struct ExportFrameState {
     float redLows = 0.0f, redMids = 0.0f, redHighs = 0.0f;
     float greenLows = 0.0f, greenMids = 0.0f, greenHighs = 0.0f;
     float blueLows = 0.0f, blueMids = 0.0f, blueHighs = 0.0f;
+    // Tone curves (applied last): 256x1 RGBA8 LUT, R/G/B = per-channel LUTs.
+    bool curves = false;
+    QImage curveLut;
 
     // Same quaternion App::imuOrientation() reports; the exporter applies its
     // conjugate to the view ray, exactly like LensViewer does.

@@ -35,6 +35,8 @@ class LensViewer : public QQuickItem
     Q_PROPERTY(bool seamStitch READ seamStitch WRITE setSeamStitch NOTIFY seamStitchChanged)
     Q_PROPERTY(double seamStrength READ seamStrength WRITE setSeamStrength NOTIFY seamStrengthChanged)
     Q_PROPERTY(QImage seamImage READ seamImage WRITE setSeamImage NOTIFY seamImageChanged)
+    Q_PROPERTY(QImage curveLut READ curveLut WRITE setCurveLut NOTIFY curveLutChanged)
+    Q_PROPERTY(bool curvesActive READ curvesActive WRITE setCurvesActive NOTIFY curvesActiveChanged)
 
 public:
     explicit LensViewer(QQuickItem *parent = nullptr);
@@ -79,6 +81,10 @@ public:
     void setSeamStrength(double v);
     QImage seamImage() const { return m_seamImage; }
     void setSeamImage(const QImage &img);
+    QImage curveLut() const { return m_curveLut; }
+    void setCurveLut(const QImage &img);
+    bool curvesActive() const { return m_curvesActive; }
+    void setCurvesActive(bool on);
 
 protected:
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
@@ -103,6 +109,8 @@ signals:
     void seamStitchChanged();
     void seamStrengthChanged();
     void seamImageChanged();
+    void curveLutChanged();
+    void curvesActiveChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -130,6 +138,10 @@ private:
     QImage m_seamImage;
     QSGTexture *m_seamTexture;
     qint64 m_seamTextureKey;
+    QImage m_curveLut;
+    bool m_curvesActive = false;
+    QSGTexture *m_curveTexture = nullptr;
+    qint64 m_curveTextureKey = -1;
 };
 
 #endif // LENSVIEWER_H

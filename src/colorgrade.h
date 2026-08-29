@@ -2,6 +2,10 @@
 #define COLORGRADE_H
 
 #include <QObject>
+#include <QImage>
+#include <QPointF>
+#include <QVariantList>
+#include <QVector>
 
 // Colour grading parameters applied in the viewer shader (project.frag) and by
 // the exporter's software renderer, so previews and exports always match.
@@ -37,6 +41,14 @@ class ColorGrade : public QObject
     Q_PROPERTY(double blueLows READ blueLows WRITE setBlueLows NOTIFY blueLowsChanged)
     Q_PROPERTY(double blueMids READ blueMids WRITE setBlueMids NOTIFY blueMidsChanged)
     Q_PROPERTY(double blueHighs READ blueHighs WRITE setBlueHighs NOTIFY blueHighsChanged)
+    // Tone curves: a 256-entry lookup per output channel, baked from a master
+    // curve followed by a per-channel curve (out_c = C_c(M(in_c))). Applied
+    // LAST in the grade, after brightness. curveLut is a 256x1 RGBA8888 image
+    // (R/G/B = the three LUTs) so the viewer and GPU exporter sample it as a
+    // texture; the CPU exporter indexes it directly. curvesActive is false
+    // when every curve is the identity, so the shader can skip the lookups.
+    Q_PROPERTY(QImage curveLut READ curveLut NOTIFY curvesChanged)
+    Q_PROPERTY(bool curvesActive READ curvesActive NOTIFY curvesChanged)
 
 public:
     explicit ColorGrade(QObject *parent = nullptr);
@@ -83,6 +95,18 @@ public:
     // Reset every parameter to its neutral value.
     Q_INVOKABLE void reset();
 
+    // ---- Curves (channel: 0 master, 1 red, 2 green, 3 blue) ----
+    // Control points in [0,1]^2, sorted by x; the identity is {(0,0),(1,1)}.
+    Q_INVOKABLE QVariantList curvePoints(int channel) const;
+    Q_INVOKABLE void setCurvePoints(int channel, const QVariantList &points);
+    Q_INVOKABLE void resetCurve(int channel);
+    // n samples of the channel's own curve (not composed with master), for drawing.
+    Q_INVOKABLE QVariantList curveSamples(int channel, int n) const;
+    QImage curveLut() const { return m_curveLut; }
+    bool curvesActive() const { return m_curvesActive; }
+    QString curvesToJson() const;
+    void curvesFromJson(const QString &json);
+
 signals:
     void brightnessChanged();
     void contrastChanged();
@@ -101,6 +125,7 @@ signals:
     void blueLowsChanged();
     void blueMidsChanged();
     void blueHighsChanged();
+    void curvesChanged();
 
 private:
     double m_brightness;
@@ -111,6 +136,12 @@ private:
     double m_redLows, m_redMids, m_redHighs;
     double m_greenLows, m_greenMids, m_greenHighs;
     double m_blueLows, m_blueMids, m_blueHighs;
+
+    static double evalCurve(const QVector<QPointF> &pts, double x);
+    void rebuildLut();
+    QVector<QPointF> m_curves[4];
+    QImage m_curveLut;
+    bool m_curvesActive = false;
 };
 
 #endif // COLORGRADE_H

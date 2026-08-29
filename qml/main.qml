@@ -105,7 +105,7 @@ ApplicationWindow {
 
         ControlPanel {
             Layout.fillHeight: true
-            Layout.preferredWidth: 320
+            Layout.preferredWidth: 340
         }
     }
 

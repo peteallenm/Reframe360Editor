@@ -98,6 +98,22 @@ void LensViewer::setSeamImage(const QImage &img) {
     update();
 }
 
+void LensViewer::setCurveLut(const QImage &img)
+{
+    if (img.cacheKey() == m_curveLut.cacheKey()) return;
+    m_curveLut = img;
+    emit curveLutChanged();
+    update();
+}
+
+void LensViewer::setCurvesActive(bool on)
+{
+    if (m_curvesActive == on) return;
+    m_curvesActive = on;
+    emit curvesActiveChanged();
+    update();
+}
+
 void LensViewer::setFlowImage(const QImage &img)
 {
     if (m_flowImage.cacheKey() == img.cacheKey() && m_flowImage.isNull() == img.isNull())
@@ -287,6 +303,22 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         material->setSeamStitch(false);
     }
     material->setSeamStrength((float)m_seamStrength);
+
+    // Tone curves: a 256x1 LUT, re-uploaded only when ColorGrade rebuilt it.
+    const QImage lutImg = m_curveLut;
+    if (m_curvesActive && !lutImg.isNull()) {
+        const qint64 key = lutImg.cacheKey();
+        if (key != m_curveTextureKey) {
+            delete m_curveTexture;
+            m_curveTexture = window()->createTextureFromImage(lutImg);
+            m_curveTextureKey = key;
+        }
+        material->setCurveTexture(m_curveTexture);
+        material->setCurves(true);
+    } else {
+        material->setCurveTexture(nullptr);
+        material->setCurves(false);
+    }
 
     node->markDirty(QSGNode::DirtyGeometry | QSGNode::DirtyMaterial);
     return node;

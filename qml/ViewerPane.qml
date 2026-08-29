@@ -34,6 +34,8 @@ Item {
             seamStitch: app.seamStitch
             seamStrength: app.seamStrength
             seamImage: app.seamImage
+            curveLut: app.colorGrade.curveLut
+            curvesActive: app.colorGrade.curvesActive
         }
 
         MouseArea {
@@ -54,7 +56,10 @@ Item {
                 var dy = mouse.y - dragOrigin.y
                 if (dx === 0 && dy === 0) return
                 var sens = app.fov / Math.max(height, 1)
-                app.dragLook(dx * sens, -dy * sens);
+                // Grab semantics: the picture follows the hand. Dragging DOWN
+                // must move the scene down, i.e. tilt the view up. The vertical
+                // sign was inverted (reported by the user); horizontal was right.
+                app.dragLook(dx * sens, dy * sens);
                 dragOrigin = Qt.point(mouse.x, mouse.y)
             }
         }

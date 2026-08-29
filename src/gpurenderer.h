@@ -89,6 +89,8 @@ private:
     quint32 m_vTex = 0;
     quint32 m_flowTex = 0;
     quint32 m_seamTex = 0;
+    quint32 m_curveTex = 0;
+    qint64 m_curveKey = -1;
     bool m_seamValid = false;
     int m_fbW = 0;
     int m_fbH = 0;

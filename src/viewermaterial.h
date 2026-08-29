@@ -45,6 +45,9 @@ public:
     void setSeamTexture(QSGTexture *seam) { m_seamTex = seam; }
     void setSeamStitch(bool stitch) { m_seamStitch = stitch; }
     void setSeamStrength(float strength) { m_seamStrength = strength; }
+    // Tone curves: 256x1 RGBA8 LUT texture (see ColorGrade::curveLut).
+    void setCurveTexture(QSGTexture *lut) { m_curveTex = lut; }
+    void setCurves(bool on) { m_curves = on; }
 
     // Colour grading values (see ColorGrade / project.frag for semantics).
     void setColorGrade(float brightness, float contrast, float saturation, float pop,
@@ -63,6 +66,7 @@ public:
     // matter when stitching is disabled.
     QSGTexture *flowTexture() const { return m_flowTex ? m_flowTex : m_yTex; }
     QSGTexture *seamTexture() const { return m_seamTex ? m_seamTex : m_yTex; }
+    QSGTexture *curveTexture() const { return m_curveTex ? m_curveTex : m_yTex; }
 
     QByteArray compileUniformData() const;
 
@@ -96,6 +100,8 @@ private:
     QSGTexture *m_seamTex;
     bool m_seamStitch;
     float m_seamStrength;
+    QSGTexture *m_curveTex;
+    bool m_curves;
     float m_viewAspect;
     bool m_fullRange;
     float m_yaw, m_pitch, m_roll, m_fov;

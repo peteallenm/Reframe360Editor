@@ -58,6 +58,7 @@ qt_add_qml_module(render360
         qml/main.qml
         qml/ViewerPane.qml
         qml/ControlPanel.qml
+        qml/CurveEditor.qml
         qml/Timeline.qml
         qml/CalibrationDialog.qml
         qml/ExportDialog.qml

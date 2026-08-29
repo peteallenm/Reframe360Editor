@@ -230,6 +230,7 @@ App::App(QObject *parent)
     connect(m_colorGrade, &ColorGrade::blueLowsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::blueMidsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::blueHighsChanged, this, saveGrade);
+    connect(m_colorGrade, &ColorGrade::curvesChanged, this, saveGrade);
 
     // Auto-sync pipeline objects
     m_visualRotation = new VisualRotationComputer(this);
@@ -1300,6 +1301,8 @@ ExportSnapshot App::buildExportSnapshot() const
         s.base.blueLows = (float)m_colorGrade->blueLows();
         s.base.blueMids = (float)m_colorGrade->blueMids();
         s.base.blueHighs = (float)m_colorGrade->blueHighs();
+        s.base.curves = m_colorGrade->curvesActive();
+        s.base.curveLut = m_colorGrade->curveLut();
     }
     s.keyframes = m_keyframes->keyframes();
     s.imuStabilize = m_imuStabilize;
@@ -1352,6 +1355,7 @@ void App::loadSettings()
         load("grade/blueLows", m_colorGrade->blueLows(), &ColorGrade::setBlueLows);
         load("grade/blueMids", m_colorGrade->blueMids(), &ColorGrade::setBlueMids);
         load("grade/blueHighs", m_colorGrade->blueHighs(), &ColorGrade::setBlueHighs);
+        m_colorGrade->curvesFromJson(s.value(QStringLiteral("grade/curves")).toString());
     }
 }
 
@@ -1389,6 +1393,7 @@ void App::saveSettings() const
         s.setValue(QStringLiteral("grade/blueLows"), m_colorGrade->blueLows());
         s.setValue(QStringLiteral("grade/blueMids"), m_colorGrade->blueMids());
         s.setValue(QStringLiteral("grade/blueHighs"), m_colorGrade->blueHighs());
+        s.setValue(QStringLiteral("grade/curves"), m_colorGrade->curvesToJson());
     }
 }
 

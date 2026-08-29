@@ -57,7 +57,8 @@ struct ViewerUniforms {
     // --- Seam placement (std140-locked to project.frag) ---
     int seamStitch;         // offset 336
     float seamStrength;     // offset 340
-    float _padI[2];         // offset 344 (std140 rounds to 352)
+    int curves;             // offset 344 (1 = apply the tone-curve LUT)
+    float _padI1;           // offset 348 (std140 rounds to 352)
 };
 static_assert(sizeof(ViewerUniforms) == 352, "ViewerUniforms must match std140 layout");
 
@@ -81,6 +82,7 @@ ViewerMaterial::ViewerMaterial()
     , m_bandTheta0(kDefaultBandTheta0), m_bandTheta1(kDefaultBandTheta1)
     , m_flowEncode(16.0f)
     , m_seamTex(nullptr), m_seamStitch(false), m_seamStrength(1.0f)
+    , m_curveTex(nullptr), m_curves(false)
 {
 }
 
@@ -100,6 +102,7 @@ int ViewerMaterial::compare(const QSGMaterial *other) const
     if (m_yTex != m->m_yTex) return (intptr_t)m_yTex - (intptr_t)m->m_yTex;
     if (m_flowTex != m->m_flowTex) return (intptr_t)m_flowTex - (intptr_t)m->m_flowTex;
     if (m_seamTex != m->m_seamTex) return (intptr_t)m_seamTex - (intptr_t)m->m_seamTex;
+    if (m_curveTex != m->m_curveTex) return (intptr_t)m_curveTex - (intptr_t)m->m_curveTex;
     return 0;
 }
 
@@ -202,6 +205,8 @@ QByteArray ViewerMaterial::compileUniformData() const
     u.flowEncode = m_flowEncode;
     u.seamStitch = m_seamStitch ? 1 : 0;
     u.seamStrength = m_seamStrength;
+    u.curves = (m_curves && m_curveTex) ? 1 : 0;
+    u._padI1 = 0.0f;
 
     const float *mat = m_imuMatrix.constData();
     for (int i = 0; i < 16; i++) u.imuMatrix[i] = mat[i];
@@ -262,6 +267,7 @@ void ViewerMaterialShader::updateSampledImage(RenderState &state, int binding,
     case 3: tex = m->vTexture(); break;
     case 4: tex = m->flowTexture(); break;
     case 5: tex = m->seamTexture(); break;
+    case 6: tex = m->curveTexture(); break;
     }
     if (tex) {
         tex->setFiltering(QSGTexture::Linear);

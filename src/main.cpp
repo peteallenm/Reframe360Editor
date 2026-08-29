@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
     QCommandLineOption grabOption("grab", "Grab the window after a short delay and save to FILE", "file");
     parser.addOption(grabOption);
 
-    QCommandLineOption tabOption("tab", "Start on the given side-panel tab (0 View, 1 Colours, 2 Lens)", "index");
+    QCommandLineOption tabOption("tab", "Start on the given side-panel tab (0 View, 1 Stabilise, 2 Stitch, 3 Colour)", "index");
     parser.addOption(tabOption);
     
     QCommandLineOption projectionOption("projection", "Rendering projection: 0 perspective, 1 equirectangular, 2 stereographic, 3 sportsview", "mode");
@@ -250,7 +250,7 @@ int main(int argc, char *argv[])
             QObject *root = engine.rootObjects().value(0);
             if (root) {
                 if (QObject *tabs = root->findChild<QObject*>(QStringLiteral("panelTabs")))
-                    tabs->setProperty("currentIndex", qBound(0, tabIdx, 2));
+                    tabs->setProperty("currentIndex", qBound(0, tabIdx, 3));
             }
         });
     }

@@ -110,6 +110,7 @@ void GpuRenderer::destroy()
     if (m_vTex) { f->glDeleteTextures(1, &m_vTex); m_vTex = 0; }
     if (m_flowTex) { f->glDeleteTextures(1, &m_flowTex); m_flowTex = 0; m_flowValid = false; }
     if (m_seamTex) { f->glDeleteTextures(1, &m_seamTex); m_seamTex = 0; m_seamValid = false; }
+    if (m_curveTex) { f->glDeleteTextures(1, &m_curveTex); m_curveTex = 0; m_curveKey = -1; }
     if (m_colorTex) { f->glDeleteTextures(1, &m_colorTex); m_colorTex = 0; }
     if (m_vbo) { f->glDeleteBuffers(1, &m_vbo); m_vbo = 0; }
     if (m_ebo) { f->glDeleteBuffers(1, &m_ebo); m_ebo = 0; }
@@ -153,6 +154,7 @@ bool GpuRenderer::initialize(QString *error)
     m_program->setUniformValue("u_texV", 3);
     m_program->setUniformValue("u_flow", 4);
     m_program->setUniformValue("u_seam", 5);
+    m_program->setUniformValue("u_curveLut", 6);
 
     QOpenGLFunctions_3_3_Core *f = m_functions;
     f->glGenTextures(1, &m_yTex);
@@ -471,6 +473,25 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
     m_program->setUniformValue("u_flowEncode", GLfloat(m_flowEncode));
     m_program->setUniformValue("u_seamStitch", GLint((s.seamStitch && m_seamValid) ? 1 : 0));
     m_program->setUniformValue("u_seamStrength", GLfloat(s.seamStrength));
+
+    // Tone-curve LUT (256x1 RGBA8), uploaded when it changes.
+    const bool useCurves = s.curves && !s.curveLut.isNull();
+    if (useCurves) {
+        if (!m_curveTex) f->glGenTextures(1, &m_curveTex);
+        if (s.curveLut.cacheKey() != m_curveKey) {
+            const QImage lut = s.curveLut.convertToFormat(QImage::Format_RGBA8888);
+            f->glBindTexture(GL_TEXTURE_2D, m_curveTex);
+            f->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, lut.width(), 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut.constBits());
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            m_curveKey = s.curveLut.cacheKey();
+        }
+        f->glActiveTexture(GL_TEXTURE6);
+        f->glBindTexture(GL_TEXTURE_2D, m_curveTex);
+    }
+    m_program->setUniformValue("u_curves", GLint(useCurves ? 1 : 0));
 
     // Bind the YUV textures to sampler units 1..3 and the flow field to 4.
     f->glActiveTexture(GL_TEXTURE1);
