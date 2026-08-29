@@ -24,13 +24,28 @@ public:
     // visualPairs: rotation deltas between video frames (from VisualRotationComputer)
     // imuOrientations/imuTimestamps: integrated IMU orientation chain (from GyroscopeIntegrator)
     // syncOffset/drift: time mapping tImu = tVideo * (1 + drift) + syncOffset
-    // sigmaSeconds: Gaussian smoothing sigma for the correction spline
+    // sigmaSeconds: Gaussian smoothing sigma for the correction spline.
+    //   Swept against hand-authored reference keyframes on YIVR_0845
+    //   (`tracking_tests --groundtruth --sigma=N`), mean horizon error:
+    //       sigma  1.50  0.80  0.50  0.30  0.15
+    //       error  37.5  31.1  29.7  29.0  27.7   deg   (gyro alone: 96.5)
+    //   Angular jerk at 30 fps was 1.730 deg rms for the gyro chain and
+    //   1.731-1.733 for the fused chain at EVERY sigma, i.e. fusion adds no
+    //   measurable shake -- the correction is smooth, so the old 1.5 s was
+    //   simply over-smoothing a drift that moves at ~20 deg/s on an orbit clip.
+    //   0.5 s takes most of the available gain while staying the most tolerant
+    //   of clips with noisier visual pairs than the ones measured.
+    // imuTrust (optional, per IMU sample, [0,1]): where the IMU's absolute
+    // attitude is gravity-verified. When given, the visual chain is anchored
+    // to the IMU over those samples rather than at its first pair -- see the
+    // note in fuse(). Empty = anchor at the first pair (legacy behaviour).
     void fuse(const QVector<VisualRotationPair> &visualPairs,
               const QVector<QQuaternion> &imuOrientations,
               const QVector<double> &imuTimestamps,
               double syncOffset,
               double drift,
-              double sigmaSeconds = 1.5);
+              double sigmaSeconds = 0.5,
+              const QVector<float> &imuTrust = QVector<float>());
 
     // Query the fused orientation at arbitrary time (IMU time domain).
     // Uses Gaussian-weighted quaternion averaging (same as GyroscopeIntegrator::orientationAt)

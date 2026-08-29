@@ -238,7 +238,7 @@ void KeyframeModel::saveToFile(const QString &path) const
         });
     }
     QJsonObject root{
-        {"version", 4},
+        {"version", 5},
         {"in", m_trimIn},        // export trim start marker
         {"out", m_trimOut},      // export trim end marker
         {"export", QJsonObject{
@@ -256,8 +256,26 @@ void KeyframeModel::saveToFile(const QString &path) const
     };
     // Per-video IMU clock drift is optional; only stored once the user has
     // tuned it (or a sidecar was created with one).
-    if (m_imuDrift >= 0.0)
+    if (hasImuDrift())
         root.insert(QStringLiteral("imuDrift"), m_imuDrift);
+
+    // Version 5: per-video sync offset and gyro calibration
+    if (hasSyncOffset())
+        root.insert(QStringLiteral("syncOffset"), m_syncOffset);
+
+    if (m_hasGyroCalibration) {
+        QJsonArray matArr;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                matArr.append((double)m_gyroMatrix(i, j));
+        root.insert(QStringLiteral("gyroMatrix"), matArr);
+
+        QJsonArray biasArr;
+        biasArr.append((double)m_gyroBias.x());
+        biasArr.append((double)m_gyroBias.y());
+        biasArr.append((double)m_gyroBias.z());
+        root.insert(QStringLiteral("gyroBias"), biasArr);
+    }
 
     QFile f(path);
     if (f.open(QIODevice::WriteOnly))
@@ -269,7 +287,11 @@ void KeyframeModel::loadFromFile(const QString &path)
     QVector<Keyframe> loaded;
     double trimIn = 0.0;
     double trimOut = 0.0;
-    double imuDrift = -1.0;   // absent in old sidecars -> not stored
+    double imuDrift = -1e9;   // absent in old sidecars -> not stored
+    double syncOffset = -1e9; // absent in old sidecars -> not stored
+    QMatrix3x3 gyroMatrix;    // default identity
+    QVector3D gyroBias;       // default zero
+    bool hasGyroCalibration = false;
     int expWidth = m_exportWidth;
     int expHeight = m_exportHeight;
     double expFps = m_exportFps;
@@ -301,7 +323,24 @@ void KeyframeModel::loadFromFile(const QString &path)
             trimIn  = root.value("in").toDouble(0.0);
             trimOut = root.value("out").toDouble(0.0);
             // Optional per-video IMU clock drift (absent -> not stored).
-            imuDrift = root.value("imuDrift").toDouble(-1.0);
+            if (root.contains("imuDrift"))
+                imuDrift = root.value("imuDrift").toDouble(-1e9);
+            // Version 5: optional sync offset and gyro calibration
+            if (root.contains("syncOffset"))
+                syncOffset = root.value("syncOffset").toDouble(-1e9);
+            if (root.contains("gyroMatrix") && root.contains("gyroBias")) {
+                const QJsonArray matArr = root.value("gyroMatrix").toArray();
+                const QJsonArray biasArr = root.value("gyroBias").toArray();
+                if (matArr.size() == 9 && biasArr.size() == 3) {
+                    for (int i = 0; i < 3; i++)
+                        for (int j = 0; j < 3; j++)
+                            gyroMatrix(i, j) = (float)matArr[i * 3 + j].toDouble();
+                    gyroBias.setX((float)biasArr[0].toDouble());
+                    gyroBias.setY((float)biasArr[1].toDouble());
+                    gyroBias.setZ((float)biasArr[2].toDouble());
+                    hasGyroCalibration = true;
+                }
+            }
             // Optional last-used export options (absent in older sidecars ->
             // keep the current in-memory defaults).
             const QJsonObject exp = root.value("export").toObject();
@@ -351,6 +390,8 @@ void KeyframeModel::loadFromFile(const QString &path)
         && qFuzzyCompare(trimIn, m_trimIn)
         && qFuzzyCompare(trimOut, m_trimOut)
         && qFuzzyCompare(imuDrift, m_imuDrift)
+        && qFuzzyCompare(syncOffset, m_syncOffset)
+        && hasGyroCalibration == m_hasGyroCalibration
         && exportUnchanged)
         return;
 
@@ -362,6 +403,10 @@ void KeyframeModel::loadFromFile(const QString &path)
     m_trimIn = trimIn;
     m_trimOut = trimOut;
     m_imuDrift = imuDrift;
+    m_syncOffset = syncOffset;
+    m_gyroMatrix = gyroMatrix;
+    m_gyroBias = gyroBias;
+    m_hasGyroCalibration = hasGyroCalibration;
     m_exportWidth = expWidth;
     m_exportHeight = expHeight;
     m_exportFps = expFps;

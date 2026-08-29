@@ -18,6 +18,15 @@ struct VisualRotationPair {
     QQuaternion deltaR;      // rotation from t0 to t1
     int inliers;             // number of matches after outlier rejection
     double rmsDeg;           // RMS residual in degrees
+
+    // Single definition of "this pair is trustworthy enough to fit against".
+    // The producer accepts a much looser bar (HOP_MIN_INLIERS / HOP_MAX_RMS_DEG)
+    // because it is choosing a hop length; consumers apply their own threshold
+    // through this predicate so the bar lives in one place per consumer rather
+    // than as three independently-drifting inline tests.
+    bool isReliable(int minInliers, double maxRmsDeg) const {
+        return inliers >= minInliers && rmsDeg <= maxRmsDeg;
+    }
 };
 
 Q_DECLARE_METATYPE(VisualRotationPair)

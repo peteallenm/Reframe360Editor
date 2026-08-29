@@ -396,7 +396,10 @@ Dialog {
                             fov: app.fov
                             calibration: app.currentCalibration
                             colorGrade: app.colorGrade
-                            imuOrientation: app.imuStabilize ? app.imuOrientation : Qt.quaternion(1, 0, 0, 0)
+                            // app.imuOrientation already returns the constant 180 deg video un-flip
+                            // when stabilization is off; overriding it with identity here put the
+                            // render back upside down.
+                            imuOrientation: app.imuOrientation
                         }
                     }
                 }

@@ -4,6 +4,8 @@
 #include <QObject>
 #include <QAbstractListModel>
 #include <QVector>
+#include <QMatrix3x3>
+#include <QVector3D>
 #include <algorithm>
 
 struct Keyframe {
@@ -79,11 +81,36 @@ public:
     int count() const { return (int)m_keyframes.size(); }
 
     // Per-video IMU<->video clock drift (s/s) persisted in the same sidecar
-    // file so each video remembers its own tuned value. -1.0 = not stored;
+    // file so each video remembers its own tuned value. -1e9 = not stored;
     // the caller then falls back to the auto-calculated value.
     void setImuDrift(double d) { m_imuDrift = d; }
     double imuDrift() const { return m_imuDrift; }
-    bool hasImuDrift() const { return m_imuDrift >= 0.0; }
+    // Sentinel -1e9 = not stored. It must sit outside the value range, not at
+    // its edge: the old ">= 0.0" test made every NEGATIVE drift (video clock
+    // running faster than the IMU — an ordinary, expected case) indistinguishable
+    // from "absent", so such a value was silently dropped on save.
+    bool hasImuDrift() const { return m_imuDrift > -1e8; }
+
+    // Per-video IMU sync offset (s) persisted in the sidecar.
+    // Sentinel -1e9 = not stored; the caller falls back to manual/auto value.
+    void setSyncOffset(double s) { m_syncOffset = s; }
+    double syncOffset() const { return m_syncOffset; }
+    bool hasSyncOffset() const { return m_syncOffset > -1e8; }
+
+    // Per-video gyro calibration (matrix + bias) persisted in the sidecar.
+    void setGyroCalibration(const QMatrix3x3 &M, const QVector3D &b) {
+        m_gyroMatrix = M;
+        m_gyroBias = b;
+        m_hasGyroCalibration = true;
+    }
+    void clearGyroCalibration() {
+        m_gyroMatrix = QMatrix3x3();
+        m_gyroBias = QVector3D();
+        m_hasGyroCalibration = false;
+    }
+    QMatrix3x3 gyroMatrix() const { return m_gyroMatrix; }
+    QVector3D gyroBias() const { return m_gyroBias; }
+    bool hasGyroCalibration() const { return m_hasGyroCalibration; }
 
     void interpolate(double time, double &yaw, double &pitch, double &roll, double &fov) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }
@@ -126,7 +153,11 @@ private:
     bool m_exportVidstab = false;
     bool m_exportVidstabInformed = false;
     QString m_exportFileName;  // last-used output MP4 path (persisted per-video)
-    double m_imuDrift = -1.0;  // -1.0 = not stored in the sidecar
+    double m_imuDrift = -1e9;  // -1e9 = not stored in the sidecar
+    double m_syncOffset = -1e9; // sentinel = not stored in the sidecar
+    QMatrix3x3 m_gyroMatrix;   // default identity
+    QVector3D m_gyroBias;      // default zero
+    bool m_hasGyroCalibration = false;
 };
 
 #endif // KEYFRAME_H

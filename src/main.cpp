@@ -1,4 +1,5 @@
 #include <QGuiApplication>
+#include <QSettings>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
 #include <QQmlContext>
@@ -61,6 +62,15 @@ int main(int argc, char *argv[])
     QCommandLineOption imuOption("imu", "Enable IMU stabilization");
     parser.addOption(imuOption);
 
+    // The camera-wide gyro calibration is applied silently to every clip that
+    // has no calibration of its own, so a bad one is invisible and permanent.
+    // This is the scriptable escape hatch (the GUI equivalent is
+    // App::clearCameraGyroDefaults()).
+    QCommandLineOption clearCameraCalOption(
+        "clear-camera-calibration",
+        "Delete the camera-wide gyro calibration defaults and exit");
+    parser.addOption(clearCameraCalOption);
+
     // Headless video export (implies --headless): render the loaded video to
     // an MP4, then exit. The trim range defaults to the whole clip.
     QCommandLineOption exportVideoOption("export-video", "Export the loaded video to FILE as MP4 (headless)", "file");
@@ -89,6 +99,24 @@ int main(int argc, char *argv[])
     parser.addOption(exportVidstabHybridOption);
     
     parser.process(app);
+
+    // Handle before any window or App is constructed: this is a maintenance
+    // action, not a viewing session.
+    if (parser.isSet(clearCameraCalOption)) {
+        QSettings s;
+        const bool had = s.contains(QStringLiteral("camera/gyroMatrix"))
+                      || s.contains(QStringLiteral("camera/gyroBias"))
+                      || s.contains(QStringLiteral("camera/gyroScaleX"));
+        s.remove(QStringLiteral("camera/gyroMatrix"));
+        s.remove(QStringLiteral("camera/gyroBias"));
+        s.remove(QStringLiteral("camera/gyroScaleX"));
+        s.remove(QStringLiteral("camera/gyroScaleY"));
+        s.remove(QStringLiteral("camera/gyroScaleZ"));
+        s.sync();
+        qInfo().noquote() << (had ? "Camera-wide gyro calibration defaults cleared."
+                                  : "No camera-wide gyro calibration defaults were set.");
+        return 0;
+    }
 
     QQuickStyle::setStyle("Material");
 

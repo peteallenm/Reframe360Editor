@@ -21,6 +21,10 @@ public:
     explicit ImuParser(QObject *parent = nullptr);
 
     bool loadFile(const QString &path);
+    // Reproduction hook (tests only): use these LSB/(deg/s) scales instead of
+    // the built-in ones on the next loadFile().
+    void setGyroScaleOverride(double x, double y, double z)
+    { m_scaleOverride = true; m_ovX = x; m_ovY = y; m_ovZ = z; }
 
     QQuaternion initialQuaternion() const { return m_initialQuaternion; }
     double imuSampleRate() const { return m_imuSampleRate; }
@@ -36,9 +40,21 @@ public:
     double gyroScaleY() const { return m_gyroScaleY; }
     double gyroScaleZ() const { return m_gyroScaleZ; }
 
+    // Per-axis scale refinement from the visual-rotation calibration (item 1).
+    // Normally the hardcoded per-axis scales make a 360° integration read
+    // exactly 360°; a visually-derived correction can refine them per-clip by
+    // scaling the raw LSB/(deg/s) divisor. The integrator supplements these
+    // with the gyro calibration matrix M anyway, so this is a convenience for
+    // feeding corrected scales back into the parser.
+    void setGyroScaleX(double v) { m_gyroScaleX = v; }
+    void setGyroScaleY(double v) { m_gyroScaleY = v; }
+    void setGyroScaleZ(double v) { m_gyroScaleZ = v; }
+
 private:
     QQuaternion m_initialQuaternion;
     double m_imuSampleRate;
+    bool m_scaleOverride = false;
+    double m_ovX = 0, m_ovY = 0, m_ovZ = 0;
     double m_gyroScaleX;
     double m_gyroScaleY;
     double m_gyroScaleZ;

@@ -206,25 +206,21 @@ Item {
                                     Layout.fillWidth: true
                                     from: 0.0; to: 1.0
                                     value: app.imuSmoothing
+                                    hoverEnabled: true
+                                    ToolTip.text: smoothingSlider.value > 0.9
+                                        ? qsTr("Hold world steady: cancels all camera rotation (even 360°) so the scene is pinned to its first frame.")
+                                        : qsTr("Remove shake, keep motion: smooths out high-frequency jitter while pans/tilts still follow the camera.")
+                                    ToolTip.visible: hovered
                                     onMoved: app.imuSmoothing = value
                                 }
                                 Label { text: smoothingSlider.value.toFixed(2); Layout.preferredWidth: 40 }
                             }
 
-                            RowLayout {
-                                enabled: imuCheck.checked
-                                Label { text: qsTr("Drift corr:"); Layout.preferredWidth: 80 }
-                                ToolTip.text: qsTr("Mahony integral gain: accumulates the gravity-alignment error while the camera is still and feeds it back to cancel gyro bias, eliminating slow roll drift. 0 disables the correction.")
-                                ToolTip.visible: hovered
-                                Slider {
-                                    id: kiSlider
-                                    Layout.fillWidth: true
-                                    from: 0.0; to: 0.05
-                                    value: app.imuAccelKi
-                                    onMoved: app.imuAccelKi = value
-                                }
-                                Label { text: kiSlider.value.toFixed(4); Layout.preferredWidth: 50 }
-                            }
+                            // The "Drift corr" (Mahony integral gain) slider was removed: per-sample
+                            // accelerometer feedback proved harmful on this camera's footage and
+                            // the integrator no longer uses it. Drift is handled automatically
+                            // (measured bias, gravity re-level, visual fusion).
+                            
 
                             RowLayout {
                                 enabled: imuCheck.checked
@@ -246,12 +242,16 @@ Item {
                                 Slider {
                                     id: driftSlider
                                     Layout.fillWidth: true
-                                    from: -0.01; to: 0.01
+                                    // +-1e-3 s/s. The old +-0.01 range let the
+                                    // slider reach 20x what two crystal clocks
+                                    // can physically disagree by, so most of
+                                    // its travel produced nonsense.
+                                    from: -0.001; to: 0.001
                                     value: app.imuDrift
-                                    stepSize: 0.0001
+                                    stepSize: 0.00001
                                     onMoved: app.imuDrift = value
                                 }
-                                Label { text: (driftSlider.value * 1000).toFixed(1) + " ms/s"; Layout.preferredWidth: 50 }
+                                Label { text: (driftSlider.value * 1000).toFixed(2) + " ms/s"; Layout.preferredWidth: 50 }
                             }
 
                             RowLayout {
@@ -260,19 +260,79 @@ Item {
                                 spacing: 6
 
                                 Button {
-                                    text: qsTr("Calibrate")
-                                    enabled: !app.calibrationRunning && imuCheck.checked
-                                    onClicked: app.calibrateImuDrift()
+                                    text: qsTr("Auto sync")
+                                    enabled: !app.autoSyncRunning && imuCheck.checked
+                                    onClicked: app.autoSyncAndCalibrate()
                                 }
 
                                 Label {
-                                    text: app.calibrationRunning
-                                          ? qsTr("Calibrating… %1%").arg((app.calibrationProgress * 100).toFixed(0))
-                                          : app.calibrationStatus
+                                    id: autoSyncLabel
+                                    text: app.autoSyncRunning
+                                          ? qsTr("Syncing… %1%").arg((app.autoSyncProgress * 100).toFixed(0))
+                                          : app.autoSyncStatus
                                     font.pixelSize: 11
-                                    color: app.calibrationRunning ? "#aaa" : "#8f8"
+                                    color: app.autoSyncRunning ? "#aaa" : "#8f8"
                                     Layout.fillWidth: true
+                                    // Take only the space left over. Without this the
+                                    // label's implicitWidth is the FULL untruncated
+                                    // status text, which propagates up through the
+                                    // GroupBox and forces the whole panel wider than
+                                    // the window — elide affects painting, not the
+                                    // width the layout asks for.
+                                    Layout.preferredWidth: 0
+                                    Layout.minimumWidth: 0
                                     elide: Text.ElideRight
+                                    // Status messages can be long (a rejected
+                                    // calibration explains why); the full text lives
+                                    // in the tooltip rather than in the layout.
+                                    // Label is not a hoverable Control, so hover
+                                    // comes from a HoverHandler.
+                                    HoverHandler { id: autoSyncHover }
+                                    ToolTip.text: autoSyncLabel.text
+                                    ToolTip.visible: autoSyncHover.hovered && autoSyncLabel.truncated
+                                }
+                            }
+
+                            // A stored gyro calibration is re-applied silently on
+                            // every load, so a bad one is otherwise invisible and
+                            // permanent. These are the undo and the (deliberately
+                            // manual) promote — Auto sync never writes the
+                            // camera-wide default by itself.
+                            // A GridLayout, not a RowLayout: three side-by-side
+                            // buttons demand the SUM of their widths as a minimum,
+                            // which is what pushed this panel past the window edge.
+                            // Wrapped into two columns with each button free to
+                            // shrink, the minimum is one button wide.
+                            GridLayout {
+                                enabled: imuCheck.checked && !app.autoSyncRunning
+                                Layout.fillWidth: true
+                                columns: 2
+                                columnSpacing: 6
+                                rowSpacing: 6
+
+                                Button {
+                                    text: qsTr("Clear video cal")
+                                    Layout.fillWidth: true
+                                    ToolTip.text: qsTr("Discard this video's stored gyro calibration and re-integrate from the raw IMU.")
+                                    ToolTip.visible: hovered
+                                    onClicked: app.clearGyroCalibration()
+                                }
+
+                                Button {
+                                    text: qsTr("Clear camera cal")
+                                    Layout.fillWidth: true
+                                    ToolTip.text: qsTr("Discard the camera-wide gyro calibration that is applied to every clip without one of its own.")
+                                    ToolTip.visible: hovered
+                                    onClicked: app.clearCameraGyroDefaults()
+                                }
+
+                                Button {
+                                    text: qsTr("Set as camera default")
+                                    Layout.fillWidth: true
+                                    Layout.columnSpan: 2
+                                    ToolTip.text: qsTr("Apply this video's calibration to every future clip that has none of its own.")
+                                    ToolTip.visible: hovered
+                                    onClicked: app.saveGyroCalibrationAsCameraDefault()
                                 }
                             }
                         }

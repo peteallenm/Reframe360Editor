@@ -13,8 +13,6 @@
 // integrate into slow, unbounded orientation drift (most visible in roll).
 // accelKi too high causes oscillation/overshoot during fast motion.
 static const float kGyroGate   = 60.0f;   // deg/s: below this the accel is trusted
-static const float kMagLow     = 0.9f;    // |accel| window (g) for "camera still"
-static const float kMagHigh    = 1.1f;
 // IIR low-pass filter removed: quaternion integration is itself an integrator;
 // sensor noise at 400 Hz integrates to almost nothing. The one-pole IIR
 // (alpha=0.55, ~50 Hz cutoff) added ~2-3 ms of group delay which at 300°/s
@@ -33,7 +31,49 @@ static const float kMagHigh    = 1.1f;
 // integrates in, which flips the pitch/yaw stabilization direction and makes
 // the accelerometer correction fight the gyro.
 static const QVector3D kWorldUp(0.0f, 1.0f, 0.0f);
-static const QQuaternion kFlipRoll(0.0f, 0.0f, 0.0f, 1.0f);  // 180° about Z (w,x,y,z)
+// Frame tag on the stored chain (see kFlipRollQ() in the header, which is now
+// the single definition; the composition applies it once, on the outside).
+static const QQuaternion &kFlipRoll = kFlipRollQ();
+// Seed cost penalty for a full clip-length of distance from the start.
+// Measurement hook: RENDER360_GYRO_ROT="x,y,z" (degrees, camera frame) applies a
+// small fixed rotation to the gyro vector to probe cross-axis / mounting error.
+// Time constant of the accelerometer-derived tilt datum. Long enough that
+// centripetal/linear acceleration lasting seconds averages out; short enough
+// to follow gyro tilt drift, which is ~1-2 deg/min on this sensor.
+static const double kRelevelSigmaSec = 30.0;
+
+static double earlyWeight()
+{
+    static const double v = []() {
+        const QByteArray e = qgetenv("RENDER360_EARLY_WEIGHT");   // measurement hook
+        return e.isEmpty() ? 5.0 : e.toDouble();
+    }();
+    return v;
+}
+// Length of the WORLD-frame accelerometer average feeding the Mahony gravity
+// correction. Gravity is constant in the world frame; linear and centripetal
+// acceleration are not, so averaging there recovers gravity -- but only over a
+// window long enough for the offending acceleration to turn. On an orbiting
+// camera the centripetal vector only completes a turn over the ORBIT period,
+// so the old 0.5 s never cancelled it and the magnitude gate stayed shut.
+//
+// Measured as the growth in chain-vs-gravity tilt error over each clip
+// (tracking_tests --tilt), 0.5 s -> 5 s:
+//     YIVR_0845   +62.4 deg  ->  -16.6 deg
+//     YIVR_0807   +36.9      ->  +30.8
+//     JustRoll    +46.1      ->  +31.4
+//     JustYaw      +6.1      ->   +5.2
+//     YIVR_0830   15.1 abs   ->    8.6 abs
+// Uniformly better, with the start-of-clip attitude unchanged (chain-vs-accel
+// at t=0 stays 0.0-0.3 deg on every clip). Overridable for measurement.
+static double accelAvgSeconds()
+{
+    static const double v = []() {
+        const double d = qgetenv("RENDER360_ACCEL_AVG").toDouble();
+        return (d > 0.0) ? d : 5.0;
+    }();
+    return v;
+}
 
 GyroscopeIntegrator::GyroscopeIntegrator(QObject *parent)
     : QObject(parent)
@@ -43,271 +83,540 @@ GyroscopeIntegrator::GyroscopeIntegrator(QObject *parent)
 
 QVector3D GyroscopeIntegrator::computeGyroBias(const QVector<ImuSample> &samples) const
 {
-    // Find the quietest 0.5 s window anywhere in the recording and use its
-    // mean gyro as the bias. Scanning the whole recording (not just the first
-    // second) handles clips that start mid-motion. The Mahony integral term
-    // then refines this estimate continuously during still moments.
+    // The zero-rate offset of a MEMS gyro is a fraction of a degree per second
+    // (this sensor: |b| ~ 0.3-0.8 deg/s on the clips that do have a still
+    // moment). It can only be READ when the camera is genuinely still, because
+    // the mean gyro over a window that is moving is the motion, not the bias.
+    //
+    // The previous version took the quietest 0.5 s window in the first 20 s
+    // and used its mean unconditionally. On YIVR_0845 -- an orbit that never
+    // stops -- that window was doing 17 deg/s, so 17 deg/s was subtracted from
+    // every gyro sample for the whole clip: ~1000 deg of fabricated rotation
+    // per minute, which is most of the "drift that gets bad after a minute".
+    // Below, a window only counts as still if it is still in BOTH senses:
+    // low mean rate (not moving) AND low rate variability (not shaking about a
+    // moving mean). If nothing in the clip qualifies, the honest answer is
+    // that the bias is unmeasurable here; return zero and let the Mahony
+    // integral term (accelKi) estimate it slowly where gravity is visible.
     const int winSamples = qMax(1, (int)(0.5 * m_sampleRate));  // 0.5 s window
-    const int maxScan = qMin(samples.size(), (int)(20 * m_sampleRate)); // cap at 20 s
     if (samples.size() < winSamples)
         return QVector3D(0.0f, 0.0f, 0.0f);
 
-    // Sliding window of total |gyro| rate; keep the window with the lowest sum.
-    double bestSum = 0.0, bestX = 0.0, bestY = 0.0, bestZ = 0.0;
-    bool haveBest = false;
-    double sum = 0.0, sumX = 0.0, sumY = 0.0, sumZ = 0.0;
-    const int n = qMin(samples.size(), maxScan);
+    // Whole recording, not the first 20 s: the still moment on a clip that
+    // starts mid-motion can be anywhere (or nowhere).
+    const int n = samples.size();
+    double bestScore = 1e30;
+    QVector3D bestMean(0.0f, 0.0f, 0.0f);
+    double bestRate = 0.0, bestStd = 0.0;
+
+    QVector3D sum(0, 0, 0);
+    double sumRate = 0.0, sumRate2 = 0.0;
     for (int i = 0; i < n; i++) {
-        sum  += std::abs(samples[i].gyro.x()) + std::abs(samples[i].gyro.y())
-              + std::abs(samples[i].gyro.z());
-        sumX += samples[i].gyro.x();
-        sumY += samples[i].gyro.y();
-        sumZ += samples[i].gyro.z();
+        const float r = samples[i].gyro.length();
+        sum += samples[i].gyro; sumRate += r; sumRate2 += (double)r * r;
         if (i >= winSamples) {
             const int j = i - winSamples;
-            sum  -= std::abs(samples[j].gyro.x()) + std::abs(samples[j].gyro.y())
-                  + std::abs(samples[j].gyro.z());
-            sumX -= samples[j].gyro.x();
-            sumY -= samples[j].gyro.y();
-            sumZ -= samples[j].gyro.z();
+            const float rj = samples[j].gyro.length();
+            sum -= samples[j].gyro; sumRate -= rj; sumRate2 -= (double)rj * rj;
         }
-        if (i + 1 >= winSamples && (!haveBest || sum < bestSum)) {
-            bestSum = sum;
-            bestX = sumX; bestY = sumY; bestZ = sumZ;
-            haveBest = true;
+        if (i + 1 < winSamples)
+            continue;
+        const double meanRate = sumRate / winSamples;
+        const double var = qMax(0.0, sumRate2 / winSamples - meanRate * meanRate);
+        const double score = meanRate + std::sqrt(var);   // still AND steady
+        if (score < bestScore) {
+            bestScore = score;
+            bestMean = sum / (float)winSamples;
+            bestRate = meanRate;
+            bestStd = std::sqrt(var);
         }
     }
 
-    if (haveBest)
-        return QVector3D((float)(bestX / winSamples), (float)(bestY / winSamples),
-                         (float)(bestZ / winSamples));
-    return QVector3D(0.0f, 0.0f, 0.0f);
+    // A still camera reads its bias plus noise: a few deg/s of mean rate at
+    // most, with almost no spread. Anything above this is motion.
+    static const double kMaxStillRateDegS = 3.0;
+    static const double kMaxStillStdDegS  = 1.5;
+    if (bestRate > kMaxStillRateDegS || bestStd > kMaxStillStdDegS) {
+        qWarning() << "Gyro bias: no still window in clip (quietest 0.5 s has mean rate"
+                   << bestRate << "deg/s, spread" << bestStd
+                   << "deg/s) -- bias unmeasurable, using 0";
+        return QVector3D(0.0f, 0.0f, 0.0f);
+    }
+    return bestMean;
 }
 
-void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sampleRate,
-                                    const QQuaternion &imuToCamera,
-                                    float accelKp, float accelKi)
+GyroscopeIntegrator::PassResult
+GyroscopeIntegrator::integratePass(const QVector<ImuSample> &samples, double sampleRate,
+                                   const QQuaternion &imuToCamera,
+                                   float accelKp, float accelKi,
+                                   const QVector3D &bias, bool forward,
+                                   const QQuaternion &seedAdjust)
 {
-    m_sampleRate = sampleRate;
-    m_orientations.clear();
-    m_timestamps.clear();
+    PassResult result;
+    const int n = samples.size();
+    if (n == 0) return result;
 
-    if (samples.isEmpty()) return;
+    result.orientations.resize(n);
+    result.gateWeights.resize(n, 0.0f);
 
-    m_orientations.reserve(samples.size());
-    m_timestamps.reserve(samples.size());
-
-    QVector3D bias = computeGyroBias(samples);
-    qDebug() << "Gyro bias:" << bias.x() << bias.y() << bias.z() << "deg/s";
-
-    // The parser emits s.gyro = (roll, pitch, yaw) = (gx, gy, gz), where
-    // gy = pitch, gz = yaw, gx = roll. Map these to camera axes:
-    // camera X <- pitch, camera Y <- yaw, camera Z <- roll.
-    //
-    // Accelerometer fusion: the accelerometer at rest reads the specific force
-    // (~1 g, pointing away from gravity), which gives an absolute "which way is
-    // up" reference that the gyro integration (which drifts) lacks. The raw
-    // sensor accel is rotated into camera axes with the header's IMU->camera
-    // quaternion: q^-1 * accel ≈ +Y (up) for a level camera. The world frame
-    // is fixed so that +Y is up in the integration frame. The first
-    // accelerometer reading seeds the orientation and a Mahony-style
-    // proportional correction continuously nudges the predicted up direction
-    // toward the measured one (gated to only trust the accel while the camera
-    // is nearly still, so linear/centripetal acceleration during fast motion
-    // does not corrupt the estimate). Each stored orientation is then
-    // post-multiplied by kFlipRoll (180° roll) to un-flip the YI camera's
-    // inherently-upside-down video for display.
     const QQuaternion qInv = imuToCamera.conjugated();
 
-    // Seed the orientation from the first camera-still sample (|accel| near 1g
-    // and |gyro| low). Scan up to 1 second of samples so that recordings which
-    // start while the camera is being picked up / moved don't corrupt the seed.
-    // The gate mirrors the Mahony correction gate: 0.9-1.1 g + gyro < 60 deg/s.
-    QQuaternion current;
+    // Seed the orientation from the STILLEST moment anywhere in the clip.
+    //
+    // This used to scan only the first second, take the first sample that
+    // passed rather than the best one, and otherwise fall back to "any of the
+    // first 10 samples with |accel| > 0.3". On a clip that is already moving at
+    // frame 0 — a bullet-time orbit, say — nothing passes the gate, so the
+    // fallback seeded from an accelerometer reading dominated by CENTRIPETAL
+    // acceleration. That is not gravity, and it produced a starting attitude
+    // measured 156 deg from level on YIVR_0845 (against hand-authored reference
+    // keyframes). Everything downstream then inherits that error, and the
+    // gravity feedback spends the whole clip fighting it.
+    //
+    // Scanning the whole recording is safe because the pass integrates in BOTH
+    // directions from the seed, so anchoring mid-clip is exactly what the
+    // design already supports. Gravity is averaged over a short window whose
+    // rotation rate is low, which is what makes body-frame averaging valid.
+    int seedIdx = -1;
+    QQuaternion seed;
     {
-        bool seeded = false;
-        const int seedWindow = qMin((int)m_sampleRate, samples.size()); // 1 s
-        for (int k = 0; k < seedWindow && !seeded; k++) {
-            QVector3D a0 = qInv.rotatedVector(samples[k].accel);
-            float m0 = a0.length();
-            if (m0 < kMagLow || m0 > kMagHigh)
+        const int winLen = qMax(1, (int)(0.25 * sampleRate));   // 250 ms
+        const double nDur = (n > 1)
+            ? (samples[n - 1].timestamp - samples[0].timestamp) : 0.0;
+        double bestCost = 1e30;
+        QVector3D bestAccel(0.0f, 1.0f, 0.0f);
+
+        for (int k = 0; k + winLen <= n; k += qMax(1, winLen / 4)) {
+            QVector3D accSum(0, 0, 0);
+            double gyroSum = 0.0;
+            for (int j = k; j < k + winLen; j++) {
+                accSum += samples[j].accel;
+                gyroSum += samples[j].gyro.length();
+            }
+            const QVector3D accMean = accSum / (float)winLen;
+            const double gyroMean = gyroSum / winLen;
+
+            // Reject windows that are rotating enough for the accelerometer to
+            // be measuring anything other than gravity.
+            if (gyroMean >= kGyroGate)
                 continue;
-            // Also require the gyro to be low so we don't seed mid-motion.
-            float gRaw = samples[k].gyro.length();
-            if (gRaw >= kGyroGate)
+
+            const QVector3D a0 = qInv.rotatedVector(accMean);
+            const double mag = a0.length();
+            if (mag < 0.85 || mag > 1.15)
                 continue;
-            // Seed the orientation by leveling the camera (accel -> +Y) only.
-            // The 180° video un-flip (kFlipRoll) is applied at storage time,
-            // NOT here — see the kWorldUp/kFlipRoll comment above.
-            current = QQuaternion::rotationTo(a0 / m0,
-                                              QVector3D(0.0f, 1.0f, 0.0f));
-            qDebug() << "IMU seed: sample" << k << "accel_cam"
-                     << a0.x() << a0.y() << a0.z() << "mag" << m0;
-            seeded = true;
+
+            // Prefer near-exactly 1 g (little linear acceleration), as close to
+            // motionless as the clip offers, AND as early as possible.
+            //
+            // Earliness matters because everything before the seed is reached by
+            // integrating BACKWARDS from it, accumulating drift on the way — and
+            // hold-world-steady mode pins the virtual camera to the orientation
+            // at t=0, so error there contaminates the entire clip. Seeding at
+            // t=79 s on a 140 s clip (which the unweighted cost did on
+            // YIVR_0845) means the start is 79 s of backward integration away.
+            // The weight has to be heavy, not a tie-breaker. On YIVR_0845 a
+            // weight of 1.0 still chose t=38 s (nothing earlier is as still),
+            // and 38 s of backward integration left the chain 122 deg away from
+            // what the accelerometer says at the video start. A merely
+            // acceptable window at t=0.2 s beats an excellent one 38 s later.
+            const double whenFrac = (nDur > 0.0)
+                ? (samples[k + winLen / 2].timestamp - samples[0].timestamp) / nDur : 0.0;
+            const double cost = std::abs(mag - 1.0) * 10.0
+                              + gyroMean / kGyroGate
+                              + whenFrac * earlyWeight();
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestAccel = a0 / (float)mag;
+                seedIdx = k + winLen / 2;
+            }
         }
-        if (!seeded) {
-            // Fallback: no still moment found in first second; use the first
-            // sample with any reasonable accel magnitude (avoids all-zeros).
-            for (int k = 0; k < qMin(10, samples.size()); k++) {
-                QVector3D a0 = qInv.rotatedVector(samples[k].accel);
-                float m0 = a0.length();
-                if (m0 > 0.3f) {
-                    current = QQuaternion::rotationTo(a0 / m0,
-                                                      QVector3D(0.0f, 1.0f, 0.0f));
-                    qDebug() << "IMU seed (fallback): sample" << k
-                             << "accel_cam" << a0.x() << a0.y() << a0.z();
-                    break;
+
+        if (seedIdx >= 0) {
+            seed = (seedAdjust * QQuaternion::rotationTo(bestAccel, QVector3D(0.0f, 1.0f, 0.0f)))
+                       .normalized();
+            qDebug() << "IMU seed: sample" << seedIdx
+                     << QString("(t=%1s)").arg(samples[seedIdx].timestamp, 0, 'f', 2).toUtf8().constData()
+                     << "cost" << bestCost << "up_cam"
+                     << bestAccel.x() << bestAccel.y() << bestAccel.z();
+        } else {
+            // No window anywhere in the clip looks like still gravity. Use the
+            // single sample closest to 1 g rather than an arbitrary early one.
+            double best = 1e30;
+            for (int k = 0; k < n; k++) {
+                const QVector3D a0 = qInv.rotatedVector(samples[k].accel);
+                const double d = std::abs((double)a0.length() - 1.0);
+                if (d < best && a0.length() > 0.3f) {
+                    best = d;
+                    seed = QQuaternion::rotationTo(a0.normalized(), QVector3D(0.0f, 1.0f, 0.0f));
+                    seedIdx = k;
                 }
             }
+            if (seedIdx < 0) { seedIdx = 0; seed = QQuaternion(1, 0, 0, 0); }
+            seed = (seedAdjust * seed).normalized();
+            qWarning() << "IMU seed: no still window in clip; closest-to-1g sample"
+                       << seedIdx << "|accel|-1 =" << best;
         }
     }
 
-    // Mahony integral term: accumulates the gravity-alignment error while the
-    // accel is trusted, estimating and cancelling the gyro bias. It keeps
-    // running across fast-motion sections (the accumulator is not reset when
-    // the proportional gate closes), so roll/pitch drift does not re-accumulate
-    // once the correction converges.
+    // Mahony integral term + world-frame accel averaging, shared across the
+    // pass (both the backward and forward sweeps use the same state so the
+    // bias estimate and gravity observation are continuous through the seed).
     QVector3D integralFB(0.0f, 0.0f, 0.0f);
+    const int accelWindowSamples = qMax(1, (int)(accelAvgSeconds() * sampleRate));
+    // Ring buffer with a running sum. This used to be a QVector that re-summed
+    // all ~200 entries AND did a removeFirst() (an O(window) memmove) on every
+    // one of ~62 000 samples -- about 12 M vector adds and 148 MB of memmove
+    // per integration, on the GUI thread, and integrate() re-runs on every
+    // Drift-corr slider movement.
+    // The sum is kept in DOUBLE and re-derived exactly every few thousand
+    // samples. The Mahony gate is exp(-((|a|-1)/0.08)^2) feeding back into the
+    // orientation that produces the next |a|, so the chain amplifies tiny
+    // perturbations: a float running sum drifting by 1e-5 moved the measured
+    // start attitude by a few tenths of a degree. Doubles plus a periodic
+    // resync keep the result identical run to run.
+    QVector<QVector3D> accelRing(accelWindowSamples, QVector3D(0.0f, 0.0f, 0.0f));
+    double accelSumX = 0.0, accelSumY = 0.0, accelSumZ = 0.0;
+    int accelRingPos = 0;
+    int accelRingCount = 0;
+    int accelSinceResync = 0;
+    constexpr int kAccelResyncInterval = 4096;
 
-    for (int i = 0; i < samples.size(); i++) {
-        m_timestamps.append(samples[i].timestamp);
-        // Store the video-un-flip (180° roll) as part of the output orientation.
-        // The shader applies the conjugate, so output = current * kFlipRoll
-        // makes the shader sample kFlipRoll * current^-1 * ray (first the
-        // camera counter-rotation, then the rolled-video pixel correction).
-        m_orientations.append(current * kFlipRoll);
+    // Per-sample Mahony correction given the current camera orientation `cur`
+    // at (the neighborhood of) sample i. Outputs the measured body-rate
+    // gyroCam (deg/s), the correction corr (deg/s incl. integral feedback) and
+    // the trust gate in [0,1]. `dt` scales the integral accumulation.
+    auto mahonySample = [&](int i, const QQuaternion &cur, float dt,
+                            QVector3D &gyroCam, QVector3D &corr, float &gate) {
+        QVector3D gyroCorr = samples[i].gyro - bias;
+        gyroCam = qInv.rotatedVector(gyroCorr);
+        float cx = gyroCam.x(), cy = gyroCam.y(), cz = gyroCam.z();
 
-        if (i + 1 >= samples.size()) break;
-
-        float dt = (float)(samples[i + 1].timestamp - samples[i].timestamp);
-        if (dt <= 0.0f) dt = (float)(1.0 / m_sampleRate);
-
-        // Rotate the bias-corrected gyro from sensor axes into camera axes with
-        // the same qInv used for the accelerometer, so the gyro and the Mahony
-        // correction below share one frame (level accel -> +Y). No axis flip:
-        // flipping X/Y here would rotate the body frame the gyro integrates in
-        // and fight the accelerometer correction (doubling pitch/yaw motion).
-        QVector3D gyroCorr = samples[i].gyro - bias;                 // sensor axes
-        QVector3D gyroCam = qInv.rotatedVector(gyroCorr);            // camera axes
-
-        // Use the camera-frame gyro directly without IIR filtering.
-        // Quaternion integration is itself an integrator; sensor noise at
-        // 400 Hz integrates to almost nothing. The removed IIR (alpha=0.55)
-        // added ~2-3 ms lag which caused ~0.9° error at 300°/s shake rate.
-        float cx = gyroCam.x();  // camera X <- pitch
-        float cy = gyroCam.y();  // camera Y <- -yaw
-        float cz = gyroCam.z();  // camera Z <- -roll
-
-        // Accelerometer gravity correction (body-frame angular velocity).
-        QVector3D accel = qInv.rotatedVector(samples[i].accel);  // camera axes
-        float accelMag = accel.length();
-        float spinRate = std::sqrt(cx * cx + cy * cy + cz * cz);
-        // Soft/adaptive gating instead of a hard on/off cutoff: the accel is
-        // trusted fully below kGyroGate, fades to zero across the next
-        // kGyroGate degrees/s, and is disabled above that. This avoids the
-        // discontinuity a hard threshold causes when a quick roll decelerates
-        // through the gate (the correction popping in/out every sample).
-        // The magnitude window (0.9-1.1 g) still rejects linear/centripetal
-        // acceleration.
-        float gateFactor = 0.0f;
-        if (accelMag > kMagLow && accelMag < kMagHigh) {
-            if (spinRate < kGyroGate)
-                gateFactor = 1.0f;
-            else if (spinRate < 2.0f * kGyroGate)
-                gateFactor = 1.0f - (spinRate - kGyroGate) / kGyroGate;
+        // World-frame accel averaging: gravity is constant in world frame while
+        // linear/centripetal acceleration averages toward zero.
+        QVector3D accelCam = qInv.rotatedVector(samples[i].accel);
+        QVector3D accelWorld = cur.rotatedVector(accelCam);
+        if (accelRingCount == accelWindowSamples) {
+            const QVector3D &old = accelRing[accelRingPos];   // evict the oldest
+            accelSumX -= old.x(); accelSumY -= old.y(); accelSumZ -= old.z();
+        } else {
+            accelRingCount++;
         }
-        if (gateFactor > 0.0f) {
-            // Predicted gravity-up in the body frame vs measured. The accel
-            // reads specific force (up), so up is +accel in camera axes.
-            QVector3D upPred = current.conjugated().rotatedVector(kWorldUp);
-            QVector3D upMeas = accel / accelMag;
+        accelRing[accelRingPos] = accelWorld;
+        accelSumX += accelWorld.x(); accelSumY += accelWorld.y(); accelSumZ += accelWorld.z();
+        accelRingPos = (accelRingPos + 1) % accelWindowSamples;
+        if (++accelSinceResync >= kAccelResyncInterval) {
+            accelSinceResync = 0;
+            accelSumX = accelSumY = accelSumZ = 0.0;
+            for (int k = 0; k < accelRingCount; k++) {
+                const QVector3D &v = accelRing[k];
+                accelSumX += v.x(); accelSumY += v.y(); accelSumZ += v.z();
+            }
+        }
+        const double invN = 1.0 / accelRingCount;
+        QVector3D accelWorldAvg((float)(accelSumX * invN),
+                                (float)(accelSumY * invN),
+                                (float)(accelSumZ * invN));
+        QVector3D accelAvg = cur.conjugated().rotatedVector(accelWorldAvg);
+        float accelMag = accelAvg.length();
 
-            // cross(upPred, upMeas) is the body-frame axis to rotate around to
-            // align them. Its magnitude ≈ sin(angle) which is zero for both 0°
-            // (already aligned) and 180° (anti-parallel, singularity) errors.
-            // Handle the 180° case: pick any perpendicular axis and apply a
-            // finite correction kick to escape the singularity.
+        // Combined gate: Gaussian magnitude weight * spin-rate soft gate.
+        float magWeight = std::exp(-std::pow((accelMag - 1.0f) / 0.08f, 2));
+        float spinRate = std::sqrt(cx * cx + cy * cy + cz * cz);
+        float spinGate = 0.0f;
+        if (spinRate < kGyroGate)
+            spinGate = 1.0f;
+        else if (spinRate < 2.0f * kGyroGate)
+            spinGate = 1.0f - (spinRate - kGyroGate) / kGyroGate;
+        gate = magWeight * spinGate;
+
+        QVector3D err(0.0f, 0.0f, 0.0f);
+        if (gate > 0.0f) {
+            QVector3D upPred = cur.conjugated().rotatedVector(kWorldUp);
+            QVector3D upMeas = (accelMag > 1e-6f) ? (accelAvg / accelMag) : kWorldUp;
             float dotPU = QVector3D::dotProduct(upPred, upMeas);
-            QVector3D err;
             if (dotPU < -0.999f) {
-                // Nearly anti-parallel: kick toward alignment using a
-                // perpendicular axis (choose the axis least aligned with upPred
-                // to avoid a near-zero cross product here too).
                 QVector3D perp = (std::abs(upPred.x()) < 0.9f)
                                  ? QVector3D(1, 0, 0) : QVector3D(0, 1, 0);
                 err = QVector3D::crossProduct(upPred, perp).normalized();
             } else {
-                err = QVector3D::crossProduct(upPred, upMeas); // rad (≈ sin θ)
+                err = QVector3D::crossProduct(upPred, upMeas);
             }
-
-            // Accumulate the integral term (deg/s bias estimate) only while the
-            // accel is trusted — that is the only time err carries real signal.
-            // err is in rad (≈ sin θ); convert to degrees for consistency with
-            // the proportional term's gain.
             const float radToDeg = 180.0f / M_PI;
             integralFB += err * (accelKi * radToDeg) * dt;
-
-            // Add the proportional correction to the body-frame rate (rad->deg).
-            const float gain = accelKp * gateFactor * radToDeg;
-            cx += err.x() * gain;
-            cy += err.y() * gain;
-            cz += err.z() * gain;
         }
 
-        // The integral term (estimated gyro bias) is applied to the body rate
-        // unconditionally: its accumulation is gated above, but the feedback
-        // must persist even while the proportional gate is closed, otherwise
-        // the bias correction vanishes during exactly the fast-motion sections
-        // where drift would otherwise re-accumulate.
-        cx += integralFB.x();
-        cy += integralFB.y();
-        cz += integralFB.z();
+        // corr = proportional (gated) + integral (unconditional) correction.
+        const float radToDeg = 180.0f / M_PI;
+        corr = err * (accelKp * gate * radToDeg);
+        corr += integralFB;
+    };
 
-        float gxRad = qDegreesToRadians(cx);
-        float gyRad = qDegreesToRadians(cy);
-        float gzRad = qDegreesToRadians(cz);
-
-        float mag = std::sqrt(gxRad * gxRad + gyRad * gyRad + gzRad * gzRad);
-        if (mag < 0.0001f) continue;
-
-        QVector3D axis(gxRad / mag, gyRad / mag, gzRad / mag);
-        float angle = mag * dt;
-        QQuaternion delta = QQuaternion::fromAxisAndAngle(axis, qRadiansToDegrees(angle));
-        current = (current * delta).normalized();
+    // === Backward sweep: from the seed anchor down to sample 0 ===
+    // Orientation[i] is derived from orientation[i+1] by reversing the body
+    // rotation over [i, i+1]: a backward step uses R((-gyro + corr) * dt), so
+    // the +corr drives the older orientation toward measured gravity (the same
+    // sensitivity as the forward sweep).
+    QQuaternion cur = seed;
+    result.orientations[seedIdx] = cur;
+    QVector3D thPrevB(0, 0, 0), thPrevF(0, 0, 0);
+    if (seedIdx > 0) {
+        for (int i = seedIdx - 1; i >= 0; --i) {
+            float dt = (float)(samples[i + 1].timestamp - samples[i].timestamp);
+            if (dt <= 0.0f) dt = (float)(1.0 / sampleRate);
+            QVector3D gyroCam, corr; float gate;
+            mahonySample(i, cur, dt, gyroCam, corr, gate);
+            result.gateWeights[i] = gate;
+            QVector3D th((-gyroCam.x() + corr.x()) * dt,
+                         (-gyroCam.y() + corr.y()) * dt,
+                         (-gyroCam.z() + corr.z()) * dt);
+            th += QVector3D::crossProduct(thPrevB, th) * (1.0f / 12.0f);
+            thPrevB = QVector3D((-gyroCam.x() + corr.x()) * dt,
+                                (-gyroCam.y() + corr.y()) * dt,
+                                (-gyroCam.z() + corr.z()) * dt);
+            float mag = th.length();
+            if (mag > 1e-5f)
+                cur = (cur * QQuaternion::fromAxisAndAngle(th / mag, mag)).normalized();
+            result.orientations[i] = cur;
+        }
     }
 
-    qDebug() << "Gyro integrator:" << m_orientations.size() << "keyframes";
+    float peakIntegral = 0.0f;
+    // === Forward sweep: from the seed anchor to the end of the clip ===
+    // (A forward step uses R((+gyro + corr) * dt).) Two-sided coverage from the
+    // single seed means this pass is correct for the WHOLE clip — no more
+    // garbage before/after the seed, which was what the blend was snapping on.
+    cur = seed;
+    for (int i = seedIdx; i < n - 1; ++i) {
+        float dt = (float)(samples[i + 1].timestamp - samples[i].timestamp);
+        if (dt <= 0.0f) dt = (float)(1.0 / sampleRate);
+        QVector3D gyroCam, corr; float gate;
+        mahonySample(i, cur, dt, gyroCam, corr, gate);
+        result.gateWeights[i] = gate; // (overwrites seedIdx's default of 0)
+        peakIntegral = qMax(peakIntegral, integralFB.length());
+        QVector3D th((gyroCam.x() + corr.x()) * dt,
+                     (gyroCam.y() + corr.y()) * dt,
+                     (gyroCam.z() + corr.z()) * dt);
+        {
+            // Second-order (two-sample) coning correction. Composing one
+            // small rotation per sample is exact only when the axis is fixed
+            // between samples; when two axes oscillate together the true
+            // rotation over the step picks up (1/12) th_prev x th, which
+            // first-order integration silently drops and which accumulates as
+            // a systematic drift about the third axis.
+            th += QVector3D::crossProduct(thPrevF, th) * (1.0f / 12.0f);
+        }
+        thPrevF = QVector3D((gyroCam.x() + corr.x()) * dt,
+                            (gyroCam.y() + corr.y()) * dt,
+                            (gyroCam.z() + corr.z()) * dt);
+        float mag = th.length();
+        if (mag > 1e-5f)
+            cur = (cur * QQuaternion::fromAxisAndAngle(th / mag, mag)).normalized();
+        result.orientations[i + 1] = cur;
+    }
+    qDebug() << "Mahony integral term: peak" << peakIntegral << "deg/s, at end of clip"
+             << integralFB.length() << "deg/s  (a real gyro bias is < 1)";
+
+    return result;
+}
+
+void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sampleRate,
+                                    const QQuaternion &imuToCamera,
+                                    float accelKp, float accelKi,
+                                    const QMatrix3x3 &gyroMatrix,
+                                    const QVector3D &gyroBias)
+{
+    m_sampleRate = sampleRate;
+    m_orientations.clear();
+    m_timestamps.clear();
+    m_trust.clear();
+
+    if (samples.isEmpty()) return;
+
+    // Apply gyro calibration if non-trivial (matrix != identity or bias != zero).
+    // ω_corrected = M · ω_raw + b
+    // If M is identity and b is zero, use original samples (no copy needed).
+    bool hasGyroCal = (gyroMatrix != QMatrix3x3()) || (gyroBias != QVector3D());
+    QVector<ImuSample> correctedSamples;
+    const QVector<ImuSample> *workSamples = &samples;
+    if (hasGyroCal) {
+        correctedSamples.reserve(samples.size());
+        for (const auto &s : samples) {
+            ImuSample cs = s;
+            // ω_corrected = M · ω_raw + b
+            float gx = s.gyro.x(), gy = s.gyro.y(), gz = s.gyro.z();
+            cs.gyro = QVector3D(
+                gyroMatrix(0,0)*gx + gyroMatrix(0,1)*gy + gyroMatrix(0,2)*gz + gyroBias.x(),
+                gyroMatrix(1,0)*gx + gyroMatrix(1,1)*gy + gyroMatrix(1,2)*gz + gyroBias.y(),
+                gyroMatrix(2,0)*gx + gyroMatrix(2,1)*gy + gyroMatrix(2,2)*gz + gyroBias.z()
+            );
+            correctedSamples.append(cs);
+        }
+        workSamples = &correctedSamples;
+        qDebug() << "GyroIntegrator: applying gyro calibration matrix + bias";
+    }
+
+    const int n = workSamples->size();
+    m_orientations.reserve(n);
+    m_timestamps.reserve(n);
+
+    // Single-pass integration. The forward Mahony pass is anchored at the
+    // earliest still sample and integrates BOTH directions from that anchor
+    // (backward into the pre-seed region, forward to the end), so the entire
+    // chain is continuous and gravity-aligned at the seed.
+    //
+    // A two-pass (forward+backward) blend was tried here, but the accelerometer-
+    // derived seed attitudes and the gyro-integrated trajectory disagree by up
+    // to ~170° on these handheld clips (426° gyro rotation vs 44° gravity
+    // change between anchors), so the two passes sit in different absolute
+    // attitudes and any blend between them snaps — the source of the one-frame
+    // "flickers". A single continuous pass cannot flicker. Slow drift that this
+    // sacrifices is recovered by the visual-fusion correction (q_virtual).
+    QVector3D bias = m_haveForcedBias ? m_forcedBias : computeGyroBias(*workSamples);
+    qDebug() << "Gyro bias:" << bias.x() << bias.y() << bias.z() << "deg/s";
+
+    PassResult fwd = integratePass(*workSamples, sampleRate, imuToCamera,
+                                   accelKp, accelKi, bias, /*forward=*/true);
+
+    // World-frame re-levelling from the accelerometer, at a time scale of tens
+    // of seconds. This is the ONLY place the accelerometer touches the chain.
+    //
+    // The per-sample Mahony feedback that used to do this job was the cause of
+    // the "horizon rolled 45-90 deg for the first 30 s" failure on YIVR_0845:
+    // on a pole-swung camera the accelerometer reads centripetal force most of
+    // the time, and whenever the gate cracked open the proportional term
+    // (0.35 * 180/pi = 20 deg/s per radian of error) yanked the chain toward a
+    // false "up". Rendering with the feedback disabled produced level frames
+    // from 0.5 s to the end; with a tenth of the gain they were rolled 45 deg.
+    // Gyro-only, the chain holds to within 2 deg of gravity over 100 s on that
+    // clip, and 0807's residual drift drops from 10 to 2.6 deg.
+    //
+    // What the gyro cannot do is hold tilt over many minutes, so the absolute
+    // datum comes from the accelerometer averaged where the gate trusts it,
+    // over a window long enough (kRelevelSigmaSec) that short-lived
+    // contamination averages out while genuine slow drift is still followed.
+    // Each orientation is left-multiplied by the rotation taking the smoothed
+    // world-frame gravity onto +Y at its own time.
+    if (!m_relevel) {
+        qDebug() << "IMU world re-level: disabled (reproduction mode)";
+    } else {
+        const QQuaternion qInvCam = imuToCamera.conjugated();
+        // Trusted world-frame gravity samples, decimated to ~10 Hz for speed.
+        struct GSample { double t; QVector3D g; float w; };
+        QVector<GSample> gs;
+        const int stride = qMax(1, (int)(sampleRate / 10.0));
+        for (int i = 0; i < n; i += stride) {
+            const float w = (i < fwd.gateWeights.size()) ? fwd.gateWeights[i] : 0.0f;
+            if (w <= 0.01f) continue;
+            const QVector3D a = qInvCam.rotatedVector((*workSamples)[i].accel);
+            const float m = a.length();
+            if (m < 1e-6f) continue;
+            gs.append({(*workSamples)[i].timestamp, fwd.orientations[i].rotatedVector(a / m), w});
+        }
+        double wsum = 0.0;
+        for (const auto &g : gs) wsum += g.w;
+        const double trustedSeconds = wsum * stride / sampleRate;
+
+        if (trustedSeconds < 2.0) {
+            qWarning() << "IMU world re-level: only" << trustedSeconds
+                       << "s of trusted gravity in the clip; keeping the seed as measured";
+        } else {
+            // Gaussian-smoothed gravity direction at each orientation's time.
+            const double sigma = kRelevelSigmaSec;
+            const double inv2s2 = 1.0 / (2.0 * sigma * sigma);
+            int lo = 0;
+            double maxTilt = 0.0, meanTilt = 0.0; int nt = 0;
+            for (int i = 0; i < n; i++) {
+                const double t = (*workSamples)[i].timestamp;
+                while (lo < gs.size() && gs[lo].t < t - 3.0 * sigma) lo++;
+                QVector3D acc(0, 0, 0); double aw = 0.0;
+                for (int k = lo; k < gs.size() && gs[k].t <= t + 3.0 * sigma; k++) {
+                    const double dt = gs[k].t - t;
+                    const double w = gs[k].w * std::exp(-dt * dt * inv2s2);
+                    acc += gs[k].g * (float)w; aw += w;
+                }
+                if (aw < 1e-6 || acc.length() < 1e-4f) {
+                    // No trusted gravity within +-3 sigma: hold the nearest.
+                    const GSample &nearest = (lo < gs.size()) ? gs[lo] : gs.last();
+                    acc = nearest.g;
+                }
+                acc.normalize();
+                const double tilt = std::acos(qBound(-1.0,
+                    (double)QVector3D::dotProduct(acc, kWorldUp), 1.0)) * 180.0 / M_PI;
+                maxTilt = qMax(maxTilt, tilt); meanTilt += tilt; nt++;
+                if (tilt > 0.05)
+                    fwd.orientations[i] = (QQuaternion::rotationTo(acc, kWorldUp)
+                                           * fwd.orientations[i]).normalized();
+            }
+            qDebug() << "IMU world re-level: gravity-trusted" << trustedSeconds
+                     << "s; applied correction mean" << (nt ? meanTilt / nt : 0.0)
+                     << "deg, max" << maxTilt << "deg, smoothed over sigma" << sigma << "s";
+        }
+    }
+
+    m_trust.clear();
+    m_trust.reserve(n);
+    for (int i = 0; i < n; i++) {
+        m_timestamps.append((*workSamples)[i].timestamp);
+        QQuaternion q = (i < fwd.orientations.size())
+                        ? fwd.orientations[i] : QQuaternion();
+        // Apply the video un-flip (180° roll about Z) after integration.
+        m_orientations.append(q * kFlipRoll);
+        m_trust.append(i < fwd.gateWeights.size() ? fwd.gateWeights[i] : 0.0f);
+    }
+
+
+    qDebug() << "Gyro integrator (single pass):" << m_orientations.size() << "keyframes";
 }
 
 QQuaternion GyroscopeIntegrator::orientationAtTime(double time, float smoothingMs) const
 {
+    // q_virtual (the deliberately smooth "virtual tripod" path). When visual
+    // fusion is available its slow yaw/pitch/roll-drift correction belongs HERE
+    // — the fused chain is a low-frequency-corrected version of the gyro chain,
+    // and it is Gaussian-smoothed before use, so its knot noise is averaged
+    // out. Falls back to the pure gyro chain when fusion is unavailable.
+    if (m_useFused)
+        return orientationAt(m_fusedOrientations, m_fusedTimestamps, time, smoothingMs);
     return orientationAt(m_orientations, m_timestamps, time, smoothingMs);
 }
 
 QQuaternion GyroscopeIntegrator::orientationAtTimeUnsmoothed(double time) const
 {
-    if (m_orientations.isEmpty()) return QQuaternion();
+    // q_actual (full-bandwidth, unsmoothed). This MUST be sampled from the SAME
+    // chain as q_virtual (orientationAtTime): the two-signal correction is
+    // q_virtual^{-1} * q_actual, so if one comes from the fused chain and the
+    // other from the raw gyro chain, the high-frequency shake (present in both)
+    // cancels out and only the slow visual drift correction survives — making
+    // the stabilization look like a no-op. The fused chain is the gyro chain
+    // with a low-frequency correction applied, so its shake content is
+    // identical to the raw chain; sampling both paths from it keeps the shake
+    // cancellation intact while q_virtual carries the drift correction.
+    const QVector<QQuaternion> &oris = m_useFused ? m_fusedOrientations : m_orientations;
+    const QVector<double> &ts = m_useFused ? m_fusedTimestamps : m_timestamps;
 
-    if (time <= m_timestamps.first())
-        return m_orientations.first();
-    if (time >= m_timestamps.last())
-        return m_orientations.last();
+    if (oris.isEmpty()) return QQuaternion();
+
+    if (time <= ts.first())
+        return oris.first();
+    if (time >= ts.last())
+        return oris.last();
 
     // Binary search for the bracketing index
-    const auto it = std::lower_bound(m_timestamps.begin(), m_timestamps.end(), time);
-    int i = (it == m_timestamps.end()) ? m_timestamps.size() - 1
-                                       : (int)(it - m_timestamps.begin());
-    if (i > 0 && m_timestamps[i] > time) i--;
+    const auto it = std::lower_bound(ts.begin(), ts.end(), time);
+    int i = (it == ts.end()) ? ts.size() - 1
+                             : (int)(it - ts.begin());
+    if (i > 0 && ts[i] > time) i--;
 
     // Slerp between the two bracketing quaternions (no Gaussian smoothing)
-    if (i + 1 >= m_orientations.size())
-        return m_orientations.last();
+    if (i + 1 >= oris.size())
+        return oris.last();
 
-    double dt = m_timestamps[i + 1] - m_timestamps[i];
-    float t = (dt > 0.0) ? (float)((time - m_timestamps[i]) / dt) : 0.0f;
+    double dt = ts[i + 1] - ts[i];
+    float t = (dt > 0.0) ? (float)((time - ts[i]) / dt) : 0.0f;
     t = qBound(0.0f, t, 1.0f);
 
-    return QQuaternion::slerp(m_orientations[i], m_orientations[i + 1], t);
+    return QQuaternion::slerp(oris[i], oris[i + 1], t);
 }
 
 QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orientations,
@@ -348,8 +657,16 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
     const float halfMs = windowMs / 2.0f;
     const float sigmaMs = windowMs / 4.0f;
 
-    const double t0 = time - halfMs;
-    const double t1 = time + halfMs;
+    // halfMs is MILLISECONDS; timestamps are SECONDS. Subtracting it directly
+    // (the old code) made the bracket +-150 s at smoothing=1 and +-16.5 s even
+    // at the 33 ms floor, so both walks ran to the ends of the array and the
+    // average below iterated EVERY sample in the clip -- ~62 k instead of ~120
+    // on a 154 s clip, once per preview frame and twice per exported frame.
+    // The result was still correct (out-of-window weights underflow to zero);
+    // only the cost was wrong, and it grew with clip length.
+    const double halfSec = halfMs / 1000.0;
+    const double t0 = time - halfSec;
+    const double t1 = time + halfSec;
     int lo = i, hi = i;
     while (lo > 0 && timestamps[lo] > t0) lo--;
     while (hi < timestamps.size() - 1 && timestamps[hi] < t1) hi++;
@@ -378,4 +695,29 @@ QQuaternion GyroscopeIntegrator::orientationAt(const QVector<QQuaternion> &orien
     avg /= wsum;
     avg.normalize();
     return avg;
+}
+
+void GyroscopeIntegrator::setFusedOrientations(const QVector<QQuaternion> &orientations,
+                                                const QVector<double> &timestamps)
+{
+    m_fusedOrientations = orientations;
+    m_fusedTimestamps = timestamps;
+    m_useFused = !orientations.isEmpty();
+    if (m_useFused) {
+        qDebug() << "GyroscopeIntegrator: using" << orientations.size()
+                 << "fused orientations from VisualFusion";
+    }
+}
+
+void GyroscopeIntegrator::clearFusedOrientations()
+{
+    m_fusedOrientations.clear();
+    m_fusedTimestamps.clear();
+    m_useFused = false;
+}
+
+QQuaternion GyroscopeIntegrator::firstOrientation() const
+{
+    const QVector<QQuaternion> &oris = m_useFused ? m_fusedOrientations : m_orientations;
+    return oris.isEmpty() ? QQuaternion() : oris.first();
 }

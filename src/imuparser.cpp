@@ -62,9 +62,26 @@ bool ImuParser::loadFile(const QString &path)
     // residual proportional to the motion (e.g. 2.6% yaw scale error -> ~2.3°
     // residual after a 90° pan), which shows up as the persistent pan/tilt
     // oscillation measured by vidstabdetect.
-    const double kGyroScaleRoll  = 32.18;   // t1[3], X=roll
-    const double kGyroScalePitch = 33.51;   // t1[1], Y=pitch
-    const double kGyroScaleYaw   = 33.64;   // t1[2], Z=yaw
+    // REVISED AGAIN, against GRAVITY, which reverses the visual-fitted values
+    // that were here (34.86 / 34.60 / 33.42). Those were fitted to the visual
+    // rotation chain, which under-measures rotation on fast footage by 8-20%
+    // (motion blur and the outlier trim both discard the largest-displacement
+    // correspondences), so calibrating the gyro to it baked that bias into
+    // every clip: with 34.86 a single 369 deg roll left the horizon 31.4 deg
+    // off where it started (tracking_tests --tilt on JustRoll).
+    //
+    // Gravity is an absolute reference for roll and pitch: after a full turn
+    // about either axis the accelerometer must agree with the integrated chain
+    // again. Sweeping each scale to minimise that closure error:
+    //
+    //     roll  (JustRoll,  369 deg):  31.90->5.9  32.18->2.5  32.32->1.8  32.45->2.7
+    //     pitch (JustPitch, 367 deg):  32.80->5.4  33.05->2.6  33.20->1.5  33.51->3.8
+    //
+    // The ~1.5-1.8 deg floor is the seed's own accuracy. Yaw has no gravity
+    // reference; 33.64 (from the one-turn integration of JustYaw) is kept.
+    const double kGyroScaleRoll  = 32.32;   // t1[3], X=roll   (gravity closure)
+    const double kGyroScalePitch = 33.22;   // t1[1], Y=pitch  (gravity closure)
+    const double kGyroScaleYaw   = 33.64;   // t1[2], Z=yaw    (one-turn integration)
     if (calib[0] > 0.0 && calib[0] < 1000.0) {
         // Use the measured per-axis scales if the nominal header scale matches
         // the known 32.8 (otherwise fall back to the header value).
@@ -72,6 +89,22 @@ bool ImuParser::loadFile(const QString &path)
             m_gyroScaleX = kGyroScaleRoll;   // X=roll
             m_gyroScaleY = kGyroScalePitch;  // Y=pitch
             m_gyroScaleZ = kGyroScaleYaw;    // Z=yaw
+            // Measurement hooks: setGyroScaleOverride(), or
+            // RENDER360_GYRO_SCALE=roll,pitch,yaw (LSB per deg/s).
+            const QByteArray ov = qgetenv("RENDER360_GYRO_SCALE");
+            if (m_scaleOverride) {
+                m_gyroScaleX = m_ovX; m_gyroScaleY = m_ovY; m_gyroScaleZ = m_ovZ;
+            } else if (!ov.isEmpty()) {
+                const auto parts = ov.split(',');
+                if (parts.size() == 3) {
+                    m_gyroScaleX = parts[0].toDouble();
+                    m_gyroScaleY = parts[1].toDouble();
+                    m_gyroScaleZ = parts[2].toDouble();
+                }
+            }
+            if (m_scaleOverride || !ov.isEmpty())
+                qWarning() << "ImuParser: gyro scales overridden to"
+                           << m_gyroScaleX << m_gyroScaleY << m_gyroScaleZ;
         } else {
             m_gyroScaleX = m_gyroScaleY = m_gyroScaleZ = calib[0];
         }

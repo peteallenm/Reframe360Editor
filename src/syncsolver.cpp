@@ -3,20 +3,20 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <limits>
+#include <QDebug>
 
 static constexpr double PI = 3.14159265358979323846;
 static constexpr double CORR_STEP = 0.002;       // 2 ms cross-correlation step
 static constexpr double CORR_RANGE = 0.5;         // ±0.5 s search range
 static constexpr int MIN_WINDOWS = 3;             // minimum valid windows
 static constexpr double PEAK_THRESHOLD = 0.3;     // minimum normalized peak
-// The IMU and video clocks are both crystal-derived, so their relative rate
-// error is parts-per-thousand at worst (measured on these clips: ~6e-4).
-// 0.05 s/s — the old bound — is three orders of magnitude past anything
-// physical, so a fit that reached it was never clamped back to plausibility,
-// it was rubber-stamped. Drift outside this band now falls back to the
-// caller's initial estimate (which App derives from the stream durations)
-// rather than being stored as a measurement.
-static constexpr double MAX_DRIFT = 0.005;        // ±0.5% s/s
+// Two crystal oscillators at +-50 ppm each disagree by at most ~1e-4 s/s;
+// even sloppy ones stay inside ~2e-4. 5e-4 is already generous. The previous
+// 5e-3 was 25x past anything physical, which let a 13 s clip come back with
+// "0.45 %/s of clock drift" that was really a line fitted to 3 ms of window
+// scatter over a 5 s lever arm.
+static constexpr double MAX_DRIFT = 5e-4;         // s/s
 // The cross-correlation only searches ±CORR_RANGE, so an absolute offset well
 // outside that range can only have come from the line fit extrapolating past
 // its own data. Reject rather than store.
@@ -28,6 +28,116 @@ static constexpr int TARGET_WINDOWS = 12;         // target number of windows
 static constexpr int MIN_WINDOWS_COUNT = 8;
 static constexpr int MAX_WINDOWS_COUNT = 16;
 static constexpr double WINDOW_DURATION = 1.0;    // 1-second sliding window for variance
+// Per-window lag search. The global stage has already aligned the streams to
+// within a few frames, so a window only has to resolve the local residual.
+// Searching ±0.5 s inside a 1 s window (the old range) meant that at the
+// extremes half the window had slid off the end of its own data.
+static constexpr double WINDOW_LAG_RANGE = 0.10;  // ±100 ms
+// A window needs enough samples for a correlation to mean anything.
+static constexpr int MIN_WINDOW_SAMPLES = 5;
+// How many standard errors a fitted slope must clear before it is treated as a
+// measurement rather than as noise in the per-window offsets.
+static constexpr double kDriftSignificance = 3.0;
+
+// Decide whether a fitted slope is a measurement. It has to be both
+// physically possible AND resolvable against the scatter of the windows it was
+// fitted through. When it is neither, zero it and re-estimate the intercept as
+// the weighted mean of the offsets — the per-window refinement of the OFFSET is
+// still worth keeping even when the clip is too short to see any drift.
+template <typename Offsets>
+static void acceptSlope(const Offsets &offsets, double &o0, double &drift, double se)
+{
+    const bool physical   = std::abs(drift) <= MAX_DRIFT;
+    const bool resolvable = std::abs(drift) > kDriftSignificance * se;
+    if (physical && resolvable)
+        return;
+
+    qDebug("SyncSolver: fitted drift %.4g s/s rejected (%s, %s; stderr %.3g) "
+           "- using a constant offset", drift,
+           physical ? "physical" : "IMPLAUSIBLE",
+           resolvable ? "resolvable" : "within noise", se);
+
+    double W = 0.0, Wo = 0.0;
+    for (const auto &lo : offsets) { W += lo.weight; Wo += lo.weight * lo.offsetLocal; }
+    if (W > 0.0)
+        o0 = Wo / W;
+    drift = 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// GyroIntegral
+// ---------------------------------------------------------------------------
+void GyroIntegral::build(const QVector<ImuSample> &samples, double step)
+{
+    m_prefix.clear();
+    if (samples.size() < 2 || step <= 0.0)
+        return;
+
+    m_t0 = samples.first().timestamp;
+    m_step = step;
+    const double span = samples.last().timestamp - m_t0;
+    const int n = static_cast<int>(span / m_step);
+    if (n < 2)
+        return;
+
+    m_prefix.resize(n + 1);
+    m_prefix[0] = QVector3D(0.0f, 0.0f, 0.0f);
+
+    // Walk the raw samples once alongside the grid (no per-point binary search).
+    int si = 0;
+    QVector3D acc(0.0f, 0.0f, 0.0f);
+    QVector3D prevG = samples.first().gyro;
+    for (int i = 1; i <= n; i++) {
+        const double t = m_t0 + i * m_step;
+        while (si + 1 < samples.size() - 1 && samples[si + 1].timestamp < t)
+            si++;
+        // Linear interpolation between samples[si] and samples[si+1].
+        QVector3D g;
+        const double ta = samples[si].timestamp;
+        const double tb = samples[si + 1].timestamp;
+        if (tb - ta < 1e-12) {
+            g = samples[si].gyro;
+        } else {
+            const float f = static_cast<float>(qBound(0.0, (t - ta) / (tb - ta), 1.0));
+            g = samples[si].gyro + (samples[si + 1].gyro - samples[si].gyro) * f;
+        }
+        // Trapezoid: the integral is in degrees, so meanOver is deg/s.
+        acc += (prevG + g) * static_cast<float>(m_step * 0.5);
+        prevG = g;
+        m_prefix[i] = acc;
+    }
+}
+
+QVector3D GyroIntegral::integralAt(double t) const
+{
+    const double x = (t - m_t0) / m_step;
+    const int i = static_cast<int>(std::floor(x));
+    if (i < 0) return m_prefix.first();
+    if (i >= m_prefix.size() - 1) return m_prefix.last();
+    const float f = static_cast<float>(x - i);
+    return m_prefix[i] + (m_prefix[i + 1] - m_prefix[i]) * f;
+}
+
+bool GyroIntegral::meanOver(double a, double b, QVector3D &out) const
+{
+    if (!isValid())
+        return false;
+    if (b < a) std::swap(a, b);
+    if (a < tBegin() || b > tEnd())
+        return false;
+
+    const double dt = b - a;
+    if (dt < 1e-9) {
+        // Degenerate interval: fall back to the local slope.
+        const double h = m_step;
+        if (a - h * 0.5 < tBegin() || a + h * 0.5 > tEnd())
+            return false;
+        out = (integralAt(a + h * 0.5) - integralAt(a - h * 0.5)) / static_cast<float>(h);
+        return true;
+    }
+    out = (integralAt(b) - integralAt(a)) / static_cast<float>(dt);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Quaternion → axis-angle (degrees)
@@ -62,41 +172,6 @@ QVector3D SyncSolver::quaternionToAxisAngle(const QQuaternion &q)
 }
 
 // ---------------------------------------------------------------------------
-// Interpolate gyro at arbitrary time from IMU samples (binary search + lerp)
-// ---------------------------------------------------------------------------
-QVector3D SyncSolver::interpolateGyro(const QVector<ImuSample> &samples, double t)
-{
-    if (samples.isEmpty())
-        return QVector3D(0.0f, 0.0f, 0.0f);
-
-    if (t <= samples.first().timestamp)
-        return samples.first().gyro;
-    if (t >= samples.last().timestamp)
-        return samples.last().gyro;
-
-    // Binary search for bracketing index
-    auto it = std::lower_bound(samples.constBegin(), samples.constEnd(), t,
-        [](const ImuSample &s, double val) { return s.timestamp < val; });
-
-    int hi = static_cast<int>(std::distance(samples.constBegin(), it));
-    if (hi <= 0) hi = 1;
-    if (hi >= samples.size()) hi = samples.size() - 1;
-    int lo = hi - 1;
-
-    double dt = samples[hi].timestamp - samples[lo].timestamp;
-    if (dt < 1e-12)
-        return samples[lo].gyro;
-
-    double frac = (t - samples[lo].timestamp) / dt;
-    const QVector3D &g0 = samples[lo].gyro;
-    const QVector3D &g1 = samples[hi].gyro;
-
-    return QVector3D(static_cast<float>(g0.x() + (g1.x() - g0.x()) * frac),
-                     static_cast<float>(g0.y() + (g1.y() - g0.y()) * frac),
-                     static_cast<float>(g0.z() + (g1.z() - g0.z()) * frac));
-}
-
-// ---------------------------------------------------------------------------
 // Step 2: Compute visual rotation rates
 // ---------------------------------------------------------------------------
 QVector<SyncSolver::VisualRateSample> SyncSolver::computeVisualRates(
@@ -110,195 +185,134 @@ QVector<SyncSolver::VisualRateSample> SyncSolver::computeVisualRates(
         if (dt < 1e-6)
             continue;
 
-        double tMid = (pair.t0 + pair.t1) * 0.5;
         QVector3D axisAngle = quaternionToAxisAngle(pair.deltaR);
         QVector3D omega(axisAngle.x() / static_cast<float>(dt),
                         axisAngle.y() / static_cast<float>(dt),
                         axisAngle.z() / static_cast<float>(dt));
 
-        rates.append({tMid, omega});
+        rates.append({pair.t0, pair.t1, (pair.t0 + pair.t1) * 0.5,
+                      omega, (double)omega.length()});
     }
 
+    std::sort(rates.begin(), rates.end(),
+              [](const VisualRateSample &a, const VisualRateSample &b) {
+                  return a.tMid < b.tMid;
+              });
     return rates;
 }
 
 // ---------------------------------------------------------------------------
-// Step 3: Sample gyro rates at visual times
+// The one correlation primitive (see the header for why magnitudes, why
+// Pearson, and why the normalisation is recomputed per lag).
 // ---------------------------------------------------------------------------
-QVector<SyncSolver::GyroRateSample> SyncSolver::sampleGyroRates(
-    const QVector<VisualRateSample> &visualRates,
-    const QVector<ImuSample> &imuSamples,
-    double drift, double offset)
+double SyncSolver::correlate(const QVector<VisualRateSample> &vis, int lo, int hi,
+                             const GyroIntegral &gyro, double drift, double lag)
 {
-    QVector<GyroRateSample> gyroRates;
-    gyroRates.reserve(visualRates.size());
-
-    for (const auto &vr : visualRates) {
-        // Map video time to IMU time
-        double tImu = vr.tMid * (1.0 + drift) + offset;
-        QVector3D gyro = interpolateGyro(imuSamples, tImu);
-        gyroRates.append({vr.tMid, gyro});
+    double sv = 0.0, sg = 0.0, svv = 0.0, sgg = 0.0, svg = 0.0;
+    int n = 0;
+    for (int i = lo; i < hi; i++) {
+        const double a = vis[i].t0 * (1.0 + drift) + lag;
+        const double b = vis[i].t1 * (1.0 + drift) + lag;
+        QVector3D g;
+        if (!gyro.meanOver(a, b, g))
+            continue;                       // outside the IMU stream
+        const double gm = g.length();
+        const double vm = vis[i].mag;
+        sv += vm; sg += gm;
+        svv += vm * vm; sgg += gm * gm; svg += vm * gm;
+        n++;
     }
+    if (n < 3)
+        return -2.0;
 
-    return gyroRates;
+    const double dn = static_cast<double>(n);
+    const double covar = svg - sv * sg / dn;
+    const double varV  = svv - sv * sv / dn;
+    const double varG  = sgg - sg * sg / dn;
+    if (varV <= 1e-12 || varG <= 1e-12)
+        return -2.0;
+    return covar / std::sqrt(varV * varG);
 }
 
 // ---------------------------------------------------------------------------
-// Step 4a: Global cross-correlation of full visual-rate vs gyro-rate signals.
-// The gyro is resampled from the raw IMU at (tMid + lag) for each candidate
-// lag, which is a true temporal shift of the IMU stream. Returns the lag that
-// maximizes the summed 3-axis correlation.
+// Scan a lag range and parabolically refine the peak from the cached scores.
 // ---------------------------------------------------------------------------
-double SyncSolver::globalCrossCorrelate(const QVector<VisualRateSample> &visualRates,
-                                        const QVector<ImuSample> &imuSamples,
-                                        double drift, double *bestLagOut) const
+double SyncSolver::bestLag(const QVector<VisualRateSample> &vis, int lo, int hi,
+                           const GyroIntegral &gyro, double drift,
+                           double centre, double range, double step,
+                           double *scoreOut)
 {
-    if (visualRates.size() < 3 || imuSamples.size() < 2)
-        return 0.0;
-
-    const double lagMin = -CORR_RANGE;
-    const double lagMax =  CORR_RANGE;
-    int steps = static_cast<int>(std::round((lagMax - lagMin) / CORR_STEP));
-
-    double bestScore = -1e18;
-    double bestLag = 0.0;
-
-    // Correlate rotation-rate MAGNITUDES, as a properly normalised (Pearson)
-    // correlation. Both details matter and both were wrong:
-    //
-    //  - FRAME: omegaVisual is expressed in the camera/bearing frame while
-    //    interpolateGyro returns RAW SENSOR axes. A component-wise dot product
-    //    between two different frames does not peak at the true lag at all.
-    //    Magnitude is frame-independent, so it sidesteps the question entirely.
-    //
-    //  - NORMALISATION: the old score was a bare inner product with only the
-    //    visual side zero-meaned. That is maximised wherever the gyro happens
-    //    to be biggest, not where the two signals line up, so the "peak" drifted
-    //    toward the most energetic part of the clip.
-    //
-    // Measured against a ground-truth sweep, the old code returned 0.395 s on
-    // YIVR_0830 (truth 0.165) and 0.272 s on YIVR_0845 (truth 0.150) — a
-    // quarter-second error, which at 91-169 deg/s is far more shake than it
-    // removes.
-    const int nv = visualRates.size();
-    QVector<double> vmag(nv);
-    double vMean = 0.0;
-    for (int i = 0; i < nv; i++) { vmag[i] = visualRates[i].omegaVisual.length(); vMean += vmag[i]; }
-    vMean /= nv;
-    double vVar = 0.0;
-    for (int i = 0; i < nv; i++) vVar += (vmag[i]-vMean) * (vmag[i]-vMean);
-    if (vVar <= 0.0) return 0.0;
-
-    QVector<double> gmag(nv);
+    const int steps = qMax(2, static_cast<int>(std::round(2.0 * range / step)));
+    QVector<double> score(steps + 1);
+    int bestIdx = 0;
+    double best = -1e18;
     for (int s = 0; s <= steps; ++s) {
-        double lag = lagMin + s * CORR_STEP;
-        double gMean = 0.0;
-        for (int i = 0; i < nv; i++) {
-            const double tImu = visualRates[i].tMid * (1.0 + drift) + lag;
-            gmag[i] = interpolateGyro(imuSamples, tImu).length();
-            gMean += gmag[i];
-        }
-        gMean /= nv;
-        double num = 0.0, gVar = 0.0;
-        for (int i = 0; i < nv; i++) {
-            const double dv = vmag[i] - vMean, dg = gmag[i] - gMean;
-            num += dv * dg;
-            gVar += dg * dg;
-        }
-        const double score = (gVar > 0.0) ? num / std::sqrt(vVar * gVar) : -1e18;
-        if (score > bestScore) {
-            bestScore = score;
-            bestLag = lag;
-        }
+        const double lag = centre - range + s * step;
+        score[s] = correlate(vis, lo, hi, gyro, drift, lag);
+        if (score[s] > best) { best = score[s]; bestIdx = s; }
     }
+    if (scoreOut) *scoreOut = best;
+    if (best <= -1.5)
+        return centre;
 
-    // Refine the peak with parabolic interpolation for sub-ms precision.
-    int bestIdx = static_cast<int>(std::round((bestLag - lagMin) / CORR_STEP));
+    double lag = centre - range + bestIdx * step;
+    // Parabolic refinement, reusing the scores already computed rather than
+    // re-evaluating three full correlations.
     if (bestIdx > 0 && bestIdx < steps) {
-        double c0 = -1e18, cm = -1e18, cp = -1e18;
-        for (int j = bestIdx - 1; j <= bestIdx + 1; ++j) {
-            double lag = lagMin + j * CORR_STEP;
-            double gMean = 0.0;
-            for (int i = 0; i < nv; i++) {
-                const double tImu = visualRates[i].tMid * (1.0 + drift) + lag;
-                gmag[i] = interpolateGyro(imuSamples, tImu).length();
-                gMean += gmag[i];
-            }
-            gMean /= nv;
-            double num = 0.0, gVar = 0.0;
-            for (int i = 0; i < nv; i++) {
-                const double dv = vmag[i] - vMean, dg = gmag[i] - gMean;
-                num += dv * dg; gVar += dg * dg;
-            }
-            const double score = (gVar > 0.0) ? num / std::sqrt(vVar * gVar) : -1e18;
-            if (j == bestIdx) c0 = score;
-            else if (j < bestIdx) cm = score;
-            else cp = score;
-        }
-        double denom = cm - 2.0 * c0 + cp;
-        if (std::abs(denom) > 1e-12) {
-            double delta = 0.5 * (cm - cp) / denom;
-            bestLag += qBound(-1.0, delta, 1.0) * CORR_STEP;
-        }
+        const double ym1 = score[bestIdx - 1], y0 = score[bestIdx], yp1 = score[bestIdx + 1];
+        const double denom = ym1 - 2.0 * y0 + yp1;
+        if (std::abs(denom) > 1e-12)
+            lag += qBound(-1.0, 0.5 * (ym1 - yp1) / denom, 1.0) * step;
     }
-
-    if (bestLagOut)
-        *bestLagOut = bestLag;
-    return bestScore;
+    return lag;
 }
 
 // ---------------------------------------------------------------------------
-// Step 4b: Per-window local offsets (for the joint drift/offset line fit).
-// The gyro is resampled from the raw IMU at the window's visual times plus a
-// small local refinement around the global offset, giving per-window lags.
+// Per-window local offsets for the joint drift/offset line fit.
 // ---------------------------------------------------------------------------
 QVector<SyncSolver::LocalOffset> SyncSolver::crossCorrelateWindows(
     const QVector<VisualRateSample> &visualRates,
-    const QVector<GyroRateSample> &gyroRates)
+    const GyroIntegral &gyro, double drift, double baseLag)
 {
     QVector<LocalOffset> results;
-    if (visualRates.isEmpty() || visualRates.size() != gyroRates.size())
+    const int n = visualRates.size();
+    if (n < MIN_WINDOW_SAMPLES)
         return results;
 
-    int n = visualRates.size();
-    double tMin = visualRates.first().tMid;
-    double tMax = visualRates.last().tMid;
-    double totalDuration = tMax - tMin;
-    if (totalDuration < 2.0)
+    const double tMin = visualRates.first().tMid;
+    const double tMax = visualRates.last().tMid;
+    if (tMax - tMin < 2.0)
         return results;
 
-    // Sliding variance windows over the gyro-rate signal to find motion-rich
-    // segments (sharp motion gives sharp correlation peaks).
-    struct WindowInfo {
-        double tCenter;
-        double variance;
-        int startIdx;
-        int endIdx;
-    };
+    // Sliding windows, ranked by how much the rotation RATE varies inside them.
+    // Motion-rich windows give sharp correlation peaks. Using the visual
+    // magnitude (rather than the gyro) keeps window selection independent of
+    // the very alignment being solved for.
+    struct WindowInfo { double tCenter; double variance; int startIdx; int endIdx; };
     QVector<WindowInfo> windows;
-    double step = WINDOW_DURATION * 0.5;
+    const double step = WINDOW_DURATION * 0.5;
     for (double tStart = tMin; tStart + WINDOW_DURATION <= tMax + 1e-9; tStart += step) {
-        double tEnd = tStart + WINDOW_DURATION;
+        const double tEnd = tStart + WINDOW_DURATION;
         int startIdx = -1, endIdx = -1;
         for (int i = 0; i < n; ++i) {
-            double t = visualRates[i].tMid;
+            const double t = visualRates[i].tMid;
             if (t >= tStart - 1e-9 && t <= tEnd + 1e-9) {
                 if (startIdx < 0) startIdx = i;
                 endIdx = i + 1;
             }
         }
-        if (startIdx < 0 || (endIdx - startIdx) < 5)
+        if (startIdx < 0 || (endIdx - startIdx) < MIN_WINDOW_SAMPLES)
             continue;
-        int count = endIdx - startIdx;
-        QVector3D mean(0,0,0);
-        for (int i = startIdx; i < endIdx; ++i) mean += gyroRates[i].omegaGyro;
-        mean /= static_cast<float>(count);
+        const int count = endIdx - startIdx;
+        double mean = 0.0;
+        for (int i = startIdx; i < endIdx; ++i) mean += visualRates[i].mag;
+        mean /= count;
         double variance = 0.0;
         for (int i = startIdx; i < endIdx; ++i) {
-            QVector3D diff = gyroRates[i].omegaGyro - mean;
-            variance += diff.x()*diff.x() + diff.y()*diff.y() + diff.z()*diff.z();
+            const double d = visualRates[i].mag - mean;
+            variance += d * d;
         }
-        variance /= static_cast<double>(count);
+        variance /= count;
         windows.append({(tStart + tEnd) * 0.5, variance, startIdx, endIdx});
     }
 
@@ -307,97 +321,24 @@ QVector<SyncSolver::LocalOffset> SyncSolver::crossCorrelateWindows(
 
     std::sort(windows.begin(), windows.end(),
         [](const WindowInfo &a, const WindowInfo &b) { return a.variance > b.variance; });
-    int numWindows = qBound(MIN_WINDOWS_COUNT,
-                            static_cast<int>(windows.size()),
-                            MAX_WINDOWS_COUNT);
-    numWindows = qMin(numWindows, TARGET_WINDOWS);
+    // qMin, not qBound: qBound(8, size, 16) RETURNS 8 when fewer than 8 windows
+    // exist, and the resize below then APPENDED zero-initialised windows.
+    const int numWindows = qMin(qMin(windows.size(), MAX_WINDOWS_COUNT), TARGET_WINDOWS);
     windows.resize(numWindows);
     std::sort(windows.begin(), windows.end(),
         [](const WindowInfo &a, const WindowInfo &b) { return a.tCenter < b.tCenter; });
+    Q_UNUSED(MIN_WINDOWS_COUNT);
 
-    // For each window, cross-correlate the small local lag range using the
-    // paired gyro samples (already aligned with visual times).
-    int maxShift = static_cast<int>(std::round(CORR_RANGE / CORR_STEP));
     for (const auto &win : windows) {
-        int count = win.endIdx - win.startIdx;
-        if (count < 5)
+        double peak = -2.0;
+        const double lag = bestLag(visualRates, win.startIdx, win.endIdx, gyro,
+                                   drift, baseLag, WINDOW_LAG_RANGE, CORR_STEP,
+                                   &peak);
+        if (peak < PEAK_THRESHOLD)
             continue;
-
-        QVector<QVector3D> visData, gyroData;
-        QVector<double> times;
-        visData.reserve(count); gyroData.reserve(count); times.reserve(count);
-        for (int i = win.startIdx; i < win.endIdx; ++i) {
-            visData.append(visualRates[i].omegaVisual);
-            gyroData.append(gyroRates[i].omegaGyro);
-            times.append(visualRates[i].tMid);
-        }
-
-        QVector3D visMean(0,0,0), gyroMean(0,0,0);
-        for (int i = 0; i < count; ++i) { visMean += visData[i]; gyroMean += gyroData[i]; }
-        visMean /= static_cast<float>(count);
-        gyroMean /= static_cast<float>(count);
-        for (int i = 0; i < count; ++i) { visData[i] -= visMean; gyroData[i] -= gyroMean; }
-
-        QVector<double> corr(static_cast<size_t>(2 * maxShift + 1), 0.0);
-        double windowDuration = times.last() - times.first();
-        if (windowDuration < 1e-6)
-            continue;
-
-        for (int s = -maxShift; s <= maxShift; ++s) {
-            double tau = s * CORR_STEP;
-            double sum = 0.0;
-            for (int i = 0; i < count; ++i) {
-                double tShifted = times[i] + tau;
-                if (tShifted < times.first() || tShifted > times.last())
-                    continue;
-                int lo = 0, hi = count - 1;
-                while (lo < hi - 1) { int mid = (lo + hi) / 2; if (times[mid] <= tShifted) lo = mid; else hi = mid; }
-                double dt = times[hi] - times[lo];
-                QVector3D gyroInterp;
-                if (dt < 1e-12) gyroInterp = gyroData[lo];
-                else {
-                    double frac = (tShifted - times[lo]) / dt;
-                    gyroInterp = QVector3D(
-                        static_cast<float>(gyroData[lo].x() + (gyroData[hi].x() - gyroData[lo].x()) * frac),
-                        static_cast<float>(gyroData[lo].y() + (gyroData[hi].y() - gyroData[lo].y()) * frac),
-                        static_cast<float>(gyroData[lo].z() + (gyroData[hi].z() - gyroData[lo].z()) * frac));
-                }
-                sum += visData[i].x() * gyroInterp.x()
-                     + visData[i].y() * gyroInterp.y()
-                     + visData[i].z() * gyroInterp.z();
-            }
-            corr[static_cast<size_t>(s + maxShift)] = sum;
-        }
-
-        int peakIdx = maxShift;
-        double peakVal = corr[static_cast<size_t>(maxShift)];
-        for (int s = -maxShift; s <= maxShift; ++s) {
-            double val = corr[static_cast<size_t>(s + maxShift)];
-            if (val > peakVal) { peakVal = val; peakIdx = s; }
-        }
-
-        double visNorm = 0.0, gyroNorm = 0.0;
-        for (int i = 0; i < count; ++i) {
-            visNorm += visData[i].x()*visData[i].x() + visData[i].y()*visData[i].y() + visData[i].z()*visData[i].z();
-            gyroNorm += gyroData[i].x()*gyroData[i].x() + gyroData[i].y()*gyroData[i].y() + gyroData[i].z()*gyroData[i].z();
-        }
-        double normFactor = std::sqrt(visNorm * gyroNorm);
-        double peakNormalized = (normFactor > 1e-10) ? peakVal / normFactor : 0.0;
-
-        if (peakNormalized < PEAK_THRESHOLD)
-            continue;
-
-        double refinedShift = static_cast<double>(peakIdx);
-        if (peakIdx > -maxShift && peakIdx < maxShift) {
-            double ym1 = corr[static_cast<size_t>(peakIdx - 1 + maxShift)];
-            double y0  = corr[static_cast<size_t>(peakIdx + maxShift)];
-            double yp1 = corr[static_cast<size_t>(peakIdx + 1 + maxShift)];
-            double denom = ym1 - 2.0 * y0 + yp1;
-            if (std::abs(denom) > 1e-12)
-                refinedShift = peakIdx + 0.5 * (ym1 - yp1) / denom;
-        }
-
-        results.append({win.tCenter, refinedShift * CORR_STEP, win.variance});
+        // Report the offset RELATIVE to baseLag, which is what the line fit
+        // models as tau(t) = o0 + drift * t.
+        results.append({win.tCenter, lag - baseLag, win.variance});
     }
 
     return results;
@@ -407,7 +348,8 @@ QVector<SyncSolver::LocalOffset> SyncSolver::crossCorrelateWindows(
 // Step 5: Joint line fit (weighted least squares)
 // ---------------------------------------------------------------------------
 bool SyncSolver::fitLine(const QVector<LocalOffset> &offsets,
-                         double &o0, double &drift, double &residualMs)
+                         double &o0, double &drift, double &residualMs,
+                         double &driftStdErr)
 {
     if (offsets.size() < MIN_WINDOWS)
         return false;
@@ -436,13 +378,6 @@ bool SyncSolver::fitLine(const QVector<LocalOffset> &offsets,
     if (!std::isfinite(o0) || !std::isfinite(drift))
         return false;
 
-    // Drift outside the physically plausible band means the per-window offsets
-    // are not lying on a line at all — the slope is fitting noise. Report the
-    // fit as failed so the caller keeps its own drift estimate, instead of
-    // clamping to the rail and passing the rail off as a measurement.
-    if (std::abs(drift) > MAX_DRIFT)
-        return false;
-
     // Compute RMS residual
     double sumSqResid = 0.0;
     for (const auto &lo : offsets) {
@@ -454,6 +389,22 @@ bool SyncSolver::fitLine(const QVector<LocalOffset> &offsets,
 
     if (!std::isfinite(residualMs) || residualMs > MAX_RESIDUAL_MS)
         return false;
+
+    // Standard error of the slope: sigma / sqrt(Stt). A short clip has almost
+    // no lever arm, so a few ms of window scatter produces a large apparent
+    // slope -- which is how a 13 s clip came back with 0.4%/s of "clock drift",
+    // 3 orders of magnitude above anything two crystals can do.
+    // Var(slope) = sigma^2 / Stt with sigma^2 = sum(w r^2) / (n - 2) -- the
+    // residual variance estimate uses the DEGREES OF FREEDOM, not the weight
+    // total; dividing by W leaves the weight units uncancelled and makes the
+    // error look far smaller than it is.
+    const double Stt = Wt2 - Wt * Wt / W;
+    const int dof = offsets.size() - 2;
+    const double sigma2 = (dof > 0) ? sumSqResid / dof
+                                    : std::numeric_limits<double>::infinity();
+    driftStdErr = (Stt > 1e-12 && std::isfinite(sigma2))
+                  ? std::sqrt(sigma2 / Stt)
+                  : std::numeric_limits<double>::infinity();
 
     return true;
 }
@@ -489,110 +440,79 @@ void SyncSolver::solve(const QVector<VisualRotationPair> &visualPairs,
         return;
     }
 
-    // Step 3: Global cross-correlation to find the coarse sync offset (robust
-    // even for short / continuously-moving clips). Gyro is resampled from the
-    // raw IMU at a candidate lag for each step, so this is a true temporal
-    // shift of the IMU stream — not bounded by the per-window pairing.
+    GyroIntegral gyro;
+    gyro.build(imuSamples, CORR_STEP);
+    if (!gyro.isValid()) {
+        emit solveFailed(QStringLiteral("IMU stream too short to correlate"));
+        return;
+    }
+
+    // Step 3: Coarse global lag. The search is centred so that it covers BOTH
+    // zero and the caller's current estimate — `initialOffset` used to be
+    // accepted and never read, which meant a re-run could not refine a previous
+    // result and a true offset outside ±CORR_RANGE was unreachable.
     emit progressChanged(0.2, QStringLiteral("Cross-correlating gyro and visual rate..."));
-    double globalLag = 0.0;
-    globalCrossCorrelate(visualRates, imuSamples, initialDrift, &globalLag);
+    const double lo = qMin(0.0, initialOffset) - CORR_RANGE;
+    const double hi = qMax(0.0, initialOffset) + CORR_RANGE;
+    const double centre = (lo + hi) * 0.5;
+    const double range  = (hi - lo) * 0.5;
 
-    // Refine the global estimate with a second pass centered on the found lag,
-    // using a finer step so the outcome is robust to drift*time over the clip.
-    double refineCenter = globalLag;
-    const double refineRange = 0.05;                 // ±50 ms around coarse peak
-    const double refineStep = refineRange * 0.05;    // ~2.5 ms
-    {
-        int steps = static_cast<int>(std::round(2.0 * refineRange / refineStep));
-        double bestScore = -1e18, bestLag = refineCenter;
-        // Same normalised magnitude correlation as globalCrossCorrelate — see
-        // the note there on why the frame-mixing dot product was wrong.
-        const int nv = visualRates.size();
-        QVector<double> vmag(nv), gmag(nv);
-        double vMean = 0.0;
-        for (int i = 0; i < nv; i++) { vmag[i] = visualRates[i].omegaVisual.length(); vMean += vmag[i]; }
-        vMean /= nv;
-        double vVar = 0.0;
-        for (int i = 0; i < nv; i++) vVar += (vmag[i]-vMean)*(vmag[i]-vMean);
-        for (int s = 0; s <= steps && vVar > 0.0; ++s) {
-            double lag = refineCenter - refineRange + s * refineStep;
-            double gMean = 0.0;
-            for (int i = 0; i < nv; i++) {
-                const double tImu = visualRates[i].tMid * (1.0 + initialDrift) + lag;
-                gmag[i] = interpolateGyro(imuSamples, tImu).length();
-                gMean += gmag[i];
-            }
-            gMean /= nv;
-            double num = 0.0, gVar = 0.0;
-            for (int i = 0; i < nv; i++) {
-                const double dv = vmag[i]-vMean, dg = gmag[i]-gMean;
-                num += dv*dg; gVar += dg*dg;
-            }
-            const double score = (gVar > 0.0) ? num/std::sqrt(vVar*gVar) : -1e18;
-            if (score > bestScore) { bestScore = score; bestLag = lag; }
-        }
-        globalLag = bestLag;
-    }
+    const int nAll = visualRates.size();
+    double coarseScore = -2.0;
+    double globalLag = bestLag(visualRates, 0, nAll, gyro, initialDrift,
+                               centre, range, CORR_STEP, &coarseScore);
+    // Fine pass around the coarse peak.
+    globalLag = bestLag(visualRates, 0, nAll, gyro, initialDrift,
+                        globalLag, 0.05, CORR_STEP * 0.25, &coarseScore);
 
-    // Step 4: Sample gyro at the coarse-aligned visual times, then per-window
-    // local offsets for the joint offset+drift line fit.
+    // Step 4: Per-window local offsets for the joint offset+drift line fit.
     emit progressChanged(0.4, QStringLiteral("Refining per-window sync..."));
-    QVector<GyroRateSample> gyroRates = sampleGyroRates(visualRates, imuSamples,
-                                                        initialDrift, globalLag);
-    QVector<LocalOffset> offsets = crossCorrelateWindows(visualRates, gyroRates);
+    QVector<LocalOffset> offsets = crossCorrelateWindows(visualRates, gyro,
+                                                         initialDrift, globalLag);
 
-    if (offsets.size() < MIN_WINDOWS) {
-        // Too few per-window offsets (e.g. a short, continuously moving clip):
-        // fall back to the global offset with a flat drift.
-        emit progressChanged(1.0, QStringLiteral("Done (global peak only)"));
-        SyncResult result;
-        result.syncOffset = globalLag;
-        result.drift = initialDrift;
-        result.residualMs = 0.0;
-        result.windowsUsed = (int)offsets.size();
-        emit syncSolved(result);
-        return;
-    }
+    // Absolute model so far: tImu = t*(1 + driftAbs) + offsetAbs.
+    double driftAbs = initialDrift;
+    double offsetAbs = globalLag;
+    double residualMs = 0.0;
+    int windowsUsed = offsets.size();
 
-    // Step 5: Joint line fit of the per-window residuals (around globalLag):
-    // tau(t) = o0 + drift*t. The absolute sync offset is globalLag + tau(t).
-    double o0, drift, residualMs;
-    if (!fitLine(offsets, o0, drift, residualMs)) {
-        // Fit degenerate: use global offset, keep initial drift.
-        emit progressChanged(1.0, QStringLiteral("Done (global + flat drift)"));
-        SyncResult result;
-        result.syncOffset = globalLag;
-        result.drift = initialDrift;
-        result.residualMs = 0.0;
-        result.windowsUsed = (int)offsets.size();
-        emit syncSolved(result);
-        return;
-    }
-    // Absolute offset at t=0 for the refined second pass.
-    const double absOffset0 = globalLag + o0;
+    if (offsets.size() >= MIN_WINDOWS) {
+        double o0, dResid, resid, dSe;
+        if (fitLine(offsets, o0, dResid, resid, dSe)) {
+            acceptSlope(offsets, o0, dResid, dSe);
+            // The windows were measured against a mapping that already used
+            // driftAbs, so the fitted slope is a RESIDUAL and must be ADDED.
+            // Overwriting driftAbs with it (the old code) silently discarded
+            // the caller's estimate on one path while returning it verbatim on
+            // the fallback paths — the same field meaning two different things.
+            offsetAbs += o0;
+            driftAbs  += dResid;
+            residualMs = resid;
 
-    // Step 6: Second pass with the refined absolute offset and drift.
-    emit progressChanged(0.6, QStringLiteral("Second pass refinement..."));
-    QVector<GyroRateSample> gyroRates2 = sampleGyroRates(visualRates, imuSamples,
-                                                         drift, absOffset0);
-    QVector<LocalOffset> offsets2 = crossCorrelateWindows(visualRates, gyroRates2);
-    if (offsets2.size() >= MIN_WINDOWS) {
-        double o0b, driftb, residb;
-        if (fitLine(offsets2, o0b, driftb, residb)) {
-            // o0b is a further residual around absOffset0; accumulate it.
-            o0 += o0b; drift = driftb; residualMs = residb;
+            // Step 5: second pass around the refined model.
+            emit progressChanged(0.6, QStringLiteral("Second pass refinement..."));
+            QVector<LocalOffset> offsets2 = crossCorrelateWindows(visualRates, gyro,
+                                                                  driftAbs, offsetAbs);
+            if (offsets2.size() >= MIN_WINDOWS) {
+                double o0b, dResidB, residB, dSeB;
+                if (fitLine(offsets2, o0b, dResidB, residB, dSeB)) {
+                    acceptSlope(offsets2, o0b, dResidB, dSeB);
+                    offsetAbs += o0b;
+                    driftAbs  += dResidB;
+                    residualMs = residB;
+                    windowsUsed = offsets2.size();
+                }
+            }
         }
     }
-    // (Second pass not possible: keep first-pass fit.)
 
-    // Absolute sync offset: globalLag + accumulated residual.
     SyncResult result;
-    result.syncOffset = globalLag + o0;
-    result.drift = drift;
+    result.syncOffset = offsetAbs;
+    result.drift = driftAbs;
     result.residualMs = residualMs;
-    result.windowsUsed = (int)(offsets2.isEmpty() ? offsets.size() : offsets2.size());
+    result.windowsUsed = windowsUsed;
 
-    // Final plausibility gate. The searched lag range is ±CORR_RANGE, so an
+    // Final plausibility gate. The searched lag range is bounded, so an
     // absolute offset far outside it is the line fit extrapolating, not a
     // measurement — and a stored bad offset poisons every later stage
     // (calibration pairs the wrong gyro samples with each visual rotation) as
@@ -607,6 +527,13 @@ void SyncSolver::solve(const QVector<VisualRotationPair> &visualPairs,
                            "range (search range is only ±%3 s) — rejected.")
                 .arg(result.syncOffset, 0, 'f', 3)
                 .arg(MAX_ABS_OFFSET).arg(CORR_RANGE));
+        return;
+    }
+    if (std::abs(result.drift) > MAX_DRIFT) {
+        emit solveFailed(
+            QStringLiteral("Solved clock drift %1 s/s exceeds the plausible ±%2 s/s "
+                           "for two crystal clocks — rejected.")
+                .arg(result.drift, 0, 'g', 3).arg(MAX_DRIFT));
         return;
     }
 

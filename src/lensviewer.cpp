@@ -186,6 +186,14 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         if (frameKey != m_lastFrameTimestamp) {
             m_lastFrameTimestamp = frameKey;
 
+            // These .copy() calls are REQUIRED, not waste. Removing them
+            // segfaults on the RHI backend: createTextureFromImage() does not
+            // upload synchronously, it wraps the QImage in a QSGPlainTexture
+            // and defers the upload to commit time on the render thread. A
+            // QImage constructed over `frame`'s buffer is dangling by then,
+            // because `frame` goes out of scope at the end of this function.
+            // (Verified: reverting this crashes on load with a real GL
+            // context; the offscreen platform does not exercise the path.)
             QImage yImg = QImage(reinterpret_cast<const uchar*>(frame.yData.constData()), frame.width, frame.height, frame.yStride, QImage::Format_Grayscale8).copy();
             QImage uImg = QImage(reinterpret_cast<const uchar*>(frame.uData.constData()), frame.width / 2, frame.height / 2, frame.uStride, QImage::Format_Grayscale8).copy();
             QImage vImg = QImage(reinterpret_cast<const uchar*>(frame.vData.constData()), frame.width / 2, frame.height / 2, frame.vStride, QImage::Format_Grayscale8).copy();

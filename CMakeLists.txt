@@ -10,7 +10,9 @@ set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 ShaderTools OpenGL)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+# videoio is used only by the tracking_tests diagnostics (--seam-check),
+# which grab arbitrary frames directly rather than via the FFmpeg decode path.
+find_package(OpenCV REQUIRED COMPONENTS core imgproc features2d calib3d videoio)
 
 qt_add_executable(render360
     src/main.cpp
@@ -27,8 +29,26 @@ qt_add_executable(render360
     src/gpurenderer.cpp
     src/vidstab.cpp
     src/flowrenderer.cpp
-    src/horizondetector.cpp
-    src/imudriftcalibrator.cpp
+    src/visualrotation.cpp
+    src/syncsolver.cpp
+    src/visualfusion.cpp
+    src/gyrocalibration.cpp
+)
+
+# Independent tracking/diagnostics test harness. Builds the IMU/visual/gyro
+# pipeline modules only (no GUI) and verifies each stage.
+#   cmake --build build --target tracking_tests
+#   build/tracking_tests --quick <video.mp4>
+qt_add_executable(tracking_tests
+    src/tracking_tests.cpp
+    src/imuparser.cpp
+    src/gyroscopeintegrator.cpp
+    src/calibration.cpp
+    src/visualrotation.cpp
+    src/syncsolver.cpp
+    src/gyrocalibration.cpp
+    src/visualfusion.cpp
+    src/keyframe.cpp
 )
 
 qt_add_qml_module(render360
@@ -85,6 +105,24 @@ target_link_libraries(render360 PRIVATE
     ${FFMPEG_LIBRARIES}
     ${OpenCV_LIBS}
     OpenGL::GL
+)
+
+target_include_directories(tracking_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${FFMPEG_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(tracking_tests PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    ${FFMPEG_LIBRARIES}
+    ${OpenCV_LIBS}
+)
+
+target_compile_definitions(tracking_tests PRIVATE
+    QT_DEPRECATED_WARNINGS
+    QT_DISABLE_DEPRECATED_BEFORE=0x060000
 )
 
 target_compile_definitions(render360 PRIVATE

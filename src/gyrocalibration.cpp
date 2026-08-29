@@ -24,11 +24,17 @@ static constexpr int IRLS_ITERATIONS = 3;
 // anyway is how a run of AutoSync used to overwrite a perfectly good gyro with
 // a rail-clamped 0.5*I (halving every rate) or, worse, a matrix with
 // off-diagonals of +-34.
-static constexpr double MIN_DIAGONAL = 0.7;
-static constexpr double MAX_DIAGONAL = 1.4;
+// A MEMS gyro's scale-factor error is a few percent (datasheet +-3-5 %) and its
+// cross-axis sensitivity ~2 %. A fitted matrix outside that band is not
+// describing the gyro; it is describing the bias of the thing it was fitted
+// against -- and the visual chain under-measures fast rotation by 8-20 %.
+// The previous [0.7, 1.4] band accepted a 0.82/0.79 diagonal on YIVR_0845 that
+// gravity then showed to ADD 5 deg of horizon drift rather than remove any.
+static constexpr double MIN_DIAGONAL = 0.95;
+static constexpr double MAX_DIAGONAL = 1.05;
 // A real gyro's axis misalignment is a few degrees, so cross-axis terms of
 // more than ~0.2 mean the solve has started mixing axes to absorb noise.
-static constexpr double MAX_OFF_DIAGONAL = 0.20;
+static constexpr double MAX_OFF_DIAGONAL = 0.05;
 // A plausible bias for this sensor is single-digit deg/s. Anything larger is
 // the fit absorbing an unmodelled sync error into the constant term.
 static constexpr double MAX_BIAS_DEG_S = 8.0;

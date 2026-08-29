@@ -18,6 +18,7 @@ extern "C" {
 // Euler decomposition becomes degenerate and the sliders would swap yaw/roll.
 static const double kMaxPitch = 89.5;
 
+
 // Keyframes are persisted per-video as a JSON sidecar next to the source file
 // (same convention as the .imu files), so re-opening a video restores its
 // keyframe set automatically.
@@ -49,7 +50,12 @@ App::App(QObject *parent)
     // measured IMU<->video clock drift on this camera is ~0.0038 s/s, so the
     // offset that works at t=0 (~0.17 s) grows to ~0.26 s by 24 s.
     , m_imuSyncOffset(0.17)
-    , m_imuDrift(0.0038)
+    // 0 s/s. The old default of 0.0038 was not only unmeasured, it was nearly
+    // double autoImuDrift()'s own kMaxPlausibleDrift (0.002) and 7x the sync
+    // solver's MAX_DRIFT (5e-4) — a fresh install started the solve from a
+    // drift its own sanity checks would reject. Drift is measured per clip or
+    // it is zero.
+    , m_imuDrift(0.0)
     , m_imuAccelKi(0.005)
     , m_flowStitch(false)
     , m_flowStrength(1.0)
@@ -68,10 +74,8 @@ App::App(QObject *parent)
     , m_exportStatus()
     , m_exportStart(0.0)
     , m_exportEnd(0.0)
-    , m_driftCalibrator(new ImuDriftCalibrator(this))
-    , m_calibrationRunning(false)
-    , m_calibrationProgress(0.0)
-    , m_calibrationStatus()
+    , m_autoSyncRunning(false)
+    , m_autoSyncProgress(0.0)
 {
     connect(m_decoder, &VideoDecoder::durationChanged, this, [this]() {
         // Keep the export trim range inside the newly known clip length.
@@ -184,36 +188,6 @@ App::App(QObject *parent)
         QTimer::singleShot(2500, this, [this]() { setExportRunning(false); });
     });
 
-    // IMU drift calibration: the calibrator runs in a background thread and
-    // reports progress/result via queued signal connections (cross-thread safe).
-    connect(m_driftCalibrator, &ImuDriftCalibrator::progressChanged, this,
-            [this](double fraction, const QString &status) {
-        m_calibrationProgress = fraction;
-        m_calibrationStatus = status;
-        emit calibrationProgressChanged();
-        emit calibrationStatusChanged();
-    }, Qt::QueuedConnection);
-    connect(m_driftCalibrator, &ImuDriftCalibrator::calibrationFinished, this,
-            [this](double drift, double residualDeg) {
-        m_calibrationRunning = false;
-        m_calibrationProgress = 1.0;
-        m_calibrationStatus = tr("Drift: %1 ms/s (RMS %2°)")
-                                  .arg(drift * 1000.0, 0, 'f', 2)
-                                  .arg(residualDeg, 0, 'f', 1);
-        emit calibrationRunningChanged();
-        emit calibrationProgressChanged();
-        emit calibrationStatusChanged();
-        // Apply the calibrated drift (this persists it in the sidecar).
-        setImuDrift(drift);
-    }, Qt::QueuedConnection);
-    connect(m_driftCalibrator, &ImuDriftCalibrator::calibrationFailed, this,
-            [this](const QString &error) {
-        m_calibrationRunning = false;
-        m_calibrationStatus = tr("Calibration failed: %1").arg(error);
-        emit calibrationRunningChanged();
-        emit calibrationStatusChanged();
-    }, Qt::QueuedConnection);
-
     m_viewQuat = viewQuatFromEuler();
 
     int defaultIdx = m_calibrationPresets->defaultPresetIndex();
@@ -256,6 +230,12 @@ App::App(QObject *parent)
     connect(m_colorGrade, &ColorGrade::blueLowsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::blueMidsChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::blueHighsChanged, this, saveGrade);
+
+    // Auto-sync pipeline objects
+    m_visualRotation = new VisualRotationComputer(this);
+    m_syncSolver = new SyncSolver(this);
+    m_gyroCalibrator = new GyroCalibrator(this);
+    m_visualFusion = new VisualFusion();
 }
 
 App::~App()
@@ -280,6 +260,14 @@ void App::setVideoPath(const QString &path)
     m_usePreview = false;
     m_flowPending = false;  // drop any in-flight flow job from the old clip
     m_flowLastTs = -1.0;
+
+    // Drop the previous clip's optical results. The fused chain is NOT
+    // persisted and was only ever cleared by AutoSync, so loading a second clip
+    // left the integrator serving the first clip's fused orientations — wrong
+    // attitude, wrong "which way is up", and dependent on load order.
+    m_visualPairs.clear();
+    if (m_gyroIntegrator)
+        m_gyroIntegrator->clearFusedOrientations();
     emit videoPathChanged();
     emit usePreviewThumbnailChanged();
 
@@ -345,6 +333,15 @@ void App::setVideoPath(const QString &path)
             if (!qFuzzyCompare(m_imuDrift, drift)) {
                 m_imuDrift = drift;
                 emit imuDriftChanged();
+            }
+
+            // Restore stored sync offset from sidecar if available
+            if (m_keyframes->hasSyncOffset()) {
+                double offset = m_keyframes->syncOffset();
+                if (!qFuzzyCompare(m_imuSyncOffset, offset)) {
+                    m_imuSyncOffset = offset;
+                    emit imuSyncOffsetChanged();
+                }
             }
 
             integrateImu();
@@ -512,6 +509,9 @@ void App::setImuStabilize(bool stabilize)
 
     m_imuStabilize = stabilize;
     emit imuStabilizeChanged();
+    // imuOrientation switches between the stabilized chain and the bare video
+    // un-flip, so the viewer has to re-read it.
+    emit imuOrientationChanged();
 }
 
 double App::imuSmoothing() const
@@ -580,19 +580,57 @@ void App::setImuAccelKi(double ki)
     m_imuAccelKi = ki;
     emit imuAccelKiChanged();
 
-    if (m_imuParser->isLoaded())
-        integrateImu();
+    if (!m_imuParser->isLoaded())
+        return;
+    // Coalesce: re-integrating the whole 400 Hz chain per mouse-move event made
+    // dragging the slider stutter.
+    if (!m_reintegrateTimer) {
+        m_reintegrateTimer = new QTimer(this);
+        m_reintegrateTimer->setSingleShot(true);
+        m_reintegrateTimer->setInterval(120);
+        connect(m_reintegrateTimer, &QTimer::timeout, this, [this]() {
+            if (m_imuParser->isLoaded()) {
+                integrateImu();
+                if (m_imuStabilize)
+                    emit imuOrientationChanged();
+            }
+        });
+    }
+    m_reintegrateTimer->start();
 }
 
 double App::autoImuDrift() const
 {
-    // The IMU and video streams are recorded on independent clocks, so their
-    // durations never quite match. The fractional difference is the drift that
-    // accumulates over the clip: imuTime == videoTime * (1 + drift) + offset.
+    // The fractional difference in stream DURATIONS is only a clock drift if
+    // both streams cover the same interval. They generally do not — the IMU
+    // typically starts a little before and stops a little after the video — so
+    // a longer IMU stream mostly means "recorded for longer", not "ticks
+    // faster". On YIVR_0845 the IMU runs 140.30 s against 139.04 s of video,
+    // which this used to report as 0.91% drift: 1.26 s of skew across the clip.
+    // Fed to SyncSolver as its starting drift, that dragged the solved offset
+    // to -0.395 s when the truth is 0.150 s (verified against a ground-truth
+    // sweep: -0.395 explains -0.79 of the motion, 0.150 explains 0.94), and a
+    // half-second sync error looks exactly like no stabilisation at all.
+    //
+    // Both clocks are crystal-derived, so real relative rate error is parts per
+    // thousand at worst. Anything larger is a recording-length difference and
+    // the honest answer is that we do not know the drift — return 0 rather than
+    // invent one, and let the sync solver measure it from the content.
+    // Matched to SyncSolver's MAX_DRIFT. Two crystals at +-50 ppm each cannot
+    // disagree by more than ~1e-4 s/s; 5e-4 is already generous, and anything
+    // above it is a recording-length difference, not a rate difference.
+    constexpr double kMaxPlausibleDrift = 5e-4;
     const double imuDur = m_imuParser->duration();
     const double videoDur = m_decoder->duration();
-    if (imuDur > 0.0 && videoDur > 0.0)
-        return (imuDur - videoDur) / videoDur;
+    if (imuDur > 0.0 && videoDur > 0.0) {
+        const double d = (imuDur - videoDur) / videoDur;
+        if (std::abs(d) <= kMaxPlausibleDrift)
+            return d;
+        qInfo() << "autoImuDrift: duration difference implies" << d
+                << "-- too large for clock drift (IMU" << imuDur << "s, video"
+                << videoDur << "s); assuming 0";
+        return 0.0;
+    }
     return m_imuDrift;
 }
 
@@ -600,17 +638,108 @@ void App::integrateImu()
 {
     if (!m_imuParser->isLoaded())
         return;
-    // integrate() seeds the orientation from the accelerometer (so the
-    // default view is level, +Y = up) and then tracks the camera with the
-    // gyro, so the orientations are already gravity-aligned; no separate
-    // static per-clip gravity alignment is needed. Re-run whenever the
-    // Mahony integral gain (imuAccelKi) changes so the bias estimate is
-    // recomputed with the new feedback strength.
+
+    // The fused chain is a function of the chain we are about to replace, so it
+    // is stale the moment we re-integrate. Without this, changing accelKi after
+    // AutoSync re-integrated the raw chain while the queries kept returning the
+    // old fused one — the slider appeared to do nothing.
+    m_gyroIntegrator->clearFusedOrientations();
+    // Determine gyro calibration to apply:
+    // 1. Sidecar has stored calibration -> use it
+    // 2. Camera default has calibration -> use it
+    // 3. Otherwise -> identity matrix, zero bias (no correction)
+    QMatrix3x3 gyroMatrix;
+    QVector3D gyroBias;
+    if (m_keyframes->hasGyroCalibration()) {
+        gyroMatrix = m_keyframes->gyroMatrix();
+        gyroBias = m_keyframes->gyroBias();
+    } else {
+        QMatrix3x3 camM = cameraGyroMatrix();
+        QVector3D camB = cameraGyroBias();
+        if (camM != QMatrix3x3() || camB != QVector3D()) {
+            gyroMatrix = camM;
+            gyroBias = camB;
+        }
+    }
+
+    // Item 1: fold the visually-calibrated camera-default gyro scales into the
+    // matrix. The parser divided raw counts by its hardcoded scale; if a
+    // previous AutoSync stored "camera/gyroScale", the effective deg/s should
+    // use that divisor instead. The raw deg/s computed by the parser is
+    // count/hardcoded; scaling by (hardcoded/cameraDefault) readjusts it, and
+    // the stored matrix M (if any) multiplies on top. Applied as a diagonal
+    // multiplier on the left of any stored M.
+    {
+        QSettings cam;
+        const double sxx = cam.value(QStringLiteral("camera/gyroScaleX"),
+                                     m_imuParser->gyroScaleX()).toDouble();
+        const double syy = cam.value(QStringLiteral("camera/gyroScaleY"),
+                                     m_imuParser->gyroScaleY()).toDouble();
+        const double szz = cam.value(QStringLiteral("camera/gyroScaleZ"),
+                                     m_imuParser->gyroScaleZ()).toDouble();
+        const bool haveDefault = cam.contains(QStringLiteral("camera/gyroScaleX"));
+        if (haveDefault && sxx > 5.0 && syy > 5.0 && szz > 5.0) {
+            // Raw deg/s from parser uses gyroScale*; to use cameraDefault, the
+            // factor is gyroScale_parser / cameraDefault.
+            QMatrix3x3 scaleDiag;
+            scaleDiag(0,0) = (float)(m_imuParser->gyroScaleX() / sxx);
+            scaleDiag(1,1) = (float)(m_imuParser->gyroScaleY() / syy);
+            scaleDiag(2,2) = (float)(m_imuParser->gyroScaleZ() / szz);
+            // Combined = scaleDiag * M (scale applied first, then stored M).
+            QMatrix3x3 combined;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) {
+                    float acc = 0.0f;
+                    for (int k = 0; k < 3; k++)
+                        acc += scaleDiag(r,k) * gyroMatrix(k,c);
+                    combined(r,c) = acc;
+                }
+            gyroMatrix = combined;
+            qDebug() << "GyroIntegrator: camera-default scale folded"
+                     << m_imuParser->gyroScaleX()/sxx << m_imuParser->gyroScaleY()/syy
+                     << m_imuParser->gyroScaleZ()/szz;
+        }
+    }
+
+    // No per-sample accelerometer feedback (Kp = Ki = 0). The gyro alone,
+    // with a bias measured only when the camera is genuinely still and scales
+    // validated by gravity closure, holds attitude to a few degrees over
+    // minutes; the absolute tilt datum comes from the integrator's slow
+    // (30 s) world-frame gravity re-level. The Mahony terms that used to run
+    // here were the cause of the rolled horizon on fast footage — see
+    // GyroscopeIntegrator::integrate(). m_imuAccelKi is retained only so old
+    // settings files still load; it no longer affects the chain.
+    if (m_imuAccelKi > 0.0)
+        qInfo() << "imu/accelKi =" << m_imuAccelKi
+                << "is ignored: accelerometer feedback is disabled (see integrateImu)";
     m_gyroIntegrator->integrate(m_imuParser->samples(),
                                 m_imuParser->imuSampleRate(),
                                 m_imuParser->initialQuaternion(),
-                                0.35f,
-                                (float)m_imuAccelKi);
+                                0.0f, 0.0f,
+                                gyroMatrix,
+                                gyroBias);
+
+    // Rebuild the optical drift correction on top of the new chain. Cheap now
+    // that correctionAt() binary-searches its window, and it keeps the
+    // Mahony gains live after AutoSync instead of being shadowed by a stale
+    // fused chain.
+    applyVisualFusion();
+}
+
+void App::applyVisualFusion()
+{
+    if (!m_visualFusion || m_deferVisualFusion || m_visualPairs.size() < 10)
+        return;
+
+    m_visualFusion->fuse(m_visualPairs,
+                         m_gyroIntegrator->orientations(),
+                         m_gyroIntegrator->timestamps(),
+                         m_imuSyncOffset, m_imuDrift, 0.5,
+                         m_gyroIntegrator->gravityTrust());
+    const auto fusedOris = m_visualFusion->fusedOrientations();
+    const auto fusedTs = m_visualFusion->fusedTimestamps();
+    if (!fusedOris.isEmpty())
+        m_gyroIntegrator->setFusedOrientations(fusedOris, fusedTs);
 }
 
 void App::setFlowStitch(bool stitch)
@@ -886,48 +1015,6 @@ void App::applyKeyframeInterpolation()
     emit fovChanged();
 }
 
-void App::calibrateImuDrift()
-{
-    if (m_calibrationRunning) {
-        m_calibrationStatus = tr("Calibration already in progress");
-        emit calibrationStatusChanged();
-        return;
-    }
-    if (m_videoPath.isEmpty()) {
-        m_calibrationStatus = tr("No video loaded");
-        emit calibrationStatusChanged();
-        return;
-    }
-    if (!m_imuParser->isLoaded()) {
-        m_calibrationStatus = tr("No IMU data available");
-        emit calibrationStatusChanged();
-        return;
-    }
-    if (!m_gyroIntegrator || m_gyroIntegrator->orientations().isEmpty()) {
-        m_calibrationStatus = tr("IMU integration not ready");
-        emit calibrationStatusChanged();
-        return;
-    }
-
-    // Snapshot the integrator data (thread-safe: the worker gets its own copy).
-    QVector<QQuaternion> orientations = m_gyroIntegrator->orientations();
-    QVector<double> timestamps = m_gyroIntegrator->timestamps();
-
-    // Sample ~20 frames for a 139 s clip; scale down for shorter clips.
-    double dur = m_decoder->duration();
-    int numSamples = qBound(10, (int)(dur / 7.0), 30);
-
-    m_calibrationRunning = true;
-    m_calibrationProgress = 0.0;
-    m_calibrationStatus = tr("Starting calibration…");
-    emit calibrationRunningChanged();
-    emit calibrationProgressChanged();
-    emit calibrationStatusChanged();
-
-    m_driftCalibrator->startCalibration(m_videoPath, orientations, timestamps,
-                                         m_imuSyncOffset, m_imuDrift, numSamples);
-}
-
 CalibrationPresetModel* App::calibrationPresets() const
 {
     return m_calibrationPresets;
@@ -972,14 +1059,49 @@ QQuaternion App::imuOrientationAt(double time) const
         // (the IMU and video clocks run at slightly different rates, so the
         // offset that aligns the start of the clip is ~0.07 s too small by 24 s).
         const double tImu = time * (1.0 + m_imuDrift) + m_imuSyncOffset;
+
+        // Dual-mode stabilization:
+        //  - Smoothing <= 0.9 (HIGH-PASS, the default): q_virtual is the
+        //    Gaussian-smoothed "virtual tripod" path. The correction removes the
+        //    high-frequency shake (deviation of the true orientation from the
+        //    smooth path) while keeping intentional motion. A full 360° pan
+        //    stays visible.
+        //  - Smoothing > 0.9 (LOW-PASS / "hold world steady"): q_virtual is
+        //    pinned to the clip's very first orientation, so q_virtual^{-1}*
+        //    q_actual cancels ALL camera rotation. The world is held fixed and
+        //    nothing pans, even a 360° rotation. Reachable at the top of the
+        //    smoothing slider.
         const float smoothingMs = (float)(m_imuSmoothing * 300.0);
         const QQuaternion qActual = m_gyroIntegrator->orientationAtTimeUnsmoothed(tImu);
-        const QQuaternion qVirtual = m_gyroIntegrator->orientationAtTime(tImu, smoothingMs);
-        // Return q_actual^{-1} * q_virtual so the shader's conjugate gives
-        // q_virtual^{-1} * q_actual (the stabilization correction).
-        return qActual.conjugated() * qVirtual;
+        QQuaternion qVirtual;
+        if (m_imuSmoothing > 0.9) {
+            const QQuaternion qFirst = m_gyroIntegrator->firstOrientation();
+            qVirtual = qFirst.isNull() ? qActual : qFirst;
+        } else {
+            qVirtual = m_gyroIntegrator->orientationAtTime(tImu, smoothingMs);
+        }
+        // Return q_virtual^{-1} * q_actual. LensViewer builds
+        // imuMat.rotate(conjugate(q)) and the shader applies imuMat * ray, so
+        // the effective ray transform is q^{-1}; with q = q_virtual^{-1} q_actual
+        // the sampled ray becomes (q_virtual^{-1} q_actual)^{-1} = q_actual^{-1}
+        // q_virtual, i.e. the high-frequency deviation of the true camera
+        // orientation from the smooth virtual path — applied to the video ray
+        // this COUNTER-ROTATES the shake and cancels it, while leaving the
+        // smooth intentional path untouched. With q_virtual pinned to the first
+        // orientation this becomes q_actual^{-1} * q_first, cancelling ALL
+        // rotation (low-pass / hold-world-steady). (The inverse ordering here
+        // would apply the shake rotation instead of cancelling it — a
+        // no-op-looking toggle, which is the bug this fixes.)
+        // Hand the shader the composed correction. composeStabilisation()
+        // horizon-locks the virtual camera (yaw only, pitch/roll discarded) and
+        // applies the video un-flip once, on the outside where it survives.
+        // See gyroscopeintegrator.h for why both steps belong there and not in
+        // the chain.
+        return composeStabilisation(qActual, qVirtual);
     }
-    return QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    // Stabilization off: the shader still needs the un-flip, or the raw video
+    // renders upside down.
+    return kFlipRollQ();
 }
 
 
@@ -1182,8 +1304,8 @@ ExportSnapshot App::buildExportSnapshot() const
     s.keyframes = m_keyframes->keyframes();
     s.imuStabilize = m_imuStabilize;
     if (m_gyroIntegrator) {
-        s.imuOrientations = m_gyroIntegrator->orientations();
-        s.imuTimestamps = m_gyroIntegrator->timestamps();
+        s.imuOrientations = m_gyroIntegrator->activeOrientations();
+        s.imuTimestamps = m_gyroIntegrator->activeTimestamps();
     }
     s.syncOffset = m_imuSyncOffset;
     s.drift = m_imuDrift;
@@ -1279,6 +1401,320 @@ void App::saveKeyframes()
     m_keyframes->setTrimIn(m_exportStart);
     m_keyframes->setTrimOut(m_exportEnd);
     m_keyframes->saveToFile(keyframesPathFor(m_videoPath));
+}
+
+void App::clearGyroCalibration()
+{
+    if (!m_keyframes->hasGyroCalibration())
+        return;
+    m_keyframes->clearGyroCalibration();
+    saveKeyframes();
+    qInfo() << "Cleared this video's gyro calibration";
+    if (m_imuParser->isLoaded()) {
+        integrateImu();
+        if (m_imuStabilize)
+            emit imuOrientationChanged();
+    }
+}
+
+void App::clearCameraGyroDefaults()
+{
+    QSettings s;
+    s.remove(QStringLiteral("camera/gyroMatrix"));
+    s.remove(QStringLiteral("camera/gyroBias"));
+    s.remove(QStringLiteral("camera/gyroScaleX"));
+    s.remove(QStringLiteral("camera/gyroScaleY"));
+    s.remove(QStringLiteral("camera/gyroScaleZ"));
+    qInfo() << "Cleared camera-wide gyro defaults";
+    if (m_imuParser->isLoaded()) {
+        integrateImu();
+        if (m_imuStabilize)
+            emit imuOrientationChanged();
+    }
+}
+
+bool App::saveGyroCalibrationAsCameraDefault()
+{
+    if (!m_keyframes->hasGyroCalibration()) {
+        qWarning() << "No gyro calibration on this video to promote";
+        return false;
+    }
+    setCameraGyroMatrix(m_keyframes->gyroMatrix());
+    setCameraGyroBias(m_keyframes->gyroBias());
+    qInfo() << "Promoted this video's gyro calibration to the camera default";
+    return true;
+}
+
+bool App::hasGyroCalibration() const
+{
+    return m_keyframes->hasGyroCalibration();
+}
+
+bool App::hasCameraGyroDefaults() const
+{
+    return cameraGyroMatrix() != QMatrix3x3() || cameraGyroBias() != QVector3D();
+}
+
+QMatrix3x3 App::cameraGyroMatrix() const
+{
+    QSettings s;
+    QVariantList list = s.value(QStringLiteral("camera/gyroMatrix")).toList();
+    if (list.size() == 9) {
+        QMatrix3x3 M;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                M(i, j) = list[i * 3 + j].toDouble();
+        return M;
+    }
+    return QMatrix3x3();
+}
+
+void App::setCameraGyroMatrix(const QMatrix3x3 &M)
+{
+    QVariantList list;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            list.append((double)M(i, j));
+    QSettings s;
+    s.setValue(QStringLiteral("camera/gyroMatrix"), list);
+}
+
+QVector3D App::cameraGyroBias() const
+{
+    QSettings s;
+    QVariantList list = s.value(QStringLiteral("camera/gyroBias")).toList();
+    if (list.size() == 3)
+        return QVector3D(list[0].toFloat(), list[1].toFloat(), list[2].toFloat());
+    return QVector3D();
+}
+
+void App::setCameraGyroBias(const QVector3D &b)
+{
+    QVariantList list;
+    list.append((double)b.x());
+    list.append((double)b.y());
+    list.append((double)b.z());
+    QSettings s;
+    s.setValue(QStringLiteral("camera/gyroBias"), list);
+}
+
+void App::autoSyncAndCalibrate()
+{
+    if (m_autoSyncRunning)
+        return;
+    if (m_videoPath.isEmpty()) {
+        m_autoSyncStatus = tr("Error: no video loaded");
+        emit autoSyncStatusChanged();
+        return;
+    }
+    if (!m_imuParser->isLoaded()) {
+        m_autoSyncStatus = tr("Error: no IMU data loaded");
+        emit autoSyncStatusChanged();
+        return;
+    }
+    if (!m_currentCalibration) {
+        m_autoSyncStatus = tr("Error: no calibration profile set");
+        emit autoSyncStatusChanged();
+        return;
+    }
+
+    m_autoSyncRunning = true;
+    m_autoSyncProgress = 0.0;
+    m_autoSyncStatus = tr("Computing visual rotations…");
+    emit autoSyncRunningChanged();
+    emit autoSyncProgressChanged();
+    emit autoSyncStatusChanged();
+
+    m_gyroIntegrator->clearFusedOrientations();
+
+    // Stage 1: Visual Rotation (progress 0-0.4)
+    connect(m_visualRotation, &VisualRotationComputer::progressChanged, this,
+            [this](double fraction, const QString &status) {
+        m_autoSyncProgress = fraction * 0.4;
+        emit autoSyncProgressChanged();
+        m_autoSyncStatus = status;
+        emit autoSyncStatusChanged();
+    }, Qt::QueuedConnection);
+
+    connect(m_visualRotation, &VisualRotationComputer::rotationComputed, this,
+            [this](const QVector<VisualRotationPair> &pairs) {
+        disconnect(m_visualRotation, nullptr, this, nullptr);
+        m_visualPairs = pairs;
+        if (pairs.isEmpty()) {
+            m_autoSyncRunning = false;
+            m_autoSyncStatus = tr("Error: no visual rotations found");
+            emit autoSyncRunningChanged();
+            emit autoSyncStatusChanged();
+            return;
+        }
+
+        // Stage 2: Sync Solver (progress 0.4-0.6)
+        m_autoSyncStatus = tr("Solving sync…");
+        emit autoSyncStatusChanged();
+
+        connect(m_syncSolver, &SyncSolver::progressChanged, this,
+                [this](double fraction, const QString &status) {
+            m_autoSyncProgress = 0.4 + fraction * 0.2;
+            emit autoSyncProgressChanged();
+            m_autoSyncStatus = status;
+            emit autoSyncStatusChanged();
+        }, Qt::QueuedConnection);
+
+        connect(m_syncSolver, &SyncSolver::syncSolved, this,
+                [this](const SyncResult &result) {
+            disconnect(m_syncSolver, nullptr, this, nullptr);
+            setImuSyncOffset(result.syncOffset);
+            setImuDrift(result.drift);
+            m_keyframes->setSyncOffset(result.syncOffset);
+            saveKeyframes();
+
+            m_autoSyncStatus = tr("Calibrating gyro…");
+            emit autoSyncStatusChanged();
+
+            // Stage 3: Gyro Calibrator (progress 0.6-0.8)
+            connect(m_gyroCalibrator, &GyroCalibrator::progressChanged, this,
+                    [this](double fraction, const QString &status) {
+                m_autoSyncProgress = 0.6 + fraction * 0.2;
+                emit autoSyncProgressChanged();
+                m_autoSyncStatus = status;
+                emit autoSyncStatusChanged();
+            }, Qt::QueuedConnection);
+
+            connect(m_gyroCalibrator, &GyroCalibrator::calibrationComputed, this,
+                    [this](const GyroCalibration &cal) {
+                disconnect(m_gyroCalibrator, nullptr, this, nullptr);
+                // Store PER VIDEO only. Writing the camera-wide default here
+                // is what turned one bad AutoSync run into a permanent,
+                // silent regression on every other clip: integrateImu() falls
+                // back to the camera default for any video without its own
+                // sidecar calibration, so a single ill-conditioned solve on
+                // one clip re-scaled and cross-mixed the gyro for all of them,
+                // and survived restarts. Promoting a calibration to the camera
+                // default is now an explicit user action
+                // (saveGyroCalibrationAsCameraDefault()).
+                m_keyframes->setGyroCalibration(cal.matrix, cal.bias);
+                saveKeyframes();
+                qInfo() << "Gyro calibration accepted for this video: residual"
+                        << cal.residualDeg << "deg/s," << cal.samplesUsed << "samples";
+
+                // Diagnostics only. The per-axis diagonal fit (omega_visual =
+                // s * omega_raw + b) implies a scale relative to the parser's
+                // LSB/(deg/s) divisor, and it used to be written straight into
+                // the camera-default gyroScaleX/Y/Z. That was doubly wrong:
+                // it is a global write from a per-clip measurement, and
+                // integrateImu() then folds the resulting scaleDiag on top of
+                // the stored matrix M whose diagonal already encodes the SAME
+                // correction — so the scale was applied twice. Report it and
+                // let the operator decide.
+                {
+                    const double sx = cal.diagScale.x(), sy = cal.diagScale.y(), sz = cal.diagScale.z();
+                    qInfo() << "Gyro visual diagScale factors:" << sx << sy << sz
+                            << "(bias" << cal.diagBias.x() << cal.diagBias.y() << cal.diagBias.z()
+                            << "deg/s, resid" << cal.residualDeg << "deg/s, samples" << cal.samplesUsed << ")";
+                }
+
+                m_autoSyncStatus = tr("Re-integrating IMU…");
+                emit autoSyncStatusChanged();
+                // Stage 4 runs the fusion on its own thread; suppress the one
+                // integrateImu() would otherwise do inline on the GUI thread.
+                m_deferVisualFusion = true;
+                integrateImu();
+                m_deferVisualFusion = false;
+
+                // Stage 4: Visual Fusion (progress 0.8-1.0)
+                m_autoSyncStatus = tr("Fusing visual + IMU…");
+                emit autoSyncStatusChanged();
+                m_autoSyncProgress = 0.85;
+                emit autoSyncProgressChanged();
+
+                auto *fusionThread = QThread::create([this]() {
+                    applyVisualFusion();
+                });
+
+                connect(fusionThread, &QThread::finished, this, [this, fusionThread]() {
+                    fusionThread->deleteLater();
+
+                    m_autoSyncProgress = 1.0;
+                    m_autoSyncRunning = false;
+                    m_autoSyncStatus = tr("Sync & calibration complete");
+                    emit autoSyncProgressChanged();
+                    emit autoSyncRunningChanged();
+                    emit autoSyncStatusChanged();
+                    if (m_imuStabilize)
+                        emit imuOrientationChanged();
+                }, Qt::QueuedConnection);
+
+                fusionThread->start();
+            }, Qt::QueuedConnection);
+
+            connect(m_syncSolver, &SyncSolver::solveFailed, this,
+                    [this](const QString &error) {
+                disconnect(m_syncSolver, nullptr, this, nullptr);
+                m_autoSyncRunning = false;
+                m_autoSyncStatus = tr("Sync failed: %1").arg(error);
+                emit autoSyncRunningChanged();
+                emit autoSyncStatusChanged();
+            }, Qt::QueuedConnection);
+
+            connect(m_gyroCalibrator, &GyroCalibrator::calibrationFailed, this,
+                    [this](const QString &error) {
+                disconnect(m_gyroCalibrator, nullptr, this, nullptr);
+                // Gyro calibration is OPTIONAL — the sync offset solved in the
+                // previous stage is already saved and is useful on its own, so
+                // a rejected calibration must not present as a failed run. The
+                // gyro simply stays uncalibrated, which is the correct and safe
+                // outcome: the visual rotation on most clips measures well under
+                // the true rate, and accepting that as ground truth is exactly
+                // what used to scale the gyro to half and wreck stabilisation.
+                // The full reason goes to the log; the status line stays short
+                // enough not to stretch the control panel (the label elides and
+                // carries the text in its tooltip).
+                qInfo() << "Gyro calibration rejected (sync offset kept):" << error;
+                m_autoSyncStatus = tr("Sync applied; gyro calibration not accepted");
+                emit autoSyncStatusChanged();
+                m_autoSyncProgress = 1.0;
+                m_autoSyncRunning = false;
+                emit autoSyncProgressChanged();
+                emit autoSyncRunningChanged();
+                if (m_imuStabilize)
+                    emit imuOrientationChanged();
+            }, Qt::QueuedConnection);
+
+            QMatrix3x3 priorM = m_keyframes->hasGyroCalibration()
+                ? m_keyframes->gyroMatrix() : cameraGyroMatrix();
+            QVector3D priorB = m_keyframes->hasGyroCalibration()
+                ? m_keyframes->gyroBias() : cameraGyroBias();
+            m_gyroCalibrator->calibrate(m_visualPairs, m_imuParser->samples(),
+                                        m_imuSyncOffset, m_imuDrift, priorM, priorB,
+                                        m_imuParser->initialQuaternion());
+        }, Qt::QueuedConnection);
+
+        // Kick off the sync solver. Its progressChanged/syncSolved signals
+        // are connected above; solve completes synchronously here (it is
+        // cheap), emitting syncSolved which advances to the gyro stage.
+        const double initDrift = m_imuDrift;
+        const double initOffset = m_imuSyncOffset;
+        m_syncSolver->solve(m_visualPairs, m_imuParser->samples(),
+                            initDrift, initOffset);
+    }, Qt::QueuedConnection);
+
+    connect(m_visualRotation, &VisualRotationComputer::computationFailed, this,
+            [this](const QString &error) {
+        disconnect(m_visualRotation, nullptr, this, nullptr);
+        m_autoSyncRunning = false;
+        m_autoSyncStatus = tr("Visual rotation failed: %1").arg(error);
+        emit autoSyncRunningChanged();
+        emit autoSyncStatusChanged();
+    }, Qt::QueuedConnection);
+
+    // frameSkip=1 (every 2nd frame) rather than the default 3. At 3 the decoder
+    // keeps one frame in four and the hop search then spans up to four of THOSE,
+    // so the shortest possible pair is 0.13 s and a 5-7 s calibration clip
+    // yields only ~15 pairs in total — below what a 12-parameter fit can use,
+    // and long enough per hop that the body axes rotate appreciably within one.
+    // Halving the stride doubles the pair count and halves the minimum hop.
+    // Decoding stays bounded by MAX_DECODED_FRAMES.
+    m_visualRotation->compute(m_videoPath, m_currentCalibration, /*frameSkip=*/1);
 }
 
 QString App::grabStill(int lens)

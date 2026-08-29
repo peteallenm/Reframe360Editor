@@ -18,7 +18,12 @@ class QThread;
 #include "keyframe.h"
 #include "exporter.h"
 #include "flowrenderer.h"
-#include "imudriftcalibrator.h"
+#include "visualrotation.h"
+#include "syncsolver.h"
+#include "gyrocalibration.h"
+#include "visualfusion.h"
+#include <QMatrix3x3>
+#include <QVector3D>
 
 // Immutable snapshot of everything the exporter needs, captured at export
 // start so the export worker thread never touches live GUI state. Per-time
@@ -55,35 +60,54 @@ struct ExportSnapshot {
         }
         if (imuStabilize && !imuOrientations.isEmpty()) {
             const double tImu = t * (1.0 + drift) + syncOffset;
-            // Two-signal architecture: q_actual^{-1} * q_virtual
-            // q_actual: full-bandwidth slerp (unsmoothed) — shake cancels exactly
-            // q_virtual: Gaussian-smoothed — smooth intentional motion path
-            // The shader applies imuOrientation.conjugated(), giving
-            // q_virtual^{-1} * q_actual as the stabilization correction.
-            QQuaternion qActual = GyroscopeIntegrator::orientationAt(
-                imuOrientations, imuTimestamps, tImu, 0.0f);
-            // For q_actual we need unsmoothed slerp, not the 33ms-minimum
-            // Gaussian window. Compute it inline:
-            if (imuOrientations.size() >= 2 && tImu > imuTimestamps.first()
-                && tImu < imuTimestamps.last()) {
+            // Dual-mode stabilization (matches App::imuOrientationAt):
+            //  - imuSmoothingMs <= 270 (smoothing <= 0.9): q_virtual is the
+            //    Gaussian-smoothed "virtual tripod" path -> HIGH-PASS. Removes
+            //    shake, keeps intentional motion (a 360° pan stays visible).
+            //  - imuSmoothingMs > 270 (smoothing > 0.9): q_virtual is pinned to
+            //    the first orientation -> LOW-PASS / hold-world-steady. Cancels
+            //    ALL rotation (even a full 360°), holding the world fixed.
+            // Return q_virtual^{-1} * q_actual.
+            // q_actual must be UNSMOOTHED. orientationAt(..., 0.0f) is not:
+            // it still applies the 33 ms Gaussian floor. The old code called it
+            // and then threw the result away for an inline slerp on the common
+            // path, leaving the smoothed value in place only at the clip's
+            // first/last sample -- so export and preview disagreed exactly at
+            // the edges. Compute the slerp directly and skip the wasted
+            // Gaussian pass (it ran once per exported frame).
+            QQuaternion qActual = imuOrientations.last();
+            if (tImu <= imuTimestamps.first()) {
+                qActual = imuOrientations.first();
+            } else if (tImu < imuTimestamps.last()) {
                 const auto it = std::lower_bound(imuTimestamps.begin(),
                                                  imuTimestamps.end(), tImu);
                 int idx = (it == imuTimestamps.end()) ? imuTimestamps.size() - 1
                                                       : (int)(it - imuTimestamps.begin());
                 if (idx > 0 && imuTimestamps[idx] > tImu) idx--;
                 if (idx + 1 < imuOrientations.size()) {
-                    double dtIdx = imuTimestamps[idx + 1] - imuTimestamps[idx];
+                    const double dtIdx = imuTimestamps[idx + 1] - imuTimestamps[idx];
                     float frac = (dtIdx > 0.0) ? (float)((tImu - imuTimestamps[idx]) / dtIdx) : 0.0f;
                     frac = qBound(0.0f, frac, 1.0f);
                     qActual = QQuaternion::slerp(imuOrientations[idx],
                                                  imuOrientations[idx + 1], frac);
+                } else {
+                    qActual = imuOrientations[idx];
                 }
             }
-            QQuaternion qVirtual = GyroscopeIntegrator::orientationAt(
-                imuOrientations, imuTimestamps, tImu, imuSmoothingMs);
-            s.imuOrientation = qActual.conjugated() * qVirtual;
+
+            QQuaternion qVirtual;
+            if (imuSmoothingMs > 270.0f) {
+                qVirtual = imuOrientations.first();
+                if (qVirtual.isNull())
+                    qVirtual = qActual;          // guard the preview path has
+            } else {
+                qVirtual = GyroscopeIntegrator::orientationAt(
+                    imuOrientations, imuTimestamps, tImu, imuSmoothingMs);
+            }
+            // Same single definition the preview uses, so the two cannot drift.
+            s.imuOrientation = composeStabilisation(qActual, qVirtual);
         } else {
-            s.imuOrientation = QQuaternion(1.0f, 0.0f, 0.0f, 0.0f);
+            s.imuOrientation = kFlipRollQ();
         }
         return s;
     }
@@ -138,9 +162,9 @@ class App : public QObject
     Q_PROPERTY(bool exportVidstab READ exportVidstab WRITE setExportVidstab NOTIFY exportVidstabChanged)
     Q_PROPERTY(bool exportVidstabInformed READ exportVidstabInformed WRITE setExportVidstabInformed NOTIFY exportVidstabInformedChanged)
     Q_PROPERTY(QString exportFileName READ exportFileName WRITE setExportFileName NOTIFY exportFileNameChanged)
-    Q_PROPERTY(bool calibrationRunning READ calibrationRunning NOTIFY calibrationRunningChanged)
-    Q_PROPERTY(double calibrationProgress READ calibrationProgress NOTIFY calibrationProgressChanged)
-    Q_PROPERTY(QString calibrationStatus READ calibrationStatus NOTIFY calibrationStatusChanged)
+    Q_PROPERTY(bool autoSyncRunning READ autoSyncRunning NOTIFY autoSyncRunningChanged)
+    Q_PROPERTY(double autoSyncProgress READ autoSyncProgress NOTIFY autoSyncProgressChanged)
+    Q_PROPERTY(QString autoSyncStatus READ autoSyncStatus NOTIFY autoSyncStatusChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -256,15 +280,28 @@ public:
     Q_INVOKABLE void addKeyframeAtCurrent();
     Q_INVOKABLE void applyKeyframeInterpolation();
 
-    // IMU drift calibration: samples frames across the current video, detects
-    // the horizon in each, and finds the drift that minimizes the IMU-vs-horizon
-    // roll error. Runs in a background thread; progress/result surface via
-    // calibrationRunning/Progress/Status properties.
-    Q_INVOKABLE void calibrateImuDrift();
+    bool autoSyncRunning() const { return m_autoSyncRunning; }
+    double autoSyncProgress() const { return m_autoSyncProgress; }
+    QString autoSyncStatus() const { return m_autoSyncStatus; }
+    Q_INVOKABLE void autoSyncAndCalibrate();
 
-    bool calibrationRunning() const { return m_calibrationRunning; }
-    double calibrationProgress() const { return m_calibrationProgress; }
-    QString calibrationStatus() const { return m_calibrationStatus; }
+    // Gyro calibration is applied silently on every video load (sidecar first,
+    // camera default second), so there must be a way to undo one that turned
+    // out to be wrong — otherwise a bad AutoSync is permanent and invisible.
+    // Both of these re-integrate immediately so the effect is visible.
+    Q_INVOKABLE void clearGyroCalibration();        // this video's sidecar
+    Q_INVOKABLE void clearCameraGyroDefaults();     // camera-wide fallback
+    // Promote this video's calibration to the camera-wide default. Explicit
+    // only: AutoSync never does this on its own.
+    Q_INVOKABLE bool saveGyroCalibrationAsCameraDefault();
+    Q_INVOKABLE bool hasGyroCalibration() const;
+    Q_INVOKABLE bool hasCameraGyroDefaults() const;
+
+    QMatrix3x3 cameraGyroMatrix() const;
+    void setCameraGyroMatrix(const QMatrix3x3 &M);
+    QVector3D cameraGyroBias() const;
+    void setCameraGyroBias(const QVector3D &b);
+
 
 private:
     QQuaternion viewQuatFromEuler() const;
@@ -337,9 +374,9 @@ signals:
     void exportVidstabChanged();
     void exportVidstabInformedChanged();
     void exportFileNameChanged();
-    void calibrationRunningChanged();
-    void calibrationProgressChanged();
-    void calibrationStatusChanged();
+    void autoSyncRunningChanged();
+    void autoSyncProgressChanged();
+    void autoSyncStatusChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -351,6 +388,10 @@ private:
     KeyframeModel *m_keyframes;
     Exporter *m_exporter;
     QTimer *m_trimSaveTimer;  // coalesces sidecar writes while dragging trim
+    // Coalesces re-integration while dragging the Mahony gain slider. A full
+    // integrate() + refuse is ~45 ms on a 140 s clip and the slider emits on
+    // every mouse-move, so without this the UI stutters through a drag.
+    QTimer *m_reintegrateTimer = nullptr;
 
     bool m_exportRunning;
     double m_exportProgress;
@@ -399,10 +440,22 @@ private:
     double m_seamStrength;
     QImage m_seamImage;
 
-    ImuDriftCalibrator *m_driftCalibrator;
-    bool m_calibrationRunning;
-    double m_calibrationProgress;
-    QString m_calibrationStatus;
+    // Auto-sync pipeline
+    VisualRotationComputer *m_visualRotation = nullptr;
+    SyncSolver *m_syncSolver = nullptr;
+    GyroCalibrator *m_gyroCalibrator = nullptr;
+    // Rebuild the optical drift correction on the current IMU chain (no-op
+    // when this clip has no visual pairs). Called after every re-integration
+    // and as AutoSync stage 4.
+    void applyVisualFusion();
+
+    VisualFusion *m_visualFusion = nullptr;
+    bool m_deferVisualFusion = false;  // AutoSync fuses on its own thread
+    QVector<VisualRotationPair> m_visualPairs;
+    bool m_autoSyncRunning = false;
+    double m_autoSyncProgress = 0.0;
+    QString m_autoSyncStatus;
+
 };
 
 #endif // APP_H
