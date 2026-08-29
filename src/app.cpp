@@ -735,7 +735,7 @@ void App::applyVisualFusion()
     m_visualFusion->fuse(m_visualPairs,
                          m_gyroIntegrator->orientations(),
                          m_gyroIntegrator->timestamps(),
-                         m_imuSyncOffset, m_imuDrift, 0.5,
+                         m_imuSyncOffset, m_imuDrift, 3.0,
                          m_gyroIntegrator->gravityTrust());
     const auto fusedOris = m_visualFusion->fusedOrientations();
     const auto fusedTs = m_visualFusion->fusedTimestamps();

@@ -27,6 +27,9 @@ Item {
             // when stabilization is off; overriding it with identity here put the
             // render back upside down.
             imuOrientation: app.imuOrientation
+            // named "controller": a property called "app" would shadow the context
+            // object of the same name for every other binding in this item.
+            controller: app
             flowStitch: app.flowStitch
             flowStrength: app.flowStrength
             flowImage: app.flowImage

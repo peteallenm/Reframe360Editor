@@ -1,4 +1,5 @@
 #include "lensviewer.h"
+#include "app.h"
 #include "viewermaterial.h"
 #include "flowrenderer.h"
 #include <QSGGeometryNode>
@@ -192,12 +193,27 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     material->setActiveLens(m_activeLens);
     material->setProjection(m_projection);
 
+    // Pair the orientation with the frame being painted. m_imuOrientation is a
+    // QML property the GUI thread computed for the frame it last saw; the
+    // decoder can have advanced since, and under load (per-frame stitching adds
+    // ~33 ms of work) it regularly has. Painting frame N+1 with orientation N
+    // is a one-frame timing error -- 10 deg at 300 deg/s -- that showed as a
+    // high-frequency jitter in the preview but not in exports, which pair the
+    // two deterministically. updatePaintNode runs with the GUI thread blocked,
+    // so asking the App for the orientation at THIS frame's timestamp is safe.
+    QQuaternion imuQ = m_imuOrientation;
+    DecodedFrame frame;
+    const bool haveFrame = m_decoder && m_decoder->hasFrame();
+    if (haveFrame) {
+        frame = m_decoder->currentFrame();
+        if (auto *app = qobject_cast<App *>(m_app))
+            imuQ = app->imuOrientationAt(frame.timestamp);
+    }
     QMatrix4x4 imuMat;
-    imuMat.rotate(m_imuOrientation.conjugated());
+    imuMat.rotate(imuQ.conjugated());
     material->setImuMatrix(imuMat);
 
-    if (m_decoder && m_decoder->hasFrame()) {
-        DecodedFrame frame = m_decoder->currentFrame();
+    if (haveFrame) {
         int frameKey = (int)(frame.timestamp * 1000);
         if (frameKey != m_lastFrameTimestamp) {
             m_lastFrameTimestamp = frameKey;

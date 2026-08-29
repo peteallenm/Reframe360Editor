@@ -14,6 +14,7 @@
 #include "visualfusion.h"
 #include "keyframe.h"
 #include <QFile>
+#include <QTextStream>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -725,7 +726,7 @@ static double g_residualSeconds = 0.0;   // 0 = whole clip
 static double g_syncOverride = -1e9;     // --sync=N overrides the sidecar
 static int    g_lensMask = 3;            // --lens=1 front, 2 rear, 3 both
 static int    g_mirrorRear = -1;         // --mirror=0/1 forces rear mirrorAzimuth
-static double g_fusionSigma = 0.5;       // --sigma=N correction-spline sigma (s)
+static double g_fusionSigma = 3.0;       // --sigma=N correction-spline sigma (s)
 static bool   g_useCal = false;          // --usecal: apply the sidecar gyro matrix/bias
 static bool   g_imuOnly = false;         // --imuonly: skip the visual stage (fast IMU probes)
 static bool   g_evalFused = false;       // --fused: tilt tool evaluates the fused chain
@@ -1893,6 +1894,43 @@ static void tiltDrift(const QString &video)
         qInfo().noquote() << "  no window quiet enough to trust the accelerometer";
 }
 
+
+// --framejerk : sample the stored chain at video frame times (sync applied) and
+// report per-frame rotation and its change, to see whether isolated kicks in a
+// stabilised export come from the chain or from frame/state pairing.
+static void frameJerk(const QString &video)
+{
+    ImuParser imu;
+    if (!imu.loadFile(video + ".imu")) { qInfo() << "no IMU"; return; }
+    KeyframeModel kf; kf.loadFromFile(video + QStringLiteral(".keyframes.json"));
+    const double off = kf.hasSyncOffset() ? kf.syncOffset() : 0.0;
+    GyroscopeIntegrator gi;
+    gi.integrate(imu.samples(), imu.imuSampleRate(), imu.initialQuaternion(), g_kp, g_ki);
+    const auto oris = gi.orientations(); const auto ts = gi.timestamps();
+    auto ang = [](const QQuaternion &q) {
+        return 2.0 * std::asin(qMin(1.0, (double)QVector3D(q.x(), q.y(), q.z()).length())) * 180.0 / M_PI; };
+    qInfo().noquote() << QString("\n===== frame jerk: %1 (sync %2) =====").arg(video).arg(off, 0, 'f', 3);
+    qInfo().noquote() << "  frame  t(video)  rot/frame(deg)  d(rot)  | IMU dt irregular near t?";
+    const double fps = 30000.0 / 1001.0;
+    double prevRot = -1;
+    for (int n = 15; n < 90; ++n) {
+        const double t0 = n / fps, t1 = (n + 1) / fps;
+        const QQuaternion a = gi.orientationAtTimeUnsmoothed(t0 + off);
+        const QQuaternion b = gi.orientationAtTimeUnsmoothed(t1 + off);
+        const double rot = ang((a.conjugated() * b).normalized());
+        // IMU sample spacing around this frame time
+        const auto it = std::lower_bound(ts.begin(), ts.end(), t0 + off);
+        int i = qBound(1, (int)(it - ts.begin()), ts.size() - 2);
+        const double dtA = ts[i] - ts[i - 1], dtB = ts[i + 1] - ts[i];
+        const QString irr = (std::abs(dtA - 0.0025) > 2e-4 || std::abs(dtB - 0.0025) > 2e-4)
+                            ? QString("dt %1/%2 ms").arg(dtA * 1e3, 0, 'f', 2).arg(dtB * 1e3, 0, 'f', 2) : QString();
+        const double d = (prevRot < 0) ? 0.0 : rot - prevRot;
+        qInfo().noquote() << QString("  %1  %2  %3  %4  %5%6").arg(n, 5).arg(t0, 8, 'f', 3).arg(rot, 10, 'f', 2)
+            .arg(d, 7, 'f', 2).arg(std::abs(d) > 1.5 ? "  <-- kick" : "").arg(irr.isEmpty() ? "" : "   " + irr);
+        prevRot = rot;
+    }
+}
+
 static void testImuParser(const QString &video)
 {
     QString imuPath = video + ".imu";
@@ -2196,7 +2234,7 @@ static void testFusionContinuity(const QString &video, double syncOffset, double
     gi.integrate(imu.samples(), imu.imuSampleRate(), imu.initialQuaternion(), g_kp, g_ki);
 
     VisualFusion vf;
-    vf.fuse(pairs, gi.orientations(), gi.timestamps(), syncOffset, drift, 0.5, gi.gravityTrust());
+    vf.fuse(pairs, gi.orientations(), gi.timestamps(), syncOffset, drift, 3.0, gi.gravityTrust());
     auto fused = vf.fusedOrientations();
     if (fused.isEmpty()) { report("Fusion continuity", false, "no fused orientations"); return; }
 
@@ -2256,6 +2294,7 @@ int main(int argc, char *argv[])
     bool fusionMode = false;
     bool gtMode = false;
     bool tiltMode = false;
+    bool jerkMode = false;
     QStringList videos;
     for (int i = 1; i < argc; i++) {
         if (QString(argv[i]) == "--quick") { quick = true; continue; }
@@ -2270,6 +2309,7 @@ int main(int argc, char *argv[])
         if (QString(argv[i]) == "--fusion") { fusionMode = true; continue; }
         if (QString(argv[i]) == "--groundtruth") { gtMode = true; continue; }
         if (QString(argv[i]) == "--tilt") { tiltMode = true; continue; }
+        if (QString(argv[i]) == "--framejerk") { jerkMode = true; continue; }
         if (QString(argv[i]) == "--usecal") { g_useCal = true; continue; }
         if (QString(argv[i]) == "--imuonly") { g_imuOnly = true; continue; }
         if (QString(argv[i]) == "--fused") { g_evalFused = true; continue; }
@@ -2294,6 +2334,11 @@ int main(int argc, char *argv[])
     }
     if (videos.isEmpty()) {
         videos << "/home/pallen/Build/360Render/YIVR_0830_360.MP4";
+    }
+
+    if (jerkMode) {
+        for (const auto &video : videos) frameJerk(video);
+        return 0;
     }
 
     if (tiltMode) {

@@ -899,10 +899,17 @@ void VisualRotationComputer::compute(const QString &videoPath,
             constexpr double HOP_MAX_RMS_DEG = 30.0;
 
             // The greedy walk over one contiguous frame range [lo, hi].
+            // Progress from inside the parallel walk: frames advanced across all
+            // segments, emitted every few frames (Qt signals are thread-safe;
+            // the receiver is queued). Without this the bar sat at the end of
+            // feature detection until the whole stage finished.
+            QAtomicInt framesDone(0);
+            const int nFramesTotal = frames.size();
             auto walk = [&](int lo, int hi, QVector<VisualRotationPair> &outPairs) {
                 QQuaternion prevRotation;
                 int i = lo;
                 while (i < hi) {
+                    const int before = i;
                     int k = maxHop;
                     QQuaternion bestD; bool bestValid = false;
                     int bestInl = 0; double bestRms = 999.0;
@@ -947,6 +954,10 @@ void VisualRotationComputer::compute(const QString &videoPath,
                         prevRotation = bestD;
                     }
                     i += (bestValid && bestK >= 1) ? bestK : 1;  // always advance
+                    const int done = framesDone.fetchAndAddRelaxed(i - before) + (i - before);
+                    if ((done & 15) < (i - before))   // roughly every 16 frames
+                        emit progressChanged(0.65 + 0.35 * (double)done / qMax(1, nFramesTotal),
+                                             QStringLiteral("Matching %1/%2").arg(done).arg(nFramesTotal));
                 }
             };
 

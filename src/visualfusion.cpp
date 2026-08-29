@@ -24,6 +24,10 @@ static constexpr double kMaxKnotStepDeg = 20.0;
 // fastest clip measured moves ~20 deg/s; anything above this is a bad visual
 // pair, and letting it through puts a visible flick in the output.
 static constexpr double kMaxCorrectionSlewDegPerSec = 30.0;
+// Ceiling on how fast the APPLIED correction may change per IMU sample. Real
+// yaw drift on this sensor is ~1-2 deg/s even on a fast orbit; 4 keeps up with
+// it while making the visual chain's frame-to-frame noise invisible.
+static constexpr double kMaxAppliedSlewDegPerSec = 4.0;
 
 // ---------------------------------------------------------------------------
 // sampleImuOrientation — slerp interpolation at arbitrary IMU time
@@ -602,6 +606,15 @@ void VisualFusion::fuse(const QVector<VisualRotationPair> &visualPairs,
     m_fusedOrientations.reserve(n);
     m_fusedTimestamps.reserve(n);
 
+    // The correction is yaw DRIFT: on this sensor it accumulates at roughly a
+    // degree or two per second at most. Anything faster is the visual chain's
+    // noise, and applied to the output it reads as camera motion -- measured
+    // before this limit: mean 6.7 deg/s, p99 40 deg/s, kicks >10 deg/s every
+    // 0.4 s, which the user saw as a ~1 Hz jitter. Slerp each sample's
+    // correction toward the previous one so its rate never exceeds
+    // kMaxAppliedSlewDegPerSec.
+    QQuaternion prevC; bool havePrev = false; double prevT = 0.0;
+    int limitedCount = 0; double maxPostRate = 0.0;
     for (int i = 0; i < n; i++) {
         double tImu = imuTimestamps[i];
         QQuaternion qGyro = imuOrientations[i];
@@ -609,6 +622,28 @@ void VisualFusion::fuse(const QVector<VisualRotationPair> &visualPairs,
         // Map IMU time to video time for correction lookup
         double tVideo = (tImu - syncOffset) / (1.0 + drift);
         QQuaternion C = correctionAt(tVideo);
+        if (havePrev) {
+            const double dt = qMax(1e-4, tImu - prevT);
+            const QQuaternion dC = (C * prevC.conjugated()).normalized();
+            // Angle from the VECTOR part. For a 0.01 deg step the scalar part
+            // is 1 - 4e-9, which float rounds to exactly 1 -- acos then says
+            // the step is zero and the limit never engages until the step is
+            // ~0.04 deg/sample (16 deg/s). asin(|v|) keeps full precision.
+            const double sinHalf = qMin(1.0, (double)QVector3D(dC.x(), dC.y(), dC.z()).length());
+            const double step = 2.0 * std::asin(sinHalf) * 180.0 / M_PI;
+            const double maxStep = kMaxAppliedSlewDegPerSec * dt;
+            static const bool kNoSlew = !qgetenv("RENDER360_FUSION_NOSLEW").isEmpty();   // measurement hook
+            if (step > maxStep && !kNoSlew) {
+                C = QQuaternion::slerp(prevC, C, (float)(maxStep / step)).normalized();
+                limitedCount++;
+            }
+            {   // post-limit step, for the diagnostic below
+                const QQuaternion d2 = (C * prevC.conjugated()).normalized();
+                const double s2 = 2.0 * std::asin(qMin(1.0, (double)QVector3D(d2.x(), d2.y(), d2.z()).length())) * 180.0 / M_PI / dt;
+                maxPostRate = qMax(maxPostRate, s2);
+            }
+        }
+        prevC = C; prevT = tImu; havePrev = true;
 
         // Q_fused = C * Q_gyro
         QQuaternion qFused = (C * qGyro).normalized();
@@ -617,7 +652,8 @@ void VisualFusion::fuse(const QVector<VisualRotationPair> &visualPairs,
     }
 
     qDebug() << "VisualFusion: generated" << m_fusedOrientations.size()
-             << "fused orientations";
+             << "fused orientations; slew limit engaged on" << limitedCount
+             << "samples, max post-limit correction rate" << maxPostRate << "deg/s";
 }
 
 // ---------------------------------------------------------------------------

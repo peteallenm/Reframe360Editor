@@ -276,6 +276,10 @@ public:
     Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend = true);
     Q_INVOKABLE QString grabStill(int lens);
     Q_INVOKABLE void dragLook(double angleAboutUp, double angleAboutRight);
+    // Stabilisation quaternion for a given video time. Public so LensViewer can
+    // pair the orientation with the exact frame it paints (render thread, GUI
+    // thread blocked -- see LensViewer::updatePaintNode).
+    QQuaternion imuOrientationAt(double time) const;
 
     Q_INVOKABLE void addKeyframeAtCurrent();
     Q_INVOKABLE void applyKeyframeInterpolation();
@@ -322,7 +326,6 @@ private:
 
     // IMU-stabilized view quaternion at an arbitrary time (thread-safe: only
     // reads fixed integrator data).
-    QQuaternion imuOrientationAt(double time) const;
 
     // Optical-flow preview: request a recompute for the current frame (queued
     // to the flow worker), and consume its packed result.

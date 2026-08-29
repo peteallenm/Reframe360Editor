@@ -33,8 +33,10 @@ public:
     //   1.731-1.733 for the fused chain at EVERY sigma, i.e. fusion adds no
     //   measurable shake -- the correction is smooth, so the old 1.5 s was
     //   simply over-smoothing a drift that moves at ~20 deg/s on an orbit clip.
-    //   0.5 s takes most of the available gain while staying the most tolerant
-    //   of clips with noisier visual pairs than the ones measured.
+    //   That sweep optimised TILT accuracy. Fusion is now yaw-only, and a yaw
+    //   drift correction must above all be smooth: at 0.5 s the applied
+    //   correction moved at 6.7 deg/s mean / 40 deg/s p99 and read as a ~1 Hz
+    //   jitter. 3 s, plus the 4 deg/s slew limit in fuse(), keeps it invisible.
     // imuTrust (optional, per IMU sample, [0,1]): where the IMU's absolute
     // attitude is gravity-verified. When given, the visual chain is anchored
     // to the IMU over those samples rather than at its first pair -- see the

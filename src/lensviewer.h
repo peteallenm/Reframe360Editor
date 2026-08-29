@@ -35,6 +35,10 @@ class LensViewer : public QQuickItem
     Q_PROPERTY(bool seamStitch READ seamStitch WRITE setSeamStitch NOTIFY seamStitchChanged)
     Q_PROPERTY(double seamStrength READ seamStrength WRITE setSeamStrength NOTIFY seamStrengthChanged)
     Q_PROPERTY(QImage seamImage READ seamImage WRITE setSeamImage NOTIFY seamImageChanged)
+    // The App, so the viewer can ask for the orientation of the FRAME IT PAINTS
+    // (see updatePaintNode) instead of using a property computed for whatever
+    // frame the GUI thread last saw.
+    Q_PROPERTY(QObject* controller READ appObject WRITE setAppObject NOTIFY appObjectChanged)
     Q_PROPERTY(QImage curveLut READ curveLut WRITE setCurveLut NOTIFY curveLutChanged)
     Q_PROPERTY(bool curvesActive READ curvesActive WRITE setCurvesActive NOTIFY curvesActiveChanged)
 
@@ -81,6 +85,8 @@ public:
     void setSeamStrength(double v);
     QImage seamImage() const { return m_seamImage; }
     void setSeamImage(const QImage &img);
+    QObject *appObject() const { return m_app; }
+    void setAppObject(QObject *a) { if (m_app == a) return; m_app = a; emit appObjectChanged(); update(); }
     QImage curveLut() const { return m_curveLut; }
     void setCurveLut(const QImage &img);
     bool curvesActive() const { return m_curvesActive; }
@@ -110,6 +116,7 @@ signals:
     void seamStrengthChanged();
     void seamImageChanged();
     void curveLutChanged();
+    void appObjectChanged();
     void curvesActiveChanged();
 
 private:
@@ -138,6 +145,7 @@ private:
     QImage m_seamImage;
     QSGTexture *m_seamTexture;
     qint64 m_seamTextureKey;
+    QObject *m_app = nullptr;
     QImage m_curveLut;
     bool m_curvesActive = false;
     QSGTexture *m_curveTexture = nullptr;
