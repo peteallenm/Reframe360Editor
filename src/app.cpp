@@ -97,6 +97,15 @@ App::App(QObject *parent)
             emit imuOrientationChanged();
     });
     connect(m_decoder, &VideoDecoder::errorOccurred, this, &App::errorOccurred);
+    // Surface it: the signal alone went nowhere, so a failed open silently left
+    // the previous clip's last frame on screen.
+    connect(m_decoder, &VideoDecoder::errorOccurred, this, [this](const QString &msg) {
+        m_isPlaying = false;
+        emit isPlayingChanged();
+        m_loadError = msg;
+        emit loadErrorChanged();
+        qWarning().noquote() << "Load failed:" << msg;
+    });
 
     // Optical-flow stitching: a dedicated worker thread owns the FlowRenderer
     // (QOpenGLContext is thread-affine — the 4.4 context is created lazily on
@@ -114,7 +123,7 @@ App::App(QObject *parent)
     });
     m_flowThread->start();
 
-    connect(m_decoder, &VideoDecoder::frameReady, this, [this]() { maybeComputeFlow(); });
+    connect(m_decoder, &VideoDecoder::frameReady, this, [this]() { maybeComputeFlow(); emit histogramChanged(); });
     auto onCalChanged = [this]() { maybeComputeFlow(); };
     connect(m_currentCalibration, &CalibrationProfile::frontCenterXChanged, this, onCalChanged);
     connect(m_currentCalibration, &CalibrationProfile::frontCenterYChanged, this, onCalChanged);
@@ -212,7 +221,7 @@ App::App(QObject *parent)
 
     // Colour grade changes persist automatically (same convention as the
     // projection / IMU settings).
-    auto saveGrade = [this]() { saveSettings(); };
+    auto saveGrade = [this]() { saveSettings(); emit histogramChanged(); };
     connect(m_colorGrade, &ColorGrade::brightnessChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::contrastChanged, this, saveGrade);
     connect(m_colorGrade, &ColorGrade::saturationChanged, this, saveGrade);
@@ -233,6 +242,18 @@ App::App(QObject *parent)
     connect(m_colorGrade, &ColorGrade::curvesChanged, this, saveGrade);
 
     // Auto-sync pipeline objects
+    m_folder = new FolderAccess(this);
+    {
+        // A tree grant is persistable, so remember it: the user picks the
+        // camera's folder once, not once per launch.
+        QSettings st;
+        m_folder->restore(st.value(QStringLiteral("storage/folderUri")).toString());
+    }
+    connect(m_folder, &FolderAccess::folderChanged, this, [this]() {
+        QSettings st;
+        st.setValue(QStringLiteral("storage/folderUri"), m_folder->treeUri());
+    });
+
     m_visualRotation = new VisualRotationComputer(this);
     m_syncSolver = new SyncSolver(this);
     m_gyroCalibrator = new GyroCalibrator(this);
@@ -252,8 +273,45 @@ QString App::videoPath() const
     return m_videoPath;
 }
 
+void App::openClipFromFolder(const QString &displayName)
+{
+    if (!m_folder)
+        return;
+    const QString video = m_folder->uriFor(displayName);
+    if (video.isEmpty())
+        return;
+    openClip(video,
+             m_folder->imuFor(displayName),
+             m_folder->proxyFor(displayName),
+             m_folder->keyframesFor(displayName));
+    // After openClip(), which clears it: any other way of opening a clip must
+    // not inherit this name, or its keyframes would be written into the
+    // folder under the wrong file.
+    m_folderClipName = displayName;
+}
+
+void App::openClip(const QString &video, const QString &imu,
+                   const QString &proxy, const QString &keyframes)
+{
+    m_folderClipName.clear();
+    m_pendingImu = imu;
+    m_pendingProxy = proxy;
+    m_pendingKeyframes = keyframes;
+    setVideoPath(video);
+}
+
 void App::setVideoPath(const QString &path)
 {
+    // Overrides only apply to the openClip() call that supplied them; a plain
+    // setVideoPath (the CLI, or a second open) must fall back to deriving the
+    // sidecars from the video path again.
+    m_imuOverride = m_pendingImu;
+    m_proxyOverride = m_pendingProxy;
+    m_keyframesOverride = m_pendingKeyframes;
+    m_pendingImu.clear();
+    m_pendingProxy.clear();
+    m_pendingKeyframes.clear();
+
     if (m_videoPath == path)
         return;
 
@@ -290,13 +348,18 @@ void App::setVideoPath(const QString &path)
         // video has no sidecar yet). The guard prevents the export-settings
         // change handler from immediately rewriting the file it just read.
         m_restoringSidecar = true;
-        m_keyframes->loadFromFile(keyframesPathFor(path));
+        m_keyframes->loadFromFile(m_keyframesOverride.isEmpty()
+                                  ? keyframesPathFor(path) : m_keyframesOverride);
         m_restoringSidecar = false;
         m_exportStart = m_keyframes->trimIn();
         m_exportEnd = m_keyframes->trimOut();
         emit exportStartChanged();
         emit exportEndChanged();
 
+        if (!m_loadError.isEmpty()) {
+            m_loadError.clear();
+            emit loadErrorChanged();
+        }
         m_decoder->loadVideo(path);
 
         // loadVideo() resets the decoder clock to 0 without emitting
@@ -305,8 +368,8 @@ void App::setVideoPath(const QString &path)
         m_currentTime = m_decoder->currentTime();
         applyKeyframeInterpolation();
 
-        QString imuPath = path + ".imu";
-        if (!QFileInfo::exists(imuPath)) {
+        QString imuPath = m_imuOverride.isEmpty() ? (path + ".imu") : m_imuOverride;
+        if (m_imuOverride.isEmpty() && !QFileInfo::exists(imuPath)) {
             // Thumbnail videos (e.g. YIVR_0807_360_thm.MP4) rarely have their
             // own .imu sidecar. Try the parent full-resolution video's .imu
             // file by stripping a trailing "_thm" before the extension.
@@ -321,7 +384,7 @@ void App::setVideoPath(const QString &path)
                     imuPath = parentImu;
             }
         }
-        if (QFileInfo::exists(imuPath)) {
+        if (!m_imuOverride.isEmpty() || QFileInfo::exists(imuPath)) {
             m_imuParser->loadFile(imuPath);
 
             // IMU<->video drift: a value tuned for this video and stored in
@@ -354,6 +417,8 @@ void App::setVideoPath(const QString &path)
 
 QString App::previewThumbnailPath() const
 {
+    if (!m_proxyOverride.isEmpty())
+        return m_proxyOverride;
     if (m_videoPath.isEmpty())
         return QString();
 
@@ -901,37 +966,33 @@ void App::dragLook(double angleAboutUp, double angleAboutRight)
 {
     // With IMU stabilization the shader composes imuMatrix * euler, so the
     // displayed (stabilized) view is fully described by the euler angles and
-    // dragging behaves exactly like free look — no IMU correction needed.
+    // dragging behaves exactly like free look -- no IMU correction needed.
+    //
+    // Yaw turns about the WORLD up axis; pitch tilts about the camera's own
+    // right axis; roll is never touched. This is the ordinary turntable /
+    // panorama-viewer behaviour, and it is what keeps the horizon level.
+    //
+    // The previous version rotated about the view's LOCAL axes
+    // (q * axisAngle(0,1,0,...)). Once the view is pitched, the local up axis
+    // is no longer world up, so every horizontal drag tipped a little roll
+    // into the view; drag around for a while and the horizon ends up visibly
+    // canted with no obvious way back. It also needed a pole-crossing guard,
+    // because the Euler decomposition of the drifting quaternion goes
+    // degenerate near +-90 deg pitch and would swap yaw and roll.
+    //
+    // Because the shader's euler is rotY(yaw) * rotX(pitch) * rotZ(roll),
+    // adding to yaw IS a pre-multiply by a rotation about world Y, and adding
+    // to pitch inserts a rotation about the yawed X axis -- exactly the two
+    // rotations wanted. So the drag reduces to adding to the two angles, roll
+    // is structurally untouchable, and clamping pitch (setPitch already bounds
+    // it to +-kMaxPitch) removes the degenerate pole case entirely rather than
+    // detecting it after the fact.
+    double yaw = m_yaw + angleAboutUp;
+    while (yaw > 180.0) yaw -= 360.0;
+    while (yaw < -180.0) yaw += 360.0;
 
-    // A drag is a rotation about the view's local axes. Apply the pitch and
-    // yaw components separately and reject any component that would push the
-    // view past the vertical poles (|pitch| ~ 90 deg), where the yaw/roll
-    // Euler decomposition is degenerate and the sliders would swap yaw/roll.
-    // A crossing shows up as a ~180 deg jump in the extracted yaw or roll.
-    auto angleJump = [](double a, double b) {
-        double d = (a > b) ? (a - b) : (b - a);
-        return (d > 180.0) ? (360.0 - d) : d;
-    };
-    // Crossing a pole flips BOTH yaw and roll by ~180 deg (Euler identity
-    // R(y,p,r) = R(y+180, 180-p, r+180)); a large but legit single-event drag
-    // changes only one of them — hence the AND.
-    auto crossesPole = [this, &angleJump](const QQuaternion &q) {
-        double y, p, r;
-        extractEulerFromQuat(q, y, p, r);
-        return angleJump(y, m_yaw) > 90.0 && angleJump(r, m_roll) > 90.0;
-    };
-
-    QQuaternion q = m_viewQuat;
-    QQuaternion afterPitch = (q * QQuaternion::fromAxisAndAngle(1, 0, 0, angleAboutRight)).normalized();
-    if (!crossesPole(afterPitch))
-        q = afterPitch;
-
-    QQuaternion afterYaw = (q * QQuaternion::fromAxisAndAngle(0, 1, 0, angleAboutUp)).normalized();
-    if (!crossesPole(afterYaw))
-        q = afterYaw;
-
-    m_viewQuat = q;
-    setViewFromQuat(m_viewQuat);
+    setYaw(yaw);
+    setPitch(m_pitch + angleAboutRight);
 }
 
 QQuaternion App::viewQuatFromEuler() const
@@ -939,31 +1000,6 @@ QQuaternion App::viewQuatFromEuler() const
     return QQuaternion::fromAxisAndAngle(0, 1, 0, m_yaw)
          * QQuaternion::fromAxisAndAngle(1, 0, 0, m_pitch)
          * QQuaternion::fromAxisAndAngle(0, 0, 1, m_roll);
-}
-
-void App::setViewFromQuat(const QQuaternion &q)
-{
-    float w = q.scalar(), x = q.x(), y = q.y(), z = q.z();
-
-    double m02 = 2.0 * (x * z + y * w);
-    double m12 = 2.0 * (y * z - x * w);
-    double m22 = 1.0 - 2.0 * (x * x + y * y);
-    double m10 = 2.0 * (x * y + z * w);
-    double m11 = 1.0 - 2.0 * (x * x + z * z);
-
-    double yaw = qRadiansToDegrees(atan2(m02, m22));
-    double pitch = qRadiansToDegrees(-asin(qBound(-1.0, m12, 1.0)));
-    double roll = qRadiansToDegrees(atan2(m10, m11));
-
-    if (yaw > 180.0) yaw -= 360.0;
-    else if (yaw < -180.0) yaw += 360.0;
-
-    m_yaw = yaw;
-    m_pitch = pitch;
-    m_roll = roll;
-    emit yawChanged();
-    emit pitchChanged();
-    emit rollChanged();
 }
 
 void App::extractEulerFromQuat(const QQuaternion &q, double &yaw, double &pitch, double &roll) const
@@ -1405,7 +1441,18 @@ void App::saveKeyframes()
     // the current in/out markers (the model keeps them only as loaded state).
     m_keyframes->setTrimIn(m_exportStart);
     m_keyframes->setTrimOut(m_exportEnd);
-    m_keyframes->saveToFile(keyframesPathFor(m_videoPath));
+    // In a granted folder the sidecar is a document in that tree, created if
+    // it does not exist yet -- a plain path would be meaningless (and a
+    // single-file grant is read-only, which is why keyframes could not be
+    // saved on Android before the folder grant).
+    QString target;
+    if (m_folder && !m_folderClipName.isEmpty()) {
+        target = m_folder->writableUriFor(m_folderClipName + QStringLiteral(".keyframes.json"),
+                                          QStringLiteral("application/json"));
+    }
+    if (target.isEmpty())
+        target = keyframesPathFor(m_videoPath);
+    m_keyframes->saveToFile(target);
 }
 
 void App::clearGyroCalibration()
@@ -1719,6 +1766,10 @@ void App::autoSyncAndCalibrate()
     // and long enough per hop that the body axes rotate appreciably within one.
     // Halving the stride doubles the pair count and halves the minimum hop.
     // Decoding stays bounded by MAX_DECODED_FRAMES.
+    // Hand AutoSync the proxy the user selected, if any: on Android the clip
+    // is a content:// URI whose "_thm" sibling cannot be derived, and decoding
+    // 2880x5760 for analysis instead of 720x1440 would take ~30 minutes.
+    m_visualRotation->setDecodeSourceOverride(m_proxyOverride);
     m_visualRotation->compute(m_videoPath, m_currentCalibration, /*frameSkip=*/1);
 }
 
@@ -1763,4 +1814,63 @@ QString App::grabStill(int lens)
     if (!half.save(path))
         return QString();
     return path;
+}
+
+
+QVariantMap App::frameHistogram(int maxSamples) const
+{
+    QVariantMap out;
+    if (!m_decoder)
+        return out;
+
+    // Build the grade exactly as the export snapshot does, so the "graded"
+    // histogram is the same transform the viewer and the exporter apply.
+    GradeParams grade;
+    QImage lutImg;
+    if (m_colorGrade) {
+        grade.brightness = m_colorGrade->brightness();
+        grade.contrast = m_colorGrade->contrast();
+        grade.saturation = m_colorGrade->saturation();
+        grade.pop = m_colorGrade->pop();
+        grade.brightLows = m_colorGrade->brightLows();
+        grade.brightLowMids = m_colorGrade->brightLowMids();
+        grade.brightHighMids = m_colorGrade->brightHighMids();
+        grade.brightHighs = m_colorGrade->brightHighs();
+        grade.redLows = m_colorGrade->redLows();
+        grade.redMids = m_colorGrade->redMids();
+        grade.redHighs = m_colorGrade->redHighs();
+        grade.greenLows = m_colorGrade->greenLows();
+        grade.greenMids = m_colorGrade->greenMids();
+        grade.greenHighs = m_colorGrade->greenHighs();
+        grade.blueLows = m_colorGrade->blueLows();
+        grade.blueMids = m_colorGrade->blueMids();
+        grade.blueHighs = m_colorGrade->blueHighs();
+        if (m_colorGrade->curvesActive())
+            lutImg = m_colorGrade->curveLut().convertToFormat(QImage::Format_RGBA8888);
+    }
+    const uchar *lut = lutImg.isNull() ? nullptr : lutImg.constScanLine(0);
+
+    FrameHistogram src, graded;
+    if (!m_decoder->sampleHistogram(&src, &graded, &grade, lut, maxSamples))
+        return out;
+
+    auto toList = [](const quint32 *bins) {
+        QVariantList l;
+        l.reserve(256);
+        for (int i = 0; i < 256; ++i)
+            l.append(QVariant(uint(bins[i])));
+        return l;
+    };
+    auto pack = [&toList](const FrameHistogram &h) {
+        QVariantMap m;
+        m.insert(QStringLiteral("r"), toList(h.r));
+        m.insert(QStringLiteral("g"), toList(h.g));
+        m.insert(QStringLiteral("b"), toList(h.b));
+        m.insert(QStringLiteral("luma"), toList(h.luma));
+        return m;
+    };
+    out.insert(QStringLiteral("source"), pack(src));
+    out.insert(QStringLiteral("graded"), pack(graded));
+    out.insert(QStringLiteral("samples"), QVariant(qulonglong(src.samples)));
+    return out;
 }

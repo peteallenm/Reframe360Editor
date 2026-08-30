@@ -5,6 +5,7 @@
 #include <QString>
 #include <QQuaternion>
 #include <QImage>
+#include "grade.h"
 #include <functional>
 
 #include "flowrenderer.h"
@@ -74,6 +75,26 @@ struct ExportFrameState {
     // conjugate to the view ray, exactly like LensViewer does.
     QQuaternion imuOrientation{1.0f, 0.0f, 0.0f, 0.0f};
 };
+
+// Pack the grade controls of an ExportFrameState into the shared GradeParams
+// (grade.h), so the CPU rasterizer and the curve editor's histogram run the
+// identical maths.
+inline GradeParams gradeParamsFrom(const ExportFrameState &s)
+{
+    GradeParams p;
+    p.brightness = s.brightness;
+    p.contrast = s.contrast;
+    p.saturation = s.saturation;
+    p.pop = s.pop;
+    p.brightLows = s.brightLows;
+    p.brightLowMids = s.brightLowMids;
+    p.brightHighMids = s.brightHighMids;
+    p.brightHighs = s.brightHighs;
+    p.redLows = s.redLows;     p.redMids = s.redMids;     p.redHighs = s.redHighs;
+    p.greenLows = s.greenLows; p.greenMids = s.greenMids; p.greenHighs = s.greenHighs;
+    p.blueLows = s.blueLows;   p.blueMids = s.blueMids;   p.blueHighs = s.blueHighs;
+    return p;
+}
 
 // Encoder/output choices for a video export.
 struct ExportSettings {

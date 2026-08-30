@@ -1,0 +1,119 @@
+{
+    "presets": [
+        {
+            "blendStart": 0.9,
+            "default": false,
+            "front": {
+                "centerX": 0.5,
+                "centerY": 0.5,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.5,
+                "rotation": 0
+            },
+            "name": "YI 360 Default",
+            "rear": {
+                "centerX": 0.5,
+                "centerY": 0.5,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.5,
+                "rotation": 180
+            }
+        },
+        {
+            "blendStart": 0.93,
+            "default": true,
+            "front": {
+                "centerX": 0.5,
+                "centerY": 0.497,
+                "hflip": true,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.452,
+                "rotation": 0
+            },
+            "name": "YI360",
+            "rear": {
+                "centerX": 0.5,
+                "centerY": 0.516,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.446,
+                "rotation": 0
+            }
+        },
+        {
+            "blendStart": 0.93,
+            "default": false,
+            "front": {
+                "centerX": 0.5,
+                "centerY": 0.492,
+                "hflip": true,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.461,
+                "rotation": 0
+            },
+            "name": "YI360_Cl",
+            "rear": {
+                "centerX": 0.5,
+                "centerY": 0.516,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.446,
+                "rotation": 0
+            }
+        },
+        {
+            "blendStart": 0.93,
+            "default": false,
+            "front": {
+                "centerX": 0.5,
+                "centerY": 0.484,
+                "hflip": true,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.461,
+                "rotation": 0
+            },
+            "name": "YI360_Cl2",
+            "rear": {
+                "centerX": 0.5,
+                "centerY": 0.516,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.446,
+                "rotation": 0
+            }
+        },
+        {
+            "blendStart": 0.93,
+            "default": false,
+            "front": {
+                "centerX": 0.5,
+                "centerY": 0.484,
+                "hflip": true,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.46900000000000003,
+                "rotation": 0
+            },
+            "name": "YI360_Close",
+            "rear": {
+                "centerX": 0.5,
+                "centerY": 0.516,
+                "hflip": false,
+                "k1": 0,
+                "k2": 0,
+                "radius": 0.446,
+                "rotation": 0
+            }
+        }
+    ]
+}

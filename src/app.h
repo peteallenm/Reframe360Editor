@@ -2,6 +2,7 @@
 #define APP_H
 
 #include <QObject>
+#include "folderaccess.h"
 #include <QString>
 #include <QUrl>
 #include <QQuaternion>
@@ -124,6 +125,7 @@ class App : public QObject
     Q_PROPERTY(double pitch READ pitch WRITE setPitch NOTIFY pitchChanged)
     Q_PROPERTY(double roll READ roll WRITE setRoll NOTIFY rollChanged)
     Q_PROPERTY(double fov READ fov WRITE setFov NOTIFY fovChanged)
+    Q_PROPERTY(QString loadError READ loadError NOTIFY loadErrorChanged)
     Q_PROPERTY(bool imuStabilize READ imuStabilize WRITE setImuStabilize NOTIFY imuStabilizeChanged)
     Q_PROPERTY(double imuSmoothing READ imuSmoothing WRITE setImuSmoothing NOTIFY imuSmoothingChanged)
     Q_PROPERTY(double imuSyncOffset READ imuSyncOffset WRITE setImuSyncOffset NOTIFY imuSyncOffsetChanged)
@@ -146,6 +148,11 @@ class App : public QObject
     Q_PROPERTY(CalibrationPresetModel* calibrationPresets READ calibrationPresets CONSTANT)
     Q_PROPERTY(CalibrationProfile* currentCalibration READ currentCalibration NOTIFY currentCalibrationChanged)
     Q_PROPERTY(ColorGrade* colorGrade READ colorGrade CONSTANT)
+    // Folder-wide access (Android's Storage Access Framework tree grant): lets
+    // a clip's .imu / _thm / .keyframes.json be resolved by name, and the
+    // keyframe sidecar written back, neither of which a single-file grant can
+    // do. Inert on desktop, where sidecars are found by path.
+    Q_PROPERTY(FolderAccess* folder READ folder CONSTANT)
     Q_PROPERTY(QQuaternion imuOrientation READ imuOrientation NOTIFY imuOrientationChanged)
     Q_PROPERTY(KeyframeModel* keyframes READ keyframes CONSTANT)
     Q_PROPERTY(bool exportRunning READ exportRunning NOTIFY exportRunningChanged)
@@ -239,6 +246,11 @@ public:
     CalibrationPresetModel* calibrationPresets() const;
     CalibrationProfile* currentCalibration() const;
     ColorGrade* colorGrade() const { return m_colorGrade; }
+    FolderAccess* folder() const { return m_folder; }
+
+    // Open a clip from the granted folder, resolving its sidecars by name
+    // within that folder.
+    Q_INVOKABLE void openClipFromFolder(const QString &displayName);
 
     QQuaternion imuOrientation() const;
 
@@ -275,6 +287,26 @@ public:
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
     Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend = true);
     Q_INVOKABLE QString grabStill(int lens);
+
+    // Open a clip together with explicitly supplied sidecars. On Android the
+    // picker returns opaque content:// URIs: you cannot append ".imu" to one,
+    // and a single-file grant does not cover siblings, so the sidecars have to
+    // be selected alongside the video and passed in here. Empty arguments fall
+    // back to deriving the path from the video, which is what the desktop does.
+    Q_INVOKABLE void openClip(const QString &video, const QString &imu,
+                              const QString &proxy, const QString &keyframes);
+
+    // Last error from the decoder, shown over the viewer. Cleared whenever a
+    // load succeeds. Without this the error signal went nowhere and a failed
+    // open just left the previous clip's frame on screen, looking like a hang.
+    QString loadError() const { return m_loadError; }
+
+    // 256-bin histogram of the current SOURCE frame for the curves editor:
+    // { "r": [...], "g": [...], "b": [...], "luma": [...], "samples": n }.
+    // Counts are raw. Measured before the colour grade, so it shows what you
+    // are grading rather than the result of the grade. Returns an empty map
+    // when no frame is decoded yet.
+    Q_INVOKABLE QVariantMap frameHistogram(int maxSamples = 512) const;
     Q_INVOKABLE void dragLook(double angleAboutUp, double angleAboutRight);
     // Stabilisation quaternion for a given video time. Public so LensViewer can
     // pair the orientation with the exact frame it paints (render thread, GUI
@@ -310,7 +342,6 @@ public:
 private:
     QQuaternion viewQuatFromEuler() const;
     void extractEulerFromQuat(const QQuaternion &q, double &yaw, double &pitch, double &roll) const;
-    void setViewFromQuat(const QQuaternion &q);
 
     void loadSettings();
     void saveSettings() const;
@@ -333,6 +364,9 @@ private:
     void onFlowReady(const QImage &image, float encodeScale, const QImage &seamImage);
 
 signals:
+    // A newly decoded frame is available, so any displayed histogram is stale.
+    void histogramChanged();
+    void loadErrorChanged();
     void videoPathChanged();
     void isPlayingChanged();
     void currentTimeChanged();
@@ -388,6 +422,10 @@ private:
     CalibrationPresetModel *m_calibrationPresets;
     CalibrationProfile *m_currentCalibration;
     ColorGrade *m_colorGrade;
+    FolderAccess *m_folder = nullptr;
+    // Display name of the clip when it was opened from the granted folder;
+    // empty for a clip opened any other way. Used to write the sidecar back.
+    QString m_folderClipName;
     KeyframeModel *m_keyframes;
     Exporter *m_exporter;
     QTimer *m_trimSaveTimer;  // coalesces sidecar writes while dragging trim
@@ -422,6 +460,14 @@ private:
     int m_activeLens;
     int m_projection;
     QQuaternion m_viewQuat;
+    QString m_loadError;
+    // Sidecars supplied explicitly by openClip(); empty means "derive it".
+    QString m_imuOverride;
+    QString m_proxyOverride;
+    QString m_keyframesOverride;
+    QString m_pendingImu;
+    QString m_pendingProxy;
+    QString m_pendingKeyframes;
 
     bool m_flowStitch;
     double m_flowStrength;

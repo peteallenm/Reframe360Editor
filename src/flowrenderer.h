@@ -12,7 +12,7 @@
 
 class QOffscreenSurface;
 class QOpenGLContext;
-class QOpenGLFunctions_4_4_Core;
+class QOpenGLExtraFunctions;
 class QOpenGLShaderProgram;
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,9 @@ private:
 
     QOffscreenSurface *m_surface = nullptr;
     QOpenGLContext *m_context = nullptr;
-    QOpenGLFunctions_4_4_Core *m_functions = nullptr;
+    QOpenGLExtraFunctions *m_functions = nullptr;
+    // True when the context is OpenGL ES (Android): selects the shader dialect.
+    bool m_gles = false;
     QOpenGLShaderProgram *m_bandProgram = nullptr;
     QOpenGLShaderProgram *m_matchProgram = nullptr;
     QOpenGLShaderProgram *m_seamCostProgram = nullptr;

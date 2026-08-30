@@ -68,12 +68,38 @@ Item {
 
         RowLayout {
             Layout.fillWidth: true
+            // Drawn, not a glyph: U+25B8/U+25BE are missing from the Edge 40's
+            // default font and rendered as tofu boxes, same as the play/pause
+            // button did. A rotated triangle depends on no font.
+            Canvas {
+                id: discArrow
+                width: 10; height: 10
+                // A RowLayout gives an item zero size unless it is told one.
+                Layout.preferredWidth: 10
+                Layout.preferredHeight: 10
+                Layout.alignment: Qt.AlignVCenter
+                property bool open: disc.open
+                onOpenChanged: requestPaint()
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.reset()
+                    ctx.fillStyle = "#bbb"
+                    ctx.beginPath()
+                    if (open) { ctx.moveTo(0, 2); ctx.lineTo(10, 2); ctx.lineTo(5, 9) }
+                    else      { ctx.moveTo(2, 0); ctx.lineTo(9, 5); ctx.lineTo(2, 10) }
+                    ctx.closePath(); ctx.fill()
+                }
+            }
             Label {
-                text: (disc.open ? "▾  " : "▸  ") + disc.title
+                text: disc.title
                 font.pixelSize: 12
                 color: "#bbb"
                 Layout.fillWidth: true
-                MouseArea { anchors.fill: parent; onClicked: disc.open = !disc.open; cursorShape: Qt.PointingHandCursor }
+            }
+            MouseArea {
+                anchors.fill: parent
+                onClicked: disc.open = !disc.open
+                cursorShape: Qt.PointingHandCursor
             }
         }
         ColumnLayout {

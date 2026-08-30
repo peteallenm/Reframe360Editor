@@ -1,6 +1,7 @@
 #include "videodecoder.h"
 #include <QDebug>
 #include <QDateTime>
+#include "avinput.h"
 
 static double getTimeSeconds() {
     return QDateTime::currentMSecsSinceEpoch() / 1000.0;
@@ -40,22 +41,65 @@ VideoDecoder::~VideoDecoder()
     }
 
     QMutexLocker lock(&m_ffmpegMutex);
+    closeInput();
+}
+
+// Free the format context and, if one was used, the QFile-backed AVIOContext.
+// Order matters: avformat_close_input() must go first, and with AVFMT_FLAG_
+// CUSTOM_IO libavformat does NOT free our AVIOContext or its buffer.
+void VideoDecoder::closeInput()
+{
     if (m_codecCtx) avcodec_free_context(&m_codecCtx);
-    if (m_formatCtx) avformat_close_input(&m_formatCtx);
+    m_input.close();          // owns m_formatCtx
+    m_formatCtx = nullptr;
 }
 
 void VideoDecoder::loadVideo(const QString &path)
 {
     stopPlayback();
 
+    // Tear the decode thread down before touching the contexts it is reading.
+    // Clearing m_running is what makes decodeLoop() return; the thread then
+    // has to be joined and DELETED, because startPlayback()/seekTo() only
+    // create one when m_decodeThread is null. Leaving a finished QThread
+    // behind meant the second load of a session -- switching to the thumbnail
+    // after playing the full video -- never decoded anything again and the
+    // viewer sat there frozen.
+    {
+        QMutexLocker lock(&m_mutex);
+        m_running = false;
+    }
+    if (m_decodeThread) {
+        m_decodeThread->quit();
+        m_decodeThread->wait();
+        delete m_decodeThread;
+        m_decodeThread = nullptr;
+    }
+
+    // Only now is it safe to close the old input: nothing is decoding from it.
     QMutexLocker ffmpegLock(&m_ffmpegMutex);
-    if (m_codecCtx) avcodec_free_context(&m_codecCtx);
-    if (m_formatCtx) avformat_close_input(&m_formatCtx);
+    closeInput();
+
+    // Any decoded frame belongs to the OLD clip. Drop it: on a failed open the
+    // viewer must not keep showing the previous video, which is what made a
+    // failure look like a hang.
+    {
+        QMutexLocker lock(&m_mutex);
+        m_hasFrame = false;
+        m_currentFrame = DecodedFrame();
+    }
 
     qDebug() << "Opening video file:" << path;
-    int ret = avformat_open_input(&m_formatCtx, path.toUtf8().constData(), nullptr, nullptr);
+
+    // AvInput (avinput.h) handles both a filesystem path and a URL; Android's
+    // picker returns content://, which libavformat cannot open itself.
+    int ret = m_input.open(path);
+    m_formatCtx = m_input.fmt;
     if (ret < 0) {
-        emit errorOccurred(QString("Failed to open video: %1").arg(path));
+        char err[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(ret, err, sizeof(err));
+        closeInput();
+        emit errorOccurred(tr("Failed to open video: %1 (%2)").arg(path, QString::fromLatin1(err)));
         return;
     }
 
@@ -83,6 +127,15 @@ void VideoDecoder::loadVideo(const QString &path)
     m_codecCtx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(m_codecCtx, codecpar);
 
+    // Decode across all cores. This was never set, so playback ran on a single
+    // thread -- barely noticeable on a desktop with the 720x1440 proxy, but the
+    // difference between usable and apparently hung on a phone opening the
+    // 2880x5760 original (~16 M pixels per frame, no hardware decoder in
+    // existence handles 5760 tall). VisualRotationComputer already opens its
+    // analysis decoder this way; this is the same tuning for playback.
+    m_codecCtx->thread_count = 0;                                   // = one per core
+    m_codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
     if (avcodec_open2(m_codecCtx, codec, nullptr) < 0) {
         emit errorOccurred("Failed to open codec");
         return;
@@ -104,7 +157,8 @@ void VideoDecoder::loadVideo(const QString &path)
         m_hasFrame = false;
     }
     qDebug() << "Video loaded:" << m_videoWidth << "x" << m_videoHeight
-             << "duration:" << m_duration << "fullRange:" << m_isFullRange;
+             << "duration:" << m_duration << "fullRange:" << m_isFullRange
+             << "threads:" << m_codecCtx->thread_count;
 }
 
 void VideoDecoder::startPlayback()
@@ -176,6 +230,122 @@ bool VideoDecoder::hasFrame() const
 {
     QMutexLocker lock(&m_mutex);
     return m_hasFrame;
+}
+
+bool VideoDecoder::sampleHistogram(FrameHistogram *source, FrameHistogram *graded,
+                                   const GradeParams *grade, const unsigned char *curveLut,
+                                   int maxSamples, bool circularMask) const
+{
+    if (!source)
+        return false;
+    *source = FrameHistogram();
+    if (graded)
+        *graded = FrameHistogram();
+
+    QMutexLocker lock(&m_mutex);
+    if (!m_hasFrame)
+        return false;
+    const DecodedFrame &f = m_currentFrame;
+    if (f.width <= 0 || f.height <= 0 || f.yData.isEmpty() || f.uData.isEmpty() || f.vData.isEmpty())
+        return false;
+
+    const uchar *Y = reinterpret_cast<const uchar *>(f.yData.constData());
+    const uchar *U = reinterpret_cast<const uchar *>(f.uData.constData());
+    const uchar *V = reinterpret_cast<const uchar *>(f.vData.constData());
+
+    // Guard against a short plane (a truncated decode) rather than walking off
+    // the end of the buffer.
+    const int cw = f.width / 2;
+    const int ch = f.height / 2;
+    if (f.yData.size() < qsizetype(f.yStride) * f.height
+        || f.uData.size() < qsizetype(f.uStride) * ch
+        || f.vData.size() < qsizetype(f.vStride) * ch)
+        return false;
+
+    const int stepX = qMax(1, f.width / qMax(1, maxSamples));
+    const int stepY = qMax(1, f.height / qMax(1, maxSamples));
+
+    // Stacked dual fisheye: two square halves, each with an inscribed circle.
+    const bool stacked = circularMask && (f.height == 2 * f.width);
+    const double cx = f.width * 0.5;
+    const double cyTop = f.height * 0.25;
+    const double cyBot = f.height * 0.75;
+    // 0.99 of the half-width: the image circle is inscribed, and the last
+    // texel ring is vignetted rather than black.
+    const double rad = 0.99 * (f.width * 0.5);
+    const double rad2 = rad * rad;
+
+    const bool full = m_isFullRange;
+
+    for (int y = 0; y < f.height; y += stepY) {
+        const uchar *yrow = Y + qsizetype(f.yStride) * y;
+        const uchar *urow = U + qsizetype(f.uStride) * (y / 2);
+        const uchar *vrow = V + qsizetype(f.vStride) * (y / 2);
+        const double dyTop = y - cyTop;
+        const double dyBot = y - cyBot;
+        const bool topHalf = (y < f.height / 2);
+        const double dy = topHalf ? dyTop : dyBot;
+        const double dy2 = dy * dy;
+        if (stacked && dy2 > rad2)
+            continue;                       // whole row outside both circles
+        for (int x = 0; x < f.width; x += stepX) {
+            if (stacked) {
+                const double dx = x - cx;
+                if (dx * dx + dy2 > rad2)
+                    continue;
+            }
+            const int cxi = qMin(x / 2, cw - 1);
+            double yy = yrow[x] / 255.0;
+            const double uu = urow[cxi] / 255.0 - 0.5;
+            const double vv = vrow[cxi] / 255.0 - 0.5;
+            if (!full)
+                yy = (yy - 16.0 / 255.0) * (255.0 / 219.0);
+            // Same coefficients as yuvToRgb() in shaders/project.frag, so the
+            // histogram describes the pixels the viewer is showing.
+            const double r = yy + 1.402 * vv;
+            const double g = yy - 0.344136 * uu - 0.714136 * vv;
+            const double b = yy + 1.772 * uu;
+            // Clamp to [0,1] HERE, before anything else looks at the value:
+            // yuvToRgb() clamps in project.frag and in the CPU exporter, so an
+            // out-of-gamut YUV triple (common in highlights) must be brought
+            // into range BEFORE grading. Grading the unclamped value and
+            // clamping afterwards is a different function and drifted from
+            // what the viewer shows.
+            const double cr0 = qBound(0.0, r, 1.0);
+            const double cg0 = qBound(0.0, g, 1.0);
+            const double cb0 = qBound(0.0, b, 1.0);
+
+            auto bin = [](double v) {
+                return int(qBound(0.0, v, 1.0) * 255.0 + 0.5);
+            };
+            ++source->r[bin(cr0)];
+            ++source->g[bin(cg0)];
+            ++source->b[bin(cb0)];
+            // Rec.709 luma of the (already range-corrected) RGB.
+            ++source->luma[bin(0.2126 * cr0 + 0.7152 * cg0 + 0.0722 * cb0)];
+            ++source->samples;
+
+            if (graded) {
+                // The same maths the shader and the CPU exporter run, from
+                // grade.h -- so this really is the output, not an approximation
+                // of it. The grade works in 0..255 and clamps only at the end.
+                double gr = cr0 * 255.0, gg = cg0 * 255.0, gb = cb0 * 255.0;
+                if (grade)
+                    applyGrade(*grade, gr, gg, gb);
+                uchar cr = uchar(qBound(0.0, gr, 255.0) + 0.5);
+                uchar cg = uchar(qBound(0.0, gg, 255.0) + 0.5);
+                uchar cb = uchar(qBound(0.0, gb, 255.0) + 0.5);
+                if (curveLut)
+                    applyCurveLut(curveLut, cr, cg, cb);
+                ++graded->r[cr];
+                ++graded->g[cg];
+                ++graded->b[cb];
+                ++graded->luma[int(qBound(0.0, 0.2126 * cr + 0.7152 * cg + 0.0722 * cb, 255.0) + 0.5)];
+                ++graded->samples;
+            }
+        }
+    }
+    return source->samples > 0;
 }
 
 void VideoDecoder::decodeLoop()

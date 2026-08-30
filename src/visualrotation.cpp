@@ -1,4 +1,5 @@
 #include "visualrotation.h"
+#include "avinput.h"
 #include "calibration.h"
 
 #include <QThread>
@@ -58,8 +59,9 @@ struct StreamFacts { bool ok = false; qint64 frames = 0; double duration = 0.0; 
 StreamFacts probeStream(const QString &path)
 {
     StreamFacts f;
-    AVFormatContext *ctx = nullptr;
-    if (avformat_open_input(&ctx, path.toUtf8().constData(), nullptr, nullptr) < 0) return f;
+    AvInput in;
+    if (in.open(path) < 0) return f;
+    AVFormatContext *ctx = in.fmt;
     if (avformat_find_stream_info(ctx, nullptr) >= 0) {
         const int idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
         if (idx >= 0) {
@@ -72,21 +74,28 @@ StreamFacts probeStream(const QString &path)
             f.ok = true;
         }
     }
-    avformat_close_input(&ctx);
+    // AvInput owns the context; its destructor closes it.
     return f;
 }
 } // namespace
 
-QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath)
+QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath) const
 {
     if (!qgetenv("RENDER360_NO_PROXY").isEmpty())
         return videoPath;
 
-    const QFileInfo fi(videoPath);
-    const QString proxy = fi.absolutePath() + QLatin1Char('/') + fi.completeBaseName()
-                        + QLatin1String("_thm.") + fi.suffix();
-    if (!QFileInfo::exists(proxy))
-        return videoPath;
+    QString proxy;
+    if (!m_decodeOverride.isEmpty()) {
+        // Explicitly supplied (Android: the user picked the _thm alongside the
+        // clip, and a content:// URI has no derivable siblings).
+        proxy = m_decodeOverride;
+    } else {
+        const QFileInfo fi(videoPath);
+        proxy = fi.absolutePath() + QLatin1Char('/') + fi.completeBaseName()
+              + QLatin1String("_thm.") + fi.suffix();
+        if (!QFileInfo::exists(proxy))
+            return videoPath;
+    }
 
     const StreamFacts a = probeStream(videoPath);
     const StreamFacts b = probeStream(proxy);
@@ -215,21 +224,21 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
     const QString decodePath = chooseDecodeSource(videoPath);
 
     // Open video
-    int ret = avformat_open_input(&formatCtx, decodePath.toUtf8().constData(), nullptr, nullptr);
+    AvInput input;
+    int ret = input.open(decodePath);
     if (ret < 0) {
         qWarning() << "VisualRotation: failed to open video:" << decodePath;
         return false;
     }
+    formatCtx = input.fmt;
 
     ret = avformat_find_stream_info(formatCtx, nullptr);
     if (ret < 0) {
-        avformat_close_input(&formatCtx);
         return false;
     }
 
     videoStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (videoStreamIndex < 0) {
-        avformat_close_input(&formatCtx);
         return false;
     }
 
@@ -238,7 +247,6 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
 
     const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
     if (!codec) {
-        avformat_close_input(&formatCtx);
         return false;
     }
 
@@ -264,7 +272,6 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
 
     if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
         avcodec_free_context(&codecCtx);
-        avformat_close_input(&formatCtx);
         return false;
     }
 
@@ -312,7 +319,6 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
 
     if (!swsCtx) {
         avcodec_free_context(&codecCtx);
-        avformat_close_input(&formatCtx);
         return false;
     }
 
@@ -424,7 +430,6 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
     av_packet_free(&pkt);
     sws_freeContext(swsCtx);
     avcodec_free_context(&codecCtx);
-    avformat_close_input(&formatCtx);
 
     qDebug() << "VisualRotation: decoded" << processedCount << "frames from" << frameCount << "total";
     return processedCount >= 2;

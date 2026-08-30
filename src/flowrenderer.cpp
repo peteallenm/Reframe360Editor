@@ -1,13 +1,14 @@
 #include "flowrenderer.h"
+#include "glsladapt.h"
 
 #include <QFile>
 #include <QElapsedTimer>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
-#include <QOpenGLFunctions_4_4_Core>
-#include <QOpenGLVersionFunctionsFactory>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLShaderProgram>
+#include "glesext.h"   // GLES 3.0 enums on Android
 #include <QPoint>
 #include <cmath>
 #include <cstring>
@@ -41,7 +42,7 @@ void FlowRenderer::destroy()
         return;
 
     m_context->makeCurrent(m_surface);
-    QOpenGLFunctions_4_4_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     delete m_bandProgram; m_bandProgram = nullptr;
     delete m_matchProgram; m_matchProgram = nullptr;
@@ -80,12 +81,25 @@ QByteArray FlowRenderer::loadResource(const char *path)
 
 bool FlowRenderer::createContext(QString *error)
 {
+    // Same story as GpuRenderer: a GLES build of Qt (Android) cannot produce a
+    // desktop context, so ask for whatever this Qt has. The stitching shaders
+    // used to be compiled verbatim at #version 440, which forced a GL 4.4
+    // context; they now go through adaptGlsl() like the export shader, so the
+    // real requirement is only GL 3.3 / GLES 3.0 -- multiple render targets,
+    // texelFetchOffset and half-float colour buffers are all available there.
+    const bool wantGles = (QOpenGLContext::openGLModuleType() == QOpenGLContext::LibGLES);
+
     QSurfaceFormat fmt;
-    fmt.setVersion(4, 4);
-    fmt.setProfile(QSurfaceFormat::CoreProfile);
     fmt.setDepthBufferSize(0);
     fmt.setStencilBufferSize(0);
-    fmt.setRenderableType(QSurfaceFormat::OpenGL);
+    if (wantGles) {
+        fmt.setRenderableType(QSurfaceFormat::OpenGLES);
+        fmt.setVersion(3, 0);
+    } else {
+        fmt.setRenderableType(QSurfaceFormat::OpenGL);
+        fmt.setVersion(3, 3);
+        fmt.setProfile(QSurfaceFormat::CoreProfile);
+    }
 
     m_surface = new QOffscreenSurface;
     m_surface->setFormat(fmt);
@@ -98,7 +112,7 @@ bool FlowRenderer::createContext(QString *error)
     m_context = new QOpenGLContext;
     m_context->setFormat(fmt);
     if (!m_context->create()) {
-        if (error) *error = QStringLiteral("Flow: could not create an OpenGL 4.4 context");
+        if (error) *error = QStringLiteral("Flow: could not create an OpenGL context");
         return false;
     }
     if (!m_context->makeCurrent(m_surface)) {
@@ -106,19 +120,32 @@ bool FlowRenderer::createContext(QString *error)
         return false;
     }
 
-    m_functions = QOpenGLVersionFunctionsFactory::get<QOpenGLFunctions_4_4_Core>(m_context);
+    m_gles = m_context->isOpenGLES();
+    m_functions = m_context->extraFunctions();
     if (!m_functions) {
-        if (error) *error = QStringLiteral("Flow: OpenGL 4.4 function set unavailable");
+        if (error) *error = QStringLiteral("Flow: OpenGL function set unavailable");
+        return false;
+    }
+    m_functions->initializeOpenGLFunctions();
+
+    const int maj = m_context->format().majorVersion();
+    const int min = m_context->format().minorVersion();
+    if (m_gles ? (maj < 3) : (maj < 3 || (maj == 3 && min < 3))) {
+        if (error) *error = m_gles
+                ? QStringLiteral("Flow stitching requires OpenGL ES 3.0+ (have %1.%2)").arg(maj).arg(min)
+                : QStringLiteral("Flow stitching requires OpenGL 3.3+ (have %1.%2)").arg(maj).arg(min);
         return false;
     }
 
-    // The flow shaders use GLSL 440 features (layout(binding=...), RG32F
-    // render targets), so the context must really be 4.4 (or newer).
-    const int maj = m_context->format().majorVersion();
-    const int min = m_context->format().minorVersion();
-    if (maj < 4 || (maj == 4 && min < 4)) {
-        if (error) *error = QStringLiteral("Flow stitching requires OpenGL 4.4+ (have %1.%2)")
-                                .arg(maj).arg(min);
+    // The disparity field lives in a half-float colour buffer. On desktop GL
+    // that is core; on GLES 3.0 rendering to RGBA16F needs an extension. Mali
+    // (the Motorola Edge 40's G77) and every other Android GPU we target ship
+    // it, but check rather than silently read back a field of zeros -- a
+    // failure mode this renderer has hit before on desktop with RG32F.
+    if (m_gles
+        && !m_context->hasExtension(QByteArrayLiteral("GL_EXT_color_buffer_half_float"))
+        && !m_context->hasExtension(QByteArrayLiteral("GL_EXT_color_buffer_float"))) {
+        if (error) *error = QStringLiteral("Flow stitching needs GL_EXT_color_buffer_half_float, which this GPU does not report");
         return false;
     }
     return true;
@@ -126,11 +153,18 @@ bool FlowRenderer::createContext(QString *error)
 
 bool FlowRenderer::compilePrograms(QString *error)
 {
-    auto compile = [this](const QByteArray &fragSrc, QOpenGLShaderProgram *&program, const char *what, QString *err) {
+    // Lower every stage to this context's dialect. band_extract.frag draws to
+    // two attachments, so its fragment-output layout(location = N) qualifiers
+    // must survive -- adaptGlsl keeps those and strips the rest.
+    const GlslTarget target = m_gles ? GlslTarget::EmbeddedEs300 : GlslTarget::DesktopCore330;
+    const QByteArray vertSrc = adaptGlsl(QByteArray(kFlowVertSrc), target, GlslStage::Vertex);
+
+    auto compile = [this, &vertSrc, target](const QByteArray &rawFragSrc, QOpenGLShaderProgram *&program, const char *what, QString *err) {
+        const QByteArray fragSrc = adaptGlsl(rawFragSrc, target, GlslStage::Fragment);
         program = new QOpenGLShaderProgram;
         program->bindAttributeLocation("a_position", 0);
         program->bindAttributeLocation("a_texCoord", 1);
-        if (!program->addShaderFromSourceCode(QOpenGLShader::Vertex, kFlowVertSrc)
+        if (!program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertSrc)
             || !program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragSrc)
             || !program->link()) {
             if (err) *err = QStringLiteral("Flow: %1 shader compile failed: %2")
@@ -153,7 +187,7 @@ bool FlowRenderer::compilePrograms(QString *error)
 
 bool FlowRenderer::createBandTargets(QString *error)
 {
-    QOpenGLFunctions_4_4_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
     const int W = kFlowBandWidth;
     const int H = kFlowBandHeight;
 
@@ -243,25 +277,25 @@ bool FlowRenderer::createBandTargets(QString *error)
             if (error) *error = QStringLiteral("Flow: gradient framebuffer is incomplete");
             return false;
         }
-        f->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        { const GLenum one[1] = { GL_COLOR_ATTACHMENT0 }; f->glDrawBuffers(1, one); }
     }
     if (!m_flowFbo) {
         f->glGenFramebuffers(1, &m_flowFbo);
         // The color attachment is (re)attached to flowA/flowB per iteration.
         f->glBindFramebuffer(GL_FRAMEBUFFER, m_flowFbo);
-        f->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        { const GLenum one[1] = { GL_COLOR_ATTACHMENT0 }; f->glDrawBuffers(1, one); }
     }
     if (!m_seamFbo) {
         f->glGenFramebuffers(1, &m_seamFbo);
         f->glBindFramebuffer(GL_FRAMEBUFFER, m_seamFbo);
-        f->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        { const GLenum one[1] = { GL_COLOR_ATTACHMENT0 }; f->glDrawBuffers(1, one); }
     }
     return true;
 }
 
 void FlowRenderer::drawQuad()
 {
-    QOpenGLFunctions_4_4_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
     f->glBindVertexArray(m_vao);
     f->glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
     f->glBindVertexArray(0);
@@ -294,7 +328,7 @@ bool FlowRenderer::compute(const DecodedFrame &frame, const FlowCalibration &cal
         if (error) *error = QStringLiteral("Flow: lost the offscreen GL context");
         return false;
     }
-    QOpenGLFunctions_4_4_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     const int W = kFlowBandWidth;
     const int H = kFlowBandHeight;

@@ -19,6 +19,8 @@
 #include "gpurenderer.h"
 #include "flowrenderer.h"
 #include "vidstab.h"
+#include "grade.h"
+#include "avinput.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -124,6 +126,7 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
     // Tone-curve LUT (256x1 RGBA8888) or null when curves are identity.
     const QImage lutImg = (s.curves && !s.curveLut.isNull())
                           ? s.curveLut.convertToFormat(QImage::Format_RGBA8888) : QImage();
+    const GradeParams gradeParams = gradeParamsFrom(s);
     const uchar *lutLine = lutImg.isNull() ? nullptr : lutImg.constScanLine(0);
 
     QImage img(outW, outH, QImage::Format_RGB888);
@@ -261,56 +264,18 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                     b = bf + (br - bf) * blend;
                 }
 
-                // ---- Colour grading (mirror of project.frag) ----
-                {
-                    const double lumaN = clampUnit((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
-                    const double wL = (1.0 - lumaN) * (1.0 - lumaN);
-                    const double wH = lumaN * lumaN;
-                    const double wM = 1.0 - wL - wH;
-                    // Split the mid band into low-mids / high-mids (mirror of
-                    // project.frag): they share the old wM weight and cross
-                    // over exactly at luma 0.5.
-                    const double tMid = std::max(-1.0, std::min(1.0, (lumaN - 0.5) * 4.0));
-                    const double wLM = wM * 0.5 * (1.0 - tMid);
-                    const double wHM = wM * 0.5 * (1.0 + tMid);
-
-                    r += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
-                                + s.redLows * wL + s.redMids * wM + s.redHighs * wH);
-                    g += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
-                                + s.greenLows * wL + s.greenMids * wM + s.greenHighs * wH);
-                    b += 255.0 * (s.brightLows * wL + s.brightLowMids * wLM + s.brightHighMids * wHM + s.brightHighs * wH
-                                + s.blueLows * wL + s.blueMids * wM + s.blueHighs * wH);
-
-                    const double lumaN2 = clampUnit((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
-                    const double midW = 1.0 - std::abs(lumaN2 * 2.0 - 1.0);
-                    r += s.pop * 0.2 * midW * (r - 127.5);
-                    g += s.pop * 0.2 * midW * (g - 127.5);
-                    b += s.pop * 0.2 * midW * (b - 127.5);
-
-                    const double luma255 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    r = luma255 + (r - luma255) * s.saturation;
-                    g = luma255 + (g - luma255) * s.saturation;
-                    b = luma255 + (b - luma255) * s.saturation;
-
-                    r = (r - 127.5) * s.contrast + 127.5;
-                    g = (g - 127.5) * s.contrast + 127.5;
-                    b = (b - 127.5) * s.contrast + 127.5;
-
-                    r += s.brightness * 255.0;
-                    g += s.brightness * 255.0;
-                    b += s.brightness * 255.0;
-                }
+                // ---- Colour grading ----
+                // One shared definition in grade.h (also used by the curve
+                // editor's histogram), so this cannot drift from project.frag.
+                applyGrade(gradeParams, r, g, b);
 
                 quint8 *px3 = line + px * 3;
                 px3[0] = (quint8)qRound(qBound(0.0, r, 255.0));
                 px3[1] = (quint8)qRound(qBound(0.0, g, 255.0));
                 px3[2] = (quint8)qRound(qBound(0.0, b, 255.0));
                 // Tone curves last (mirror of project.frag's u_curveLut lookup).
-                if (lutLine) {
-                    px3[0] = lutLine[px3[0] * 4 + 0];
-                    px3[1] = lutLine[px3[1] * 4 + 1];
-                    px3[2] = lutLine[px3[2] * 4 + 2];
-                }
+                if (lutLine)
+                    applyCurveLut(lutLine, px3[0], px3[1], px3[2]);
             }
         }
     };
@@ -441,7 +406,8 @@ public:
     bool isOpen() const { return m_fmt != nullptr; }
 
 private:
-    AVFormatContext *m_fmt = nullptr;
+    AvInput m_input;
+    AVFormatContext *m_fmt = nullptr;   // owned by m_input
     AVCodecContext *m_dec = nullptr;
     AVStream *m_stream = nullptr;
     int m_streamIdx = -1;
@@ -454,10 +420,13 @@ private:
 
 bool DecodeReader::open(const QString &path, QString *error)
 {
-    if (avformat_open_input(&m_fmt, path.toUtf8().constData(), nullptr, nullptr) < 0) {
+    // Via AvInput so a content:// URL works (Android's picker returns one);
+    // a plain path behaves exactly as before.
+    if (m_input.open(path) < 0) {
         if (error) *error = QObject::tr("Failed to open video file");
         return false;
     }
+    m_fmt = m_input.fmt;
     if (avformat_find_stream_info(m_fmt, nullptr) < 0) {
         if (error) *error = QObject::tr("Failed to read video stream info");
         return false;
@@ -495,7 +464,8 @@ void DecodeReader::close()
     if (m_pkt) av_packet_free(&m_pkt);
     if (m_frame) av_frame_free(&m_frame);
     if (m_dec) avcodec_free_context(&m_dec);
-    if (m_fmt) avformat_close_input(&m_fmt);
+    m_input.close();   // owns m_fmt
+    m_fmt = nullptr;
     m_stream = nullptr;
     m_streamIdx = -1;
 }

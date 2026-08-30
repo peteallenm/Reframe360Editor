@@ -10,8 +10,19 @@ Dialog {
     modal: false
     dim: false
     standardButtons: Dialog.Ok | Dialog.Cancel
-    width: 780
-    height: 640
+
+    // Size against the window rather than fixed 780x640. Those are LOGICAL
+    // pixels: on a phone (the Edge 40 reports a device pixel ratio of ~2.6) a
+    // 640-high dialog does not fit a 1080-high screen, and the Ok/Cancel
+    // footer ended up off the bottom edge with no way to reach it. Bounding to
+    // the overlay keeps the footer on screen; the StackLayout inside already
+    // has Layout.fillHeight, so the content shrinks to match.
+    parent: Overlay.overlay
+    anchors.centerIn: parent
+    readonly property real availW: parent ? parent.width : 780
+    readonly property real availH: parent ? parent.height : 640
+    width: Math.min(780, availW - 24)
+    height: Math.min(640, availH - 24)
 
     property int lens: 0
     property string stillSource: ""

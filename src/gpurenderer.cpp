@@ -6,86 +6,23 @@
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
 #include <QOpenGLShader>
-#include <QOpenGLFunctions_3_3_Core>
-#include <QOpenGLVersionFunctionsFactory>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLShaderProgram>
+#include "glesext.h"   // GLES 3.0 enums on Android
 #include <QSurfaceFormat>
 #include <QVector2D>
 #include <QtGlobal>
 #include <QtCore/qfloat16.h>
 #include <cstring>
 
+#include "glsladapt.h"
 #include "videodecoder.h"
 #include "exporter.h"
 #include "flowrenderer.h"
 
-// ---------------------------------------------------------------------------
-// Shader source adaptation.
-//
-// The shipped GLSL is written for Qt's RHI (qsb) with #version 440 and
-// binding-qualified samplers/uniform blocks. For a standalone GL program we
-// need a context that supports 440 (GL 4.4), which excludes a lot of real
-// hardware. Instead we reuse the exact same source and adapt it minimally:
-//   * lower #version 440 -> 330  (GL 3.3, universally available since ~2012)
-//   * drop layout(binding = N) qualifiers (a GLSL 4.20 feature)
-//   * flatten the Uniforms block into individual global uniforms so values
-//     can be uploaded by name (QOpenGLShaderProgram cannot write into UBOs)
-// The members and their names still come from project.frag, so the export
-// shader can never drift from the viewer's.
-// ---------------------------------------------------------------------------
-
-static QByteArray adaptShader(const QByteArray &src)
-{
-    QByteArray s = src;
-    s.replace("#version 440", "#version 330");
-    s.replace("#version 430", "#version 330");
-    s.replace("#version 450", "#version 330");
-    s.replace("#version 460", "#version 330");
-    // Any binding index: a sampler added to project.frag under a new binding
-    // (the curve LUT at 6 was one) must not silently break the export shader
-    // -- when it did, the exporter fell back to the CPU path unannounced.
-    static const QRegularExpression samplerBinding(
-        QStringLiteral("layout\\(binding\\s*=\\s*\\d+\\)\\s*uniform sampler2D"));
-    s = QString::fromUtf8(s).replace(samplerBinding, QStringLiteral("uniform sampler2D")).toUtf8();
-    // layout(location = N) needs GLSL 410 (or an extension) on NVIDIA's
-    // compiler, so strip them and assign attribute locations explicitly via
-    // QOpenGLShaderProgram::bindAttributeLocation before linking. With a
-    // single fragment output GL assigns it location 0 by default.
-    s.replace("layout(location = 0) in", "in");
-    s.replace("layout(location = 1) in", "in");
-    s.replace("layout(location = 2) in", "in");
-    s.replace("layout(location = 3) in", "in");
-    s.replace("layout(location = 0) out", "out");
-    s.replace("layout(location = 1) out", "out");
-    s.replace("ubuf.qt_Matrix", "qt_Matrix");   // quad.vert's block instance
-    return s;
-}
-
-static QByteArray flattenUniformBlock(QByteArray src)
-{
-    const QList<QByteArray> lines = src.split('\n');
-    QList<QByteArray> out;
-    out.reserve(lines.size());
-    bool inBlock = false;
-    for (const QByteArray &line : lines) {
-        const QByteArray t = line.trimmed();
-        if (t.startsWith("layout(std140") && t.contains("uniform Uniforms")) {
-            inBlock = true;
-            continue;
-        }
-        if (inBlock) {
-            if (t == "};" || t == "} ubuf;") {
-                inBlock = false;
-                continue;
-            }
-            if (!t.isEmpty())
-                out.append(QByteArray("uniform ") + t);
-            continue;
-        }
-        out.append(line);
-    }
-    return out.join('\n');
-}
+// The GLSL adapters that lower the shipped #version 440 source to whatever
+// this context is (desktop 330 core or ES 300) live in glsladapt.cpp, shared
+// with FlowRenderer.
 
 // ---------------------------------------------------------------------------
 // GpuRenderer
@@ -102,7 +39,7 @@ void GpuRenderer::destroy()
         return;
 
     m_context->makeCurrent(m_surface);
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     delete m_program;
     m_program = nullptr;
@@ -142,8 +79,9 @@ bool GpuRenderer::initialize(QString *error)
             ? loadResource(":/shaders_raw/shaders/quad.vert") : m_testVertSrc;
     const QByteArray rawFrag = m_testFragSrc.isEmpty()
             ? loadResource(":/shaders_raw/shaders/project.frag") : m_testFragSrc;
-    const QByteArray vertSrc = flattenUniformBlock(adaptShader(rawVert));
-    const QByteArray fragSrc = flattenUniformBlock(adaptShader(rawFrag));
+    const GlslTarget target = m_gles ? GlslTarget::EmbeddedEs300 : GlslTarget::DesktopCore330;
+    const QByteArray vertSrc = flattenUniformBlock(adaptGlsl(rawVert, target, GlslStage::Vertex));
+    const QByteArray fragSrc = flattenUniformBlock(adaptGlsl(rawFrag, target, GlslStage::Fragment));
 
     // Compile, link, and bind the sampler units explicitly (binding
     // qualifiers were stripped for GLSL 330).
@@ -158,7 +96,7 @@ bool GpuRenderer::initialize(QString *error)
     m_program->setUniformValue("u_seam", 5);
     m_program->setUniformValue("u_curveLut", 6);
 
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
     f->glGenTextures(1, &m_yTex);
     f->glGenTextures(1, &m_uTex);
     f->glGenTextures(1, &m_vTex);
@@ -177,12 +115,27 @@ QByteArray GpuRenderer::loadResource(const char *path)
 
 bool GpuRenderer::createContext(QString *error)
 {
+    // Which GL we can ask for is decided at Qt build time, not at runtime: a
+    // Qt built against GLES (every Android build, and some embedded Linux
+    // ones) cannot hand out a desktop context and vice versa. Ask for what
+    // this Qt actually has.
+    const bool wantGles = (QOpenGLContext::openGLModuleType() == QOpenGLContext::LibGLES);
+
     QSurfaceFormat fmt;
-    fmt.setVersion(3, 3);
-    fmt.setProfile(QSurfaceFormat::CoreProfile);
     fmt.setDepthBufferSize(0);
     fmt.setStencilBufferSize(0);
-    fmt.setRenderableType(QSurfaceFormat::OpenGL);
+    if (wantGles) {
+        // GLES 3.0 is the floor: it is what the adapted "#version 300 es"
+        // shaders need, and it brings the non-square NPOT textures, R8/RG16F
+        // formats and glReadPixels paths this renderer relies on. The
+        // Motorola Edge 40's Mali-G77 reports 3.2.
+        fmt.setRenderableType(QSurfaceFormat::OpenGLES);
+        fmt.setVersion(3, 0);
+    } else {
+        fmt.setRenderableType(QSurfaceFormat::OpenGL);
+        fmt.setVersion(3, 3);
+        fmt.setProfile(QSurfaceFormat::CoreProfile);
+    }
 
     m_surface = new QOffscreenSurface;
     m_surface->setFormat(fmt);
@@ -203,18 +156,32 @@ bool GpuRenderer::createContext(QString *error)
         return false;
     }
 
-    m_functions = QOpenGLVersionFunctionsFactory::get<QOpenGLFunctions_3_3_Core>(m_context);
+    // Whether the context we actually got is ES decides which GLSL dialect the
+    // shaders are lowered to. Trust the context, not the request: a desktop
+    // driver may hand back a compatibility context, and Qt may be running on
+    // ANGLE or a software rasteriser.
+    m_gles = m_context->isOpenGLES();
+
+    // QOpenGLExtraFunctions is the GLES 3.0 API, which desktop GL 3.3 core is
+    // a superset of -- every call this renderer makes is in that intersection,
+    // so one function set covers both targets. (The previous
+    // QOpenGLFunctions_3_3_Core does not exist in a GLES build of Qt.)
+    m_functions = m_context->extraFunctions();
     if (!m_functions) {
-        if (error) *error = QStringLiteral("OpenGL 3.3+ function set unavailable");
+        if (error) *error = QStringLiteral("OpenGL function set unavailable");
         return false;
     }
+    m_functions->initializeOpenGLFunctions();
 
-    // GL 3.3+ is required for the adapted GLSL 330 shaders and core profile.
-    const QByteArray version = QByteArray::number(m_context->format().majorVersion())
-                             + "." + QByteArray::number(m_context->format().minorVersion());
-    if (m_context->format().majorVersion() < 3
-        || (m_context->format().majorVersion() == 3 && m_context->format().minorVersion() < 3)) {
-        if (error) *error = QStringLiteral("OpenGL %1 is too old for GPU export (need 3.3+); using CPU renderer").arg(version.constData());
+    const int major = m_context->format().majorVersion();
+    const int minor = m_context->format().minorVersion();
+    const QString version = QStringLiteral("%1.%2").arg(major).arg(minor);
+    const bool tooOld = m_gles ? (major < 3)
+                               : (major < 3 || (major == 3 && minor < 3));
+    if (tooOld) {
+        if (error) *error = m_gles
+                ? QStringLiteral("OpenGL ES %1 is too old for GPU export (need 3.0+); using CPU renderer").arg(version)
+                : QStringLiteral("OpenGL %1 is too old for GPU export (need 3.3+); using CPU renderer").arg(version);
         return false;
     }
     return true;
@@ -244,7 +211,7 @@ bool GpuRenderer::ensureFramebuffer(int width, int height, QString *error)
     if (m_fbo && width == m_fbW && height == m_fbH)
         return true;
 
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     if (!m_fbo)
         f->glGenFramebuffers(1, &m_fbo);
@@ -273,7 +240,7 @@ bool GpuRenderer::ensureFramebuffer(int width, int height, QString *error)
 
 void GpuRenderer::uploadPlane(quint32 tex, int w, int h, int stride, const void *data)
 {
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
     f->glBindTexture(GL_TEXTURE_2D, tex);
     f->glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     if (stride != w)
@@ -297,7 +264,7 @@ void GpuRenderer::setFlowData(const QVector<float> &flow, int w, int h)
         return;
     }
 
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     // Same packing as the preview path (see FlowRenderer::packFlowToImage):
     // e = ndu*k + 0.5 with ndu = du/w, so the field fits [0,1]. Stored as
@@ -338,7 +305,7 @@ void GpuRenderer::setSeamData(const QVector<float> &seam, int w)
         m_seamValid = false;
         return;
     }
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
     if (!m_seamTex)
         f->glGenTextures(1, &m_seamTex);
     f->glBindTexture(GL_TEXTURE_2D, m_seamTex);
@@ -373,7 +340,7 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
         return false;
     }
 
-    QOpenGLFunctions_3_3_Core *f = m_functions;
+    QOpenGLExtraFunctions *f = m_functions;
 
     if (!ensureFramebuffer(W, H, error))
         return false;

@@ -71,6 +71,10 @@ CalibrationPresetModel::CalibrationPresetModel(QObject *parent)
     : QAbstractListModel(parent)
 {
     m_presets.append(makeDefaultPreset());
+    // Factory presets first, the user's own file second: loadFromPath()
+    // replaces by name, so anything the user has edited overrides the baked-in
+    // copy of the same name and their extra presets are appended.
+    loadFactoryDefaults();
     loadFromFile();
 }
 
@@ -269,7 +273,21 @@ void CalibrationPresetModel::persist() const
 
 void CalibrationPresetModel::loadFromFile()
 {
-    QFile f(presetsFilePath());
+    loadFromPath(presetsFilePath());
+}
+
+// Seed a fresh install from the presets baked into the binary. Only used when
+// the user has no calibration_presets.json yet: an existing file always wins,
+// so this can never overwrite calibration someone has tuned. It matters most
+// on Android, which has no way to import the desktop's config file.
+void CalibrationPresetModel::loadFactoryDefaults()
+{
+    loadFromPath(QStringLiteral(":/presets/resources/presets/calibration_presets.json"));
+}
+
+void CalibrationPresetModel::loadFromPath(const QString &path)
+{
+    QFile f(path);
     if (!f.open(QIODevice::ReadOnly))
         return;
 

@@ -5,8 +5,24 @@ import QtQuick.Layouts
 
 Pane {
     id: timeline
-    height: 60
+    // Targeting SDK 36 means the app draws edge-to-edge, UNDER the system
+    // bars. In landscape the navigation bar sits on one SIDE, and it was
+    // covering the play button. SafeArea gives the real insets for whichever
+    // rotation, so this is right both ways up rather than a fixed nudge.
+    //
+    // Guarded on the platform because SafeArea is QtQuick 6.9+, and the
+    // desktop here builds against distro Qt 6.4: an unresolved attached
+    // property makes the arithmetic NaN, which collapsed the whole footer.
+    // The conditional short-circuits before SafeArea is ever looked up.
+    readonly property real safeLeft: Qt.platform.os === "android" ? SafeArea.margins.left : 0
+    readonly property real safeRight: Qt.platform.os === "android" ? SafeArea.margins.right : 0
+    readonly property real safeBottom: Qt.platform.os === "android" ? SafeArea.margins.bottom : 0
+
+    height: 60 + safeBottom
     padding: 8
+    leftPadding: 8 + safeLeft
+    rightPadding: 8 + safeRight
+    bottomPadding: 8 + safeBottom
 
     RowLayout {
         anchors.fill: parent
@@ -14,14 +30,58 @@ Pane {
 
         ToolButton {
             id: playButton
-            icon.name: app.isPlaying ? "media-playback-pause" : "media-playback-start"
+            // Drawn, not icon.name and not a glyph:
+            //   * icon.name resolves through the freedesktop icon theme, which
+            //     exists on desktop Linux and NOT on Android -- the button
+            //     rendered completely empty there.
+            //   * U+275A (heavy vertical bar) for pause is missing from the
+            //     Edge 40's default font and came out as two tofu boxes.
+            // Two Rectangles and a Canvas triangle depend on no font or theme.
+            implicitWidth: 40
+            implicitHeight: 36
             onClicked: app.isPlaying = !app.isPlaying
             enabled: app.videoPath !== ""
+            ToolTip.text: app.isPlaying ? qsTr("Pause") : qsTr("Play")
+            ToolTip.visible: hovered
+
+            contentItem: Item {
+                implicitWidth: 40
+                implicitHeight: 36
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: 4
+                    visible: app.isPlaying
+                    Repeater {
+                        model: 2
+                        Rectangle {
+                            width: 5; height: 16; radius: 1
+                            color: playButton.enabled ? Material.foreground : Material.hintTextColor
+                        }
+                    }
+                }
+
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 16; height: 16
+                    visible: !app.isPlaying
+                    // Repaint when the tint changes (enabled/disabled).
+                    property color tint: playButton.enabled ? Material.foreground : Material.hintTextColor
+                    onTintChanged: requestPaint()
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        ctx.fillStyle = tint
+                        ctx.beginPath()
+                        ctx.moveTo(1, 0); ctx.lineTo(width - 1, height / 2); ctx.lineTo(1, height)
+                        ctx.closePath(); ctx.fill()
+                    }
+                }
+            }
         }
 
         ToolButton {
-            icon.name: "list-add"
-            text: "KF"
+            text: "KF"   // no icon.name: no icon theme on Android (see play button)
             ToolTip.text: "Add keyframe at current time"
             ToolTip.visible: hovered
             onClicked: app.addKeyframeAtCurrent()

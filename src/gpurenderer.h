@@ -9,7 +9,7 @@
 
 class QOffscreenSurface;
 class QOpenGLContext;
-class QOpenGLFunctions_3_3_Core;
+class QOpenGLExtraFunctions;
 class QOpenGLShaderProgram;
 
 struct DecodedFrame;
@@ -24,8 +24,9 @@ struct ExportFrameState;
 //
 // The class owns its own offscreen GL context and is designed to be created
 // and used entirely on the exporter worker thread, so it never touches the
-// GUI's scene graph. If no suitable GL (>= 3.3) is available, initialize()
-// fails and the caller falls back to the CPU rasterizer.
+// GUI's scene graph. If no suitable GL (>= 3.3 desktop, or >= ES 3.0) is
+// available, initialize() fails and the caller falls back to the CPU
+// rasterizer.
 class GpuRenderer
 {
 public:
@@ -74,7 +75,10 @@ private:
 
     QOffscreenSurface *m_surface = nullptr;
     QOpenGLContext *m_context = nullptr;
-    QOpenGLFunctions_3_3_Core *m_functions = nullptr;
+    QOpenGLExtraFunctions *m_functions = nullptr;
+    // True when the context we got is OpenGL ES (Android, or a GLES build of
+    // Qt): selects the "#version 300 es" shader dialect.
+    bool m_gles = false;
     QOpenGLShaderProgram *m_program = nullptr;
     QByteArray m_testVertSrc;
     QByteArray m_testFragSrc;

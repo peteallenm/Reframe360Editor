@@ -72,7 +72,22 @@ Item {
             text: qsTr("Open a 360 video to begin")
             font.pixelSize: 24
             color: "#888888"
-            visible: !app.videoPath
+            visible: !app.videoPath && !app.loadError
+        }
+
+        // A failed open used to be invisible: the error signal went nowhere and
+        // the previous clip's last frame stayed on screen, which reads as a hang.
+        Label {
+            anchors.centerIn: parent
+            width: parent.width * 0.8
+            text: app.loadError
+            font.pixelSize: 16
+            color: "#ff8080"
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            visible: app.loadError.length > 0
+            padding: 12
+            background: Rectangle { color: "#cc000000"; radius: 6 }
         }
     }
 }

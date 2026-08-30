@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Render360 - Android manifest (Qt 6 for Android, QML app).
+
+    This file is the QT_ANDROID_PACKAGE_SOURCE_DIR template referenced by the
+    top-level CMakeLists.txt. androiddeployqt copies it over Qt's own template
+    and substitutes every %%INSERT_...%% token from the values CMake set on the
+    target (min SDK 28, target SDK 34, version name 1.0.0, version code 1).
+    Do not hard-code those numbers here - CMake is the single source of truth.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="uk.co.overview.render360"
+    android:installLocation="auto"
+    android:versionCode="-- %%INSERT_VERSION_CODE%% --"
+    android:versionName="-- %%INSERT_VERSION_NAME%% --">
+
+    <!--
+        Supplied by CMake: QT_ANDROID_MIN_SDK_VERSION 28 (Android 9) and
+        QT_ANDROID_TARGET_SDK_VERSION 34 (Android 14). Min 28 is the floor for
+        the Media NDK surface (mediandk) that FFmpeg's MediaCodec wrapper uses;
+        target 34 is what Play requires and what the Edge 40 runs.
+    -->
+
+    <!-- ==================================================================
+         PERMISSIONS
+
+         Deliberately NOT declared:
+
+         * android.permission.MANAGE_EXTERNAL_STORAGE ("All files access").
+           The camera's footage is read through the Storage Access Framework:
+           the user picks the YI 360's DCIM folder over USB OTG with
+           ACTION_OPEN_DOCUMENT_TREE and we take a persistable read grant, then
+           enumerate each clip together with its .imu / _thm.MP4 /
+           .keyframes.json siblings inside that tree. A SAF tree grant already
+           gives us everything we need, survives reboots, and needs no runtime
+           prompt - whereas MANAGE_EXTERNAL_STORAGE is a Play-policy-restricted
+           permission that would have to be justified, is refused for apps that
+           could use SAF instead, and still would not cover a USB OTG volume.
+
+         * READ_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE. Legacy, ignored on
+           API 33+, and again unnecessary under SAF.
+
+         * android.permission.CAMERA / RECORD_AUDIO. We never capture; we only
+           read files the YI 360 already recorded.
+    ================================================================== -->
+
+    <!-- Export renders a full-resolution equirect pass that runs for minutes
+         and must survive the user switching away, so it runs in a foreground
+         service with a progress notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
+    <!-- Android 14 (target SDK 34) refuses to start a foreground service that
+         has no *type*, and the type must be backed by a matching permission.
+         A long-running local transcode is "dataSync" (mediaProcessing did not
+         exist until API 35, and we must run on the Edge 40's Android 13/14). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+
+    <!-- Android 13+ gates the export-progress notification behind a runtime
+         prompt. Without it the service still runs but shows no progress. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- A partial wake lock keeps the CPU alive for the duration of an export
+         when the screen turns off. The GPU render pass itself stops with the
+         screen, so export takes the CPU path when backgrounded. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- Not needed while storage is SAF-only: a tree grant from
+         ACTION_OPEN_DOCUMENT_TREE already authorises reading the video files
+         inside it. Uncomment ONLY if we ever add a MediaStore-based "recent
+         clips on this phone" browser that queries video outside a picked tree.
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    -->
+
+    <!-- androiddeployqt injects the permissions required by the Qt modules we
+         actually link (this must stay, and must stay a comment). -->
+    <!-- %%INSERT_PERMISSIONS -->
+
+    <!-- ==================================================================
+         HARDWARE FEATURES
+    ================================================================== -->
+
+    <!-- The intended workflow is reading the camera over USB-C OTG, but the
+         app is perfectly usable on clips already copied to the phone, so this
+         must not filter the app out of the store for non-OTG devices. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+
+    <!-- Hard requirement: the viewer and the GPU exporter are GLES 3.0-class
+         (#version 300 es shaders, MRT, RG32F). Below that the app cannot run.
+         The Edge 40's Mali-G77 MC9 reports GLES 3.2. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true"/>
+
+    <!-- The Android Extension Pack is nice to have but nothing in the render
+         path depends on it, so it must not be a filter. -->
+    <uses-feature android:name="android.hardware.opengles.aep" android:required="false"/>
+
+    <!-- Touch-only device is fine; no keyboard, no camera, no sensors used. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+
+    <!-- androiddeployqt injects features required by linked Qt modules. -->
+    <!-- %%INSERT_FEATURES -->
+
+    <supports-screens
+        android:anyDensity="true"
+        android:largeScreens="true"
+        android:normalScreens="true"
+        android:smallScreens="true"/>
+
+    <application
+        android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:label="Render360"
+        android:hardwareAccelerated="true"
+        android:allowBackup="false"
+        android:fullBackupOnly="false"
+        android:allowNativeHeapPointerTagging="false">
+        <!--
+            android:name / activity name: the Qt bindings classes from the
+            Qt6AndroidBindings AAR. QtApplication + QtActivity load the native
+            library named by the android.app.lib_name meta-data below.
+
+            allowBackup=false: everything the app holds is derived state - the
+            source clips, their .imu and .keyframes.json live in the SAF tree
+            next to the footage - and persistable URI grants are device-local
+            and would not restore usefully anyway.
+
+            allowNativeHeapPointerTagging=false: Qt's own template sets this;
+            it keeps top-byte-ignore pointer tagging (Android 11+ on arm64)
+            from tripping over the prebuilt static FFmpeg/OpenCV we link.
+
+            extractNativeLibs is deliberately NOT set: AGP 8 fails the release
+            packaging task outright if the manifest declares it
+            ("Avoid setting android:extractNativeLibs=true explicitly"). If the
+            uncompressed-native-libs behaviour is ever wanted, it belongs in the
+            Gradle script as android.packagingOptions.jniLibs.useLegacyPackaging,
+            not here.
+
+            No android:icon here on purpose - this package source dir ships no
+            res/ tree, so referencing @drawable/icon would fail at aapt time.
+            Add res/mipmap-*/ic_launcher.png plus android:icon when there is a
+            real launcher icon.
+        -->
+        <activity
+            android:name="org.qtproject.qt.android.bindings.QtActivity"
+            android:label="Render360"
+            android:launchMode="singleTop"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:hardwareAccelerated="true"
+            android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density">
+            <!--
+                screenOrientation="sensorLandscape": the layout is a wide viewer
+                 plus a 380 px side panel, which is unusable squeezed into a
+                 1080x2400 portrait screen. sensorLandscape (rather than plain
+                 landscape) still lets the phone be held either way up. Revisit
+                 when the touch UI lands and portrait becomes viable.
+                Landscape is the natural pose for an equirect viewer; portrait
+                still has to work because the SAF picker and the export dialog
+                are used one-handed.
+
+                configChanges: Qt handles all of these itself. If any of them
+                were left out, Android would destroy and recreate the activity
+                on a rotation or a light/dark switch, tearing down the QML
+                scene graph and the GL context and losing the loaded clip. This
+                is the exact list Qt's own template uses - do not trim it.
+
+                exported="true" is mandatory for a LAUNCHER activity from
+                API 31 onwards.
+
+                No android:theme override: Qt applies its own activity theme
+                from the bindings AAR, and pointing at a platform DayNight
+                theme here would break on our min SDK 28 (DayNight is API 29+).
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+
+            <!-- Substituted by androiddeployqt with the real .so base name
+                 (render360_arm64-v8a for this build). -->
+            <meta-data android:name="android.app.lib_name" android:value="-- %%INSERT_APP_LIB_NAME%% --"/>
+
+            <!-- argv passed to main(); CMake/androiddeployqt fills it in. -->
+            <meta-data android:name="android.app.arguments" android:value="-- %%INSERT_APP_ARGUMENTS%% --"/>
+
+            <!-- "minimal" style extraction: we draw Qt Quick Controls
+                 ourselves, so there is no reason to pay the startup cost of
+                 scraping the whole platform style. -->
+            <meta-data android:name="android.app.extract_android_style" android:value="minimal"/>
+        </activity>
+
+        <!--
+            PLANNED: the export foreground service. Not enabled yet because the
+            Java class does not exist - declaring a missing class here would
+            only fail later at startService() time, so it stays commented until
+            the service is written (see android/README.md "Known gaps").
+
+            foregroundServiceType MUST be dataSync and MUST match the
+            FOREGROUND_SERVICE_DATA_SYNC permission above, or Android 14 throws
+            MissingForegroundServiceTypeException at startForeground().
+
+            Qt runs this as a QtService in the same process as the activity so
+            the exporter can reuse the loaded keyframes and decoder state; see
+            https://wiki.qt.io/AndroidServices for the QtService bindings.
+
+        <service
+            android:name="uk.co.overview.render360.ExportService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:process=":qt">
+            <meta-data android:name="android.app.lib_name" android:value="INSERT_APP_LIB_NAME placeholder - restore the Qt -%%- wrapper when enabling this"/>
+            <meta-data android:name="android.app.background_running" android:value="true"/>
+        </service>
+        -->
+
+        <!-- Qt's own template declares this provider; QFile/QDesktopServices
+             file sharing on API 24+ goes through it, and androiddeployqt ships
+             the matching res/xml/qtprovider_paths.xml. Dropping it makes any
+             outward file hand-off fail at runtime. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.qtprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/qtprovider_paths"/>
+        </provider>
+    </application>
+</manifest>

@@ -131,6 +131,11 @@ public:
 private:
     void persist() const;
     void loadFromFile();
+    // Presets baked into the binary, applied before the user's own file so a
+    // fresh install (especially Android, which cannot import the desktop's
+    // config) starts with the measured YI 360 profiles.
+    void loadFactoryDefaults();
+    void loadFromPath(const QString &path);
     int indexByName(const QString &name) const;
 
     QVector<CalibrationPreset> m_presets;

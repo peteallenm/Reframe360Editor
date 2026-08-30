@@ -37,6 +37,19 @@ public:
     explicit VisualRotationComputer(QObject *parent = nullptr);
     ~VisualRotationComputer();
 
+    // Analysis decode source supplied by the caller, used instead of deriving
+
+    // the "_thm" sibling from the video path. On Android the video is an
+
+    // opaque content:// URI, so the sibling cannot be derived -- but the user
+
+    // selected the proxy explicitly, so pass it through. Still validated
+
+    // against the original (frame count and duration) before it is trusted.
+
+    void setDecodeSourceOverride(const QString &path) { m_decodeOverride = path; }
+
+
     void compute(const QString &videoPath,
                  const CalibrationProfile *calibration,
                  int frameSkip = 3);  // process every (frameSkip+1)th frame
@@ -81,6 +94,7 @@ signals:
     void computationFailed(const QString &error);
 
 private:
+    QString m_decodeOverride;
     struct FrameData {
         double timestamp;
         cv::Mat grayFront;    // grayscale front fisheye half
@@ -98,7 +112,7 @@ private:
 
     // Pick the file to decode for analysis: the camera's *_thm proxy when it
     // matches the original frame-for-frame, else the original.
-    static QString chooseDecodeSource(const QString &videoPath);
+    QString chooseDecodeSource(const QString &videoPath) const;
 
     // Decode frames from video, returning timestamps and grayscale half-images
     bool decodeFrames(const QString &videoPath, int frameSkip,

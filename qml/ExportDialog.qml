@@ -10,8 +10,18 @@ Dialog {
     title: qsTr("Export Video")
     modal: true
     standardButtons: Dialog.NoButton
-    width: 480
     closePolicy: Popup.CloseOnEscape
+
+    // Bound to the window, not a fixed 480 wide with a fixed 380 body. Those
+    // are LOGICAL pixels: on a phone (device pixel ratio ~2.6) title + body +
+    // button row came to more than the 1080-high screen and the Export button
+    // sat below the bottom edge, unreachable -- the body scrolls, but the
+    // buttons live outside it deliberately, so they have to fit.
+    parent: Overlay.overlay
+    anchors.centerIn: parent
+    readonly property real availW: parent ? parent.width : 480
+    readonly property real availH: parent ? parent.height : 720
+    width: Math.min(480, availW - 24)
 
     property string defaultFolder: ""
     property string defaultBase: "export"
@@ -72,7 +82,9 @@ Dialog {
     }
 
     // Body area height (the fields scroll internally if they exceed this).
-    property int bodyHeight: 380
+    // Leave room for the title bar, the button row and padding (~220) so the
+    // whole dialog fits; the body scrolls inside whatever is left.
+    property int bodyHeight: Math.max(180, Math.min(380, availH - 220))
 
     contentItem: ColumnLayout {
         spacing: 8

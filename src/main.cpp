@@ -25,8 +25,14 @@ int main(int argc, char *argv[])
     // fileMode: SaveFile (it always shows "Open"). The GTK3 platform theme
     // supplies a real save-as dialog helper, so prefer it when available
     // (Qt falls back gracefully if the theme plugin is missing).
+    //
+    // Desktop Linux only: Android has its own theme and file picker (and the
+    // storage model there is the Storage Access Framework, not paths), so
+    // forcing gtk3 would just log a missing-plugin warning.
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORMTHEME"))
         qputenv("QT_QPA_PLATFORMTHEME", "gtk3");
+#endif
 
     // We also deliberately do NOT set QT_QUICK_CONTROLS_NATIVE_DIALOGS=0:
     // the non-native Qt Quick dialog implementation ignores SaveFile mode.
