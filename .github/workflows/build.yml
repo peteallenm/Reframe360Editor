@@ -18,6 +18,13 @@ on:
 permissions:
   contents: read
 
+# `shell: bash` means `bash --noprofile --norc -eo pipefail`. The implicit
+# default is only `bash -e`, under which `build.sh | tee log` returns tee's
+# exit status and a failed build reports success.
+defaults:
+  run:
+    shell: bash
+
 # A newer push supersedes an in-flight PR run; a run on main is left alone so
 # the dependency cache it may be populating survives.
 concurrency:
@@ -82,6 +89,7 @@ jobs:
         with:
           name: reframe360-editor-linux-x86_64
           path: reframe360-editor-linux-x86_64.tar.gz
+          if-no-files-found: error
 
   # ------------------------------------------------- Android dependencies ---
   # FFmpeg (+x264, for the 5.7K software encode) cross-built for both ABIs,
@@ -148,6 +156,21 @@ jobs:
           msg="${msg//$'\n'/'%0A'}"
           msg="${msg//$'\r'/'%0D'}"
           echo "::error title=dependency build tail::$msg"
+
+      - name: Verify the dependency tree
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: |
+          deps=$HOME/android-deps
+          for abi in arm64 x86_64; do
+            for lib in libavcodec libavformat libswscale libavutil libx264; do
+              test -f "$deps/ffmpeg-$abi/lib/$lib.a" \
+                || { echo "missing $deps/ffmpeg-$abi/lib/$lib.a"; exit 1; }
+            done
+          done
+          test -f "$deps/OpenCV-android-sdk/sdk/native/jni/OpenCVConfig.cmake"
+          test -e "$deps/ffmpeg/arm64-v8a/lib/libavcodec.a"
+          test -e "$deps/ffmpeg/x86_64/lib/libavcodec.a"
+          echo "dependency tree complete"
 
       - name: Prune to what the app build needs
         if: steps.probe.outputs.cache-hit != 'true'
@@ -278,6 +301,7 @@ jobs:
         with:
           name: reframe360-android
           path: artifacts/*.apk
+          if-no-files-found: error
 
   # -------------------------------------------------------------- Release ---
   release:

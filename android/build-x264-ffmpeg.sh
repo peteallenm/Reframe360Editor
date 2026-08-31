@@ -54,6 +54,13 @@ ffmpeg_common="--enable-static --disable-shared --enable-pic
 # ---- arm64 ----
 cd $DEPS/ffmpeg-$FFMPEG_VERSION
 PREFIX=$DEPS/ffmpeg-arm64
+# PKG_CONFIG_LIBDIR *replaces* pkg-config's search path, so the only x264 it
+# can see is the one just cross-built. Without it a machine that happens to
+# have a host libx264-dev installed satisfies the probe with the DESKTOP
+# package (and a machine that does not -- every CI runner -- fails with the
+# misleading "x264 not found using pkg-config").
+export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+unset PKG_CONFIG_PATH
 make distclean >/dev/null 2>&1 || true
 ./configure --prefix=$PREFIX --target-os=android --arch=aarch64 --cpu=armv8-a \
   --enable-cross-compile \
@@ -68,6 +75,7 @@ echo "ffmpeg arm64 done"
 # ---- x86_64 ----
 cd $DEPS/ffmpeg-x86_64-src
 PREFIX=$DEPS/ffmpeg-x86_64
+export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
 make distclean >/dev/null 2>&1 || true
 ./configure --prefix=$PREFIX --target-os=android --arch=x86_64 \
   --enable-cross-compile \
