@@ -13,6 +13,7 @@ extern "C" {
 #include <libavutil/spherical.h>
 }
 
+#include <QElapsedTimer>
 #include <QImage>
 #include <QThread>
 #include <QFile>
@@ -466,6 +467,19 @@ bool DecodeReader::open(const QString &path, QString *error)
     }
     m_dec = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(m_dec, m_stream->codecpar);
+    // Threaded decode. libavcodec defaults to a single thread, and decoding
+    // the camera's 2880x5760 stream is two thirds of an export's wall clock
+    // (measured: 6.65 s of a 9.92 s pass), so leaving it serial pinned the
+    // whole export to one core while the other three idled. Frame threading
+    // holds roughly thread_count frames in flight at ~25 MB each, which is
+    // free on a desktop but worth capping on a phone that Android will kill
+    // at ~1.5 GB.
+#ifdef Q_OS_ANDROID
+    m_dec->thread_count = qMin(4, QThread::idealThreadCount());
+#else
+    m_dec->thread_count = 0;      // one per core
+#endif
+    m_dec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     if (avcodec_open2(m_dec, codec, nullptr) < 0) {
         if (error) *error = QObject::tr("Failed to open video decoder");
         return false;
@@ -1011,17 +1025,26 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     // resolution and encode into <w>. Progress is reported over
     // [base, base + scale]. Returns frames written, -1 on a fatal error.
     FlowEngine flow;
+    // Where the wall clock actually goes, on demand: RENDER360_EXPORT_TIMING=1.
+    // A pass is one thread pushing frames through decode -> render -> encode,
+    // so the three-way split is what says which stage to attack.
+    const bool timing = qEnvironmentVariableIsSet("RENDER360_EXPORT_TIMING");
     auto renderPass = [&](VideoWriter &w, int rw, int rh, bool withFlow,
                           double base, double scale) -> int {
         bool eof = false;
         int written = 0;
+        qint64 nsDecode = 0, nsRender = 0, nsEncode = 0, nsFlow = 0;
+        QElapsedTimer clock;
+        clock.start();
         for (int i = 0; i < totalFrames && !eof; ++i) {
             const double t = start + (double)i / fpsd;
             DecodedFrame frame;
+            const qint64 tA = clock.nsecsElapsed();
             if (!reader.readFrameAt(t, &frame)) {
                 eof = true;
                 break;
             }
+            nsDecode += clock.nsecsElapsed() - tA;
             // Look up the state at the frame's actual presentation timestamp,
             // not the idealized start + i/fps grid: the IMU sync must align to
             // the real frame time (the same PTS the preview uses), otherwise
@@ -1033,26 +1056,45 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
                       stateTime, s.yaw, s.pitch, s.roll, s.fov, s.activeLens, s.projection,
                       s.imuOrientation.scalar(), s.imuOrientation.x(), s.imuOrientation.y(), s.imuOrientation.z());
             QImage rendered;
+            const qint64 tB = clock.nsecsElapsed();
+            qint64 nsFlowThis = 0;
             if (gpuReady) {
                 // Optical-flow stitching: estimate the parallax field for this
                 // frame and upload it before rendering. If flow was requested
                 // but the 4.4 context or a frame's computation fails, that
                 // frame renders without the warp.
                 if (withFlow && s.flowStitch) {
+                    const qint64 tF = clock.nsecsElapsed();
                     if (!flow.prepare(s) || !flow.apply(frame, gpu)) {
                         s.flowStitch = false;
                         s.seamStitch = false;  // seam depends on flow pipeline
                     }
+                    nsFlowThis = clock.nsecsElapsed() - tF;
                 }
                 if (!gpu.render(frame, s, rw, rh, &rendered, &err))
                     return -1;
             } else {
                 rendered = renderFrame(frame, s, rw, rh);
             }
+            const qint64 tC = clock.nsecsElapsed();
+            nsRender += tC - tB - nsFlowThis;
+            nsFlow += nsFlowThis;
             if (!w.writeFrame(rendered, &err))
                 return -1;
+            nsEncode += clock.nsecsElapsed() - tC;
             written++;
             emit exportProgress(base + scale * ((double)(i + 1) / (double)totalFrames));
+        }
+        if (timing && written > 0) {
+            const double total = clock.nsecsElapsed() / 1e9;
+            qInfo("Export timing %dx%d: %d frames in %.2f s (%.2f fps) -- "
+                  "decode %.2f s (%.0f%%), flow stitch %.2f s (%.0f%%), "
+                  "render %.2f s (%.0f%%), encode %.2f s (%.0f%%)",
+                  rw, rh, written, total, written / total,
+                  nsDecode / 1e9, 100.0 * nsDecode / (total * 1e9),
+                  nsFlow / 1e9, 100.0 * nsFlow / (total * 1e9),
+                  nsRender / 1e9, 100.0 * nsRender / (total * 1e9),
+                  nsEncode / 1e9, 100.0 * nsEncode / (total * 1e9));
         }
         return written;
     };

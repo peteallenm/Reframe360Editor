@@ -338,10 +338,15 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
         if (error) *error = QStringLiteral("GPU renderer is not initialized");
         return false;
     }
+    static const bool kTiming0 = qEnvironmentVariableIsSet("RENDER360_EXPORT_TIMING");
+    static qint64 nsCurrent = 0, nsFbo = 0;
+    QElapsedTimer clk0;
+    if (kTiming0) clk0.start();
     if (!m_context->makeCurrent(m_surface)) {
         if (error) *error = QStringLiteral("Lost the offscreen GL context");
         return false;
     }
+    if (kTiming0) nsCurrent += clk0.nsecsElapsed();
 
     const int W = width & ~1;
     const int H = height & ~1;
@@ -352,8 +357,18 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
 
     QOpenGLExtraFunctions *f = m_functions;
 
+    const qint64 tFboStart = kTiming0 ? clk0.nsecsElapsed() : 0;
     if (!ensureFramebuffer(W, H, error))
         return false;
+    if (kTiming0) nsFbo += clk0.nsecsElapsed() - tFboStart;
+
+    // Stage timing for RENDER360_EXPORT_TIMING=1: the export loop reports one
+    // "render" number, and this says which part of it.
+    static const bool kTiming = qEnvironmentVariableIsSet("RENDER360_EXPORT_TIMING");
+    static qint64 nsUpload = 0, nsDraw = 0, nsRead = 0, nsPack = 0;
+    static int nFrames = 0;
+    QElapsedTimer clk;
+    if (kTiming) clk.start();
 
     // Upload the decoded YUV planes.
     uploadPlane(m_yTex, frame.width, frame.height, frame.yStride,
@@ -492,17 +507,21 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
     f->glViewport(0, 0, W, H);
     f->glDisable(GL_DEPTH_TEST);
     f->glDisable(GL_BLEND);
+    const qint64 tUp = kTiming ? clk.nsecsElapsed() : 0;
+
     f->glClearColor(0.f, 0.f, 0.f, 1.f);
     f->glClear(GL_COLOR_BUFFER_BIT);
 
     f->glBindVertexArray(m_vao);
     f->glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
     f->glBindVertexArray(0);
+    const qint64 tDraw = kTiming ? clk.nsecsElapsed() : 0;
 
     // Read back RGBA (bottom-up) and assemble a top-down RGB888 image.
     QByteArray buf(W * H * 4, Qt::Uninitialized);
     f->glPixelStorei(GL_PACK_ALIGNMENT, 1);
     f->glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    const qint64 tRead = kTiming ? clk.nsecsElapsed() : 0;
 
     QImage img(W, H, QImage::Format_RGB888);
     for (int y = 0; y < H; ++y) {
@@ -516,5 +535,14 @@ bool GpuRenderer::render(const DecodedFrame &frame, const ExportFrameState &s,
         }
     }
     *out = img;
+    if (kTiming) {
+        const qint64 tPack = clk.nsecsElapsed();
+        nsUpload += tUp; nsDraw += tDraw - tUp; nsRead += tRead - tDraw; nsPack += tPack - tRead;
+        if (++nFrames % 60 == 0)
+            qInfo("  GPU render over %d frames: makeCurrent %.2f s, fbo %.2f s, "
+                  "upload+uniforms %.2f s, draw %.2f s, readback %.2f s, repack %.2f s",
+                  nFrames, nsCurrent / 1e9, nsFbo / 1e9,
+                  nsUpload / 1e9, nsDraw / 1e9, nsRead / 1e9, nsPack / 1e9);
+    }
     return true;
 }
