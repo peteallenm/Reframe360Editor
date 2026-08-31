@@ -9,7 +9,7 @@
 # WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS
 # FOR A PARTICULAR PURPOSE.
 
-# Build Render360 for Android arm64-v8a.
+# Build Reframe360 Editor for Android arm64-v8a.
 #
 # Verified end-to-end on 2026-08-30: produces a 72 MB APK containing
 # librender360_arm64-v8a.so (10.5 MB, static FFmpeg + OpenCV), the Qt 6.11.2
@@ -21,7 +21,7 @@ QT_VER=6.11.2
 QT_ANDROID=$HOME/Qt/$QT_VER/android_arm64_v8a
 QT_HOST=$HOME/Qt/$QT_VER/gcc_64
 DEPS=$HOME/Build/360Render/android-deps
-BUILD=${1:-$HOME/Build/360Render/Render360/build-android}
+BUILD=${1:-$(cd "$(dirname "$0")/.." && pwd)/build-android}
 
 # JDK 21, not 17: the java-17-openjdk-amd64 package on this machine is a JRE
 # with no javac, and Gradle fails with "does not provide the required

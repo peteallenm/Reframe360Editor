@@ -19,7 +19,7 @@ import QtQuick.Layouts
 Dialog {
     id: about
 
-    property string sourceUrl: "https://github.com/peteallenm/Render360"
+    property string sourceUrl: "https://github.com/peteallenm/Reframe360Editor"
 
     modal: true
     title: qsTr("About Reframe360 Editor")

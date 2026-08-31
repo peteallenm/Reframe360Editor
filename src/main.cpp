@@ -72,9 +72,15 @@ int main(int argc, char *argv[])
     app.setApplicationVersion("1.0.0");
 
     QCommandLineParser parser;
-    parser.setApplicationDescription("360° video viewer with fisheye dewarping");
+    parser.setApplicationDescription(
+        "Reframe360 Editor -- stabilise, reframe and stitch dual-fisheye 360 footage");
     parser.addHelpOption();
-    parser.addVersionOption();
+    // Not addVersionOption(): its output is built from applicationName, which
+    // is the QSettings identity ("render360") and not what the product is
+    // called. Same spelling of the option, handled below.
+    QCommandLineOption versionOption(QStringList() << "v" << "version",
+                                     "Displays version information.");
+    parser.addOption(versionOption);
     
     QCommandLineOption videoOption(QStringList() << "i" << "input",
                                    "Load video file", "file");
@@ -137,6 +143,12 @@ int main(int argc, char *argv[])
     parser.addOption(exportVidstabHybridOption);
     
     parser.process(app);
+
+    if (parser.isSet(versionOption)) {
+        printf("%s %s\n", qPrintable(QGuiApplication::applicationDisplayName()),
+                           qPrintable(QCoreApplication::applicationVersion()));
+        return 0;
+    }
 
     // Handle before any window or App is constructed: this is a maintenance
     // action, not a viewing session.

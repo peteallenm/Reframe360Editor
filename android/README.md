@@ -1,4 +1,4 @@
-# Render360 on Android — build setup
+# Reframe360 Editor on Android — build setup
 
 
 ---
@@ -349,9 +349,9 @@ from Android builds.
 
 ---
 
-## 5. Configure and build Render360
+## 5. Configure and build Reframe360 Editor
 
-From the repo root (`/home/pallen/Build/360Render/Render360`):
+From the repo root (`~/Build/360Render/Reframe360Editor`):
 
 ```bash
 export QT_ANDROID=$HOME/Qt/6.11.2/android_arm64_v8a     # your installed version

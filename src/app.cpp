@@ -344,7 +344,7 @@ QString App::exportDestination(const QString &suggestedName)
                                  || name.contains(QLatin1Char(':'));
     if (name.isEmpty() || looksLikeUriLitter) {
         const QString base = m_folderClipName.isEmpty()
-                ? QStringLiteral("render360")
+                ? QStringLiteral("reframe360")
                 : QFileInfo(m_folderClipName).completeBaseName();
         name = base + QStringLiteral("_export.mp4");
     }
