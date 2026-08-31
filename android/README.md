@@ -532,13 +532,17 @@ in one place and both paths follow.
 
 What the runner has to install, and how long it costs:
 
+Measured on the first green run (a hosted runner is a good deal faster than
+this machine at the compile-bound parts):
+
 | piece | how | cold | cached |
 |---|---|---|---|
-| JDK 21 | `actions/setup-java` | ~10 s | — |
-| Android SDK 36, build-tools 36.0.0, NDK 27.2.12479018 | `sdkmanager` (the image already has cmdline-tools) | ~2 min | — |
-| Qt 6.11.2 host + `android_arm64_v8a` + `android_x86_64` | `aqtinstall` (unattended; the Qt online installer's account login is not scriptable) | ~5 min | ~1 min |
-| FFmpeg + x264, both ABIs, and the OpenCV Android SDK | the two scripts above, in a separate `android-deps` job | ~20 min | ~1 min |
-| Gradle | androiddeployqt's own wrapper | ~2 min | ~20 s |
+| JDK 21 | `actions/setup-java` | ~1 s | — |
+| Android SDK 36, build-tools 36.0.0, NDK 27.2.12479018 | `sdkmanager` (the image already has cmdline-tools) | ~25 s | — |
+| Qt 6.11.2 host + `android_arm64_v8a` + `android_x86_64`, with `qtshadertools` | `aqtinstall` (unattended; the Qt online installer's account login is not scriptable) | ~1 min | ~10 s |
+| FFmpeg + x264, both ABIs, and the OpenCV Android SDK | the two scripts above, in a separate `android-deps` job | ~2.5 min | ~4 s |
+| the APK itself | `release-android.sh arm64` | ~2 min | — |
+| the Linux build | apt + cmake + smoke test | ~1.5 min | — |
 
 The dependency cache key is
 `android-deps-ff<ffmpeg>-ocv<opencv>-x264<commit>-ndk<ver>-<hash of both
@@ -590,3 +594,34 @@ compiles, links and starts", not "it renders correctly".
 
 Note that the Android binaries are **GPL** (x264 is linked in for the 5.7K
 software encode), so a published release carries that licence.
+
+### What a clean machine caught
+
+Every one of these was invisible here and fatal on a runner. They are fixed;
+the list is a reminder of which assumptions do not survive a fresh machine.
+
+1. **`build-x264-ffmpeg.sh` could not work anywhere but this machine.**
+   FFmpeg's `--enable-libx264` probe goes through pkg-config, which knew
+   nothing about the freshly cross-built x264 — the probe was being satisfied
+   by the **host** `libx264-dev` installed here, while the link picked up our
+   static arm64 library. Fixed by setting `PKG_CONFIG_LIBDIR` to the cross
+   prefix, which replaces the search path outright so a host package can never
+   leak into an Android build.
+2. **A failed build reported success.** A step's default shell is `bash -e`
+   *without* `pipefail`, so `build.sh | tee log` returned tee's status: the
+   dependency build "passed" in 27 s and the APK build in 0 s. Hence
+   `defaults.run.shell: bash` (which is `-eo pipefail`),
+   `if-no-files-found: error` on the uploads, and a step that asserts every
+   expected static library exists before the tree is cached.
+3. **`qtshadertools` is not part of aqtinstall's base Qt**, even though
+   qtdeclarative depends on it — `qt_add_shaders()` needs `Qt6ShaderTools` on
+   the target and `qsb` from the host.
+4. **Qt's host tools need EGL/GL/xkbcommon at runtime**, which a bare runner
+   image does not carry: `qsb` died with
+   `libEGL.so.1: cannot open shared object file` (exit 127).
+
+Because logs need repository permissions but check-run annotations do not, a
+failing dependency or APK build echoes its last 3 KB as an `::error::`, and a
+successful APK build emits a `::notice::` with its size, ABIs, package line
+and signing state. Both are readable from the API by anyone who can see the
+repo, and they are what made diagnosing the above possible without log access.
