@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# Reframe360 Editor -- 360 video stabiliser and stitcher for dual-fisheye footage.
+# Copyright (C) 2026 Peter Allen
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This program is free software under the GNU General Public License, version
+# 3 or (at your option) any later version; see LICENSE for the full text.
+# It is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.
+
 # Build (and, if a keystore is available, SIGN) the release APKs:
 #   reframe360-arm64.apk      arm64-v8a only (phones; the Edge 40)
 #   reframe360-universal.apk  arm64-v8a + x86_64 (adds Chromebooks/emulators)

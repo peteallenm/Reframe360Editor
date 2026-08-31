@@ -1,3 +1,13 @@
+// Reframe360 Editor -- 360 video stabiliser and stitcher for dual-fisheye footage.
+// Copyright (C) 2026 Peter Allen
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software under the GNU General Public License, version
+// 3 or (at your option) any later version; see LICENSE for the full text.
+// It is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE.
+
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -181,6 +191,14 @@ ApplicationWindow {
             }
 
             Item { Layout.fillWidth: true }
+
+            ToolButton {
+                text: qsTr("About")
+                icon.name: "help-about"
+                onClicked: aboutDialog.open()
+                ToolTip.text: qsTr("Version, licence and source")
+                ToolTip.visible: hovered
+            }
 
             Label {
                 text: app.videoPath ? videoBaseName() : "Reframe360 Editor"
@@ -394,6 +412,10 @@ ApplicationWindow {
                 horizontalAlignment: Text.AlignHCenter
             }
         }
+    }
+
+    AboutDialog {
+        id: aboutDialog
     }
 
     // Export configuration dialog (resolution, codec, bitrate/CRF, FFmpeg
