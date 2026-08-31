@@ -1,0 +1,38 @@
+2026-08-31 17:06:49,297 - aqt.main - INFO - installer 132421437096064 aqtinstall(aqt) v3.3.0 on Python 3.12.3 [CPython GCC 13.3.0]
+2026-08-31 17:06:49,577 - aqt.helper - DEBUG - helper 129705523830912 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:49,803 - aqt.helper - DEBUG - helper 129705523830912 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:50,029 - aqt.helper - DEBUG - helper 129705523830912 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:50,248 - aqt.helper - DEBUG - helper 129705523830912 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:50,448 - aqt.helper - DEBUG - helper 129705523830912 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:50,679 - aqt.main - ERROR - installer 129705523830912 Failed to download checksum for the file 'Updates.xml' from mirrors '['https://download.qt.io']
+==============================Suggested follow-up:==============================
+* Check your internet connection
+* Consider modifying `requests.max_retries_to_retrieve_hash` in settings.ini
+* Consider modifying `mirrors.trusted_mirrors` in settings.ini (see https://aqtinstall.readthedocs.io/en/stable/configuration.html#configuration)
+* Please use 'aqt list-qt linux android' to show versions of Qt available.
+* Please use 'aqt list-qt linux android --arch <QT_VERSION>' to list valid architectures.
+2026-08-31 17:06:59,063 - aqt.helper - DEBUG - helper 131660216864896 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:59,268 - aqt.helper - DEBUG - helper 131660216864896 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:59,503 - aqt.helper - DEBUG - helper 131660216864896 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:06:59,834 - aqt.helper - DEBUG - helper 131660216864896 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:00,040 - aqt.helper - DEBUG - helper 131660216864896 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_6112/qt6_6112_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:00,278 - aqt.main - ERROR - installer 131660216864896 Failed to download checksum for the file 'Updates.xml' from mirrors '['https://download.qt.io']
+==============================Suggested follow-up:==============================
+* Check your internet connection
+* Consider modifying `requests.max_retries_to_retrieve_hash` in settings.ini
+* Consider modifying `mirrors.trusted_mirrors` in settings.ini (see https://aqtinstall.readthedocs.io/en/stable/configuration.html#configuration)
+* Please use 'aqt list-qt linux android' to show versions of Qt available.
+* Please use 'aqt list-qt linux android --arch <QT_VERSION>' to list valid architectures.
+2026-08-31 17:07:13,055 - aqt.helper - DEBUG - helper 127607267135616 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_673_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:13,247 - aqt.helper - DEBUG - helper 127607267135616 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_673_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:13,471 - aqt.helper - DEBUG - helper 127607267135616 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_673_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:13,687 - aqt.helper - DEBUG - helper 127607267135616 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_673_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:13,906 - aqt.helper - DEBUG - helper 127607267135616 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt6_673_arm64_v8a/Updates.xml.sha256
+2026-08-31 17:07:14,145 - aqt.main - ERROR - installer 127607267135616 Failed to download checksum for the file 'Updates.xml' from mirrors '['https://download.qt.io']
+==============================Suggested follow-up:==============================
+* Check your internet connection
+* Consider modifying `requests.max_retries_to_retrieve_hash` in settings.ini
+* Consider modifying `mirrors.trusted_mirrors` in settings.ini (see https://aqtinstall.readthedocs.io/en/stable/configuration.html#configuration)
+* Please use 'aqt list-qt linux android' to show versions of Qt available.
+* Please use 'aqt list-qt linux android --arch <QT_VERSION>' to list valid architectures.
+2026-08-31 17:07:14,445 - aqt.helper - DEBUG - helper 124961790972032 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_673/Updates.xml.sha256

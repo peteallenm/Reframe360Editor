@@ -196,7 +196,11 @@ if(ANDROID)
     set_property(TARGET render360 PROPERTY QT_ANDROID_TARGET_SDK_VERSION 36)
     set_property(TARGET render360 PROPERTY QT_ANDROID_MIN_SDK_VERSION 28)
     set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_NAME "1.0.0")
-    set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_CODE 2)
+    # Google Play refuses an upload whose versionCode it has already seen, so
+    # this has to move for every store upload (a sideloaded APK only needs it
+    # to not go backwards). Override with -DRENDER360_VERSION_CODE=N.
+    set(RENDER360_VERSION_CODE "2" CACHE STRING "Android versionCode")
+    set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_CODE ${RENDER360_VERSION_CODE})
 
     # To point a release APK at a clip for testing, configure with
     #   -DQT_ANDROID_APPLICATION_ARGUMENTS="-i /sdcard/.../clip.MP4 --imu"

@@ -9,6 +9,7 @@
     Do not hard-code those numbers here - CMake is the single source of truth.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="uk.co.overview.render360"
     android:installLocation="auto"
     android:versionCode="-- %%INSERT_VERSION_CODE%% --"
@@ -45,15 +46,22 @@
     ================================================================== -->
 
     <!-- Export renders a full-resolution equirect pass that runs for minutes
-         and must survive the user switching away, so it runs in a foreground
-         service with a progress notification. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+         and must survive the user switching away, so it will run in a
+         foreground service with a progress notification.
 
-    <!-- Android 14 (target SDK 34) refuses to start a foreground service that
-         has no *type*, and the type must be backed by a matching permission.
-         A long-running local transcode is "dataSync" (mediaProcessing did not
-         exist until API 35, and we must run on the Edge 40's Android 13/14). -->
+         Both permissions are commented out until that service actually
+         exists: Google Play requires a written declaration (and a demo video)
+         for FOREGROUND_SERVICE_DATA_SYNC, and justifying a feature the build
+         does not have is a review rejection waiting to happen. Restore them
+         with the service.
+
+         Android 14 refuses to start a foreground service that has no *type*,
+         and the type must be backed by a matching permission. A long-running
+         local transcode is "dataSync" (mediaProcessing did not exist until
+         API 35, and we must run on the Edge 40's Android 13/14).
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    -->
 
     <!-- Android 13+ gates the export-progress notification behind a runtime
          prompt. Without it the service still runs but shows no progress. -->
@@ -74,6 +82,12 @@
     <!-- androiddeployqt injects the permissions required by the Qt modules we
          actually link (this must stay, and must stay a comment). -->
     <!-- %%INSERT_PERMISSIONS -->
+
+    <!-- ...including WRITE_EXTERNAL_STORAGE, which this app must not ask for:
+         every file it touches comes through a SAF tree grant the user chose.
+         tools:node="remove" strips it from the merged manifest. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        tools:node="remove"/>
 
     <!-- ==================================================================
          HARDWARE FEATURES

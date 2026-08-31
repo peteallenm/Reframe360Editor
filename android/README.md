@@ -625,3 +625,49 @@ failing dependency or APK build echoes its last 3 KB as an `::error::`, and a
 successful APK build emits a `::notice::` with its size, ABIs, package line
 and signing state. Both are readable from the API by anyone who can see the
 repo, and they are what made diagnosing the above possible without log access.
+
+---
+
+## Publishing to Google Play
+
+Play takes an **app bundle**, not an APK, and splits it per device, so one
+`.aab` carries both ABIs while each phone still downloads ~74 MB:
+
+```bash
+VERSION_CODE=3 android/release-android.sh bundle   # -> reframe360-release.aab
+```
+
+It reuses the universal build tree (same objects, a different Gradle task) and
+signs with `jarsigner` — `apksigner` handles APKs only. A `v*` tag builds it in
+CI alongside the APKs.
+
+`VERSION_CODE` (or `-DRENDER360_VERSION_CODE=`) matters here: Play refuses an
+upload whose versionCode it has already seen, so every upload needs a new one,
+and it can never go backwards.
+
+**The signing-key decision is one-way.** Play App Signing is mandatory for new
+apps, and when the app is created you either let Google generate the app
+signing key or upload this keystore as it (Console offers "use existing app
+signing key", via the PEPK tool). If Google generates one, the APKs Play
+serves are signed with a *different* key than the sideloaded builds — so an
+existing install cannot be updated from Play, and the user has to uninstall,
+losing their SAF folder grant and settings. Uploading the existing key keeps
+sideloaded and Play builds interchangeable. Either way keep the keystore: it
+stays the *upload* key.
+
+The manifest was trimmed for review before the first upload:
+
+* `WRITE_EXTERNAL_STORAGE`, which androiddeployqt injects, is stripped with
+  `tools:node="remove"` — storage here is SAF-only, and a storage permission
+  invites questions this app has no reason to answer.
+* `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_DATA_SYNC` are commented out
+  until the export service actually exists. Play makes you justify a
+  foreground-service type with a written declaration and a demo video, and
+  there is nothing to demo yet.
+
+What Play sees now: `INTERNET` and `ACCESS_NETWORK_STATE` (injected by Qt),
+`POST_NOTIFICATIONS`, `WAKE_LOCK`. No sensitive permission, so no permission
+declarations beyond the standard App content forms.
+
+Both the app's own library and Qt's are 16 KB page aligned (`LOAD align
+0x4000`), which Play requires of new uploads.

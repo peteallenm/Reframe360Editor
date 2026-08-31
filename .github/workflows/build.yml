@@ -301,6 +301,11 @@ jobs:
             variant=both
           fi
           android/release-android.sh "$variant" 2>&1 | tee "$RUNNER_TEMP/apk-build.log"
+          # A tag is a release: also produce the Play bundle. It reuses the
+          # universal build tree, so this is a Gradle task, not a rebuild.
+          if [ "$variant" = both ]; then
+            android/release-android.sh bundle 2>&1 | tee -a "$RUNNER_TEMP/apk-build.log"
+          fi
 
       - name: Surface the failure
         if: failure() && steps.apk.conclusion == 'failure'
@@ -333,7 +338,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: reframe360-android
-          path: artifacts/*.apk
+          path: |
+            artifacts/*.apk
+            artifacts/*.aab
           if-no-files-found: error
 
   # -------------------------------------------------------------- Release ---
@@ -355,4 +362,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Reframe360 Editor $GITHUB_REF_NAME" \
             --generate-notes \
-            $(find dist -type f \( -name '*.apk' -o -name '*.tar.gz' \))
+            $(find dist -type f \( -name '*.apk' -o -name '*.aab' -o -name '*.tar.gz' \))
