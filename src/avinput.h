@@ -46,4 +46,43 @@ private:
     QFile *m_file = nullptr;
 };
 
+// Writing, for the same reason: on Android the only place the app may write is
+// a document in the granted folder, addressed by a content:// URI, and
+// avio_open() cannot open one. MP4 muxing needs a SEEKABLE sink (it rewrites
+// the header once the moov atom size is known), so the QFile bridge provides
+// seek as well as write; open() reports whether it got one, and the caller can
+// switch to a fragmented layout if not.
+struct AvOutput {
+    AVFormatContext *fmt = nullptr;
+
+    // shortName is the muxer name, e.g. "mp4". Returns 0 on success or a
+    // negative AVERROR.
+    int open(const QString &path, const char *shortName);
+
+    // False when the sink could not be seeked (write-only stream). MP4 then
+    // needs frag_keyframe+empty_moov to be playable.
+    bool seekable() const { return m_seekable; }
+
+    // True when writing goes through the QFile bridge rather than
+    // libavformat's own file protocol. Seeking a content:// document can
+    // SUCCEED on the probe and still not behave well enough for the MP4 muxer
+    // to rewind and patch its header, so callers should treat custom I/O as
+    // non-rewindable and mux fragmented.
+    bool isCustomIo() const { return m_avio != nullptr; }
+
+    void close();
+
+    ~AvOutput() { close(); }
+
+    AvOutput() = default;
+    AvOutput(const AvOutput &) = delete;
+    AvOutput &operator=(const AvOutput &) = delete;
+
+private:
+    AVIOContext *m_avio = nullptr;
+    QFile *m_file = nullptr;
+    bool m_seekable = true;
+    bool m_ownsAvioOpen = false;   // true when avio_open() was used (plain path)
+};
+
 #endif // AVINPUT_H

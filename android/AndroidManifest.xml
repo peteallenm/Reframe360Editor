@@ -107,7 +107,9 @@
 
     <application
         android:name="org.qtproject.qt.android.bindings.QtApplication"
-        android:label="Render360"
+        android:label="Reframe360 Editor"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:hardwareAccelerated="true"
         android:allowBackup="false"
         android:fullBackupOnly="false"
@@ -133,14 +135,13 @@
             Gradle script as android.packagingOptions.jniLibs.useLegacyPackaging,
             not here.
 
-            No android:icon here on purpose - this package source dir ships no
-            res/ tree, so referencing @drawable/icon would fail at aapt time.
-            Add res/mipmap-*/ic_launcher.png plus android:icon when there is a
-            real launcher icon.
+            android:icon points at the adaptive icon in
+            res/mipmap-anydpi-v26/ic_launcher.xml, with legacy PNGs in
+            res/mipmap-<density>/ for anything that cannot use it.
         -->
         <activity
             android:name="org.qtproject.qt.android.bindings.QtActivity"
-            android:label="Render360"
+            android:label="Reframe360 Editor"
             android:launchMode="singleTop"
             android:exported="true"
             android:screenOrientation="sensorLandscape"

@@ -144,6 +144,18 @@ void KeyframeModel::removeKeyframe(int i)
     emit keyframesChanged();
 }
 
+void KeyframeModel::clearKeyframes()
+{
+    if (m_keyframes.isEmpty())
+        return;
+    // One reset rather than a removal signal per row: the view rebuilds once,
+    // and the sidecar is written once by the keyframesChanged handler.
+    beginResetModel();
+    m_keyframes.clear();
+    endResetModel();
+    emit keyframesChanged();
+}
+
 void KeyframeModel::updateKeyframe(int i, double time, double yaw, double pitch, double roll, double fov)
 {
     if (i < 0 || i >= (int)m_keyframes.size()) return;

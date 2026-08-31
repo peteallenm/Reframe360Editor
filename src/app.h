@@ -252,6 +252,11 @@ public:
     // within that folder.
     Q_INVOKABLE void openClipFromFolder(const QString &displayName);
 
+    // A writable destination for an export. On Android nothing can be written
+    // by path, so this creates a document in the granted folder and returns
+    // its content:// URI; elsewhere it just returns the suggested path.
+    Q_INVOKABLE QString exportDestination(const QString &suggestedName);
+
     QQuaternion imuOrientation() const;
 
     KeyframeModel* keyframes() const { return m_keyframes; }
@@ -426,6 +431,9 @@ private:
     // Display name of the clip when it was opened from the granted folder;
     // empty for a clip opened any other way. Used to write the sidecar back.
     QString m_folderClipName;
+    // Destination document for an export that must be copied there afterwards
+    // (a content:// URI cannot be muxed into directly).
+    QString m_exportFinalUri;
     KeyframeModel *m_keyframes;
     Exporter *m_exporter;
     QTimer *m_trimSaveTimer;  // coalesces sidecar writes while dragging trim

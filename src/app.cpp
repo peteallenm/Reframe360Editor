@@ -1,6 +1,7 @@
 #include "app.h"
 #include <QFileInfo>
 #include <QDir>
+#include <QStandardPaths>
 #include <QImage>
 #include <QSettings>
 #include <QDateTime>
@@ -44,8 +45,12 @@ App::App(QObject *parent)
     , m_pitch(0.0)
     , m_roll(0.0)
     , m_fov(90.0)
-    , m_imuStabilize(false)
-    , m_imuSmoothing(0.5)
+    // Stabilised, holding the world steady, is what this app is FOR: a fresh
+    // install should show a stabilised clip, not raw shake that has to be
+    // switched on. smoothing 1.0 is "hold world steady" (below 0.9 is the
+    // follow-camera high-pass mode).
+    , m_imuStabilize(true)
+    , m_imuSmoothing(1.0)
     // Linear sync model: offset(t) = m_imuSyncOffset + m_imuDrift * t. The
     // measured IMU<->video clock drift on this camera is ~0.0038 s/s, so the
     // offset that works at t=0 (~0.17 s) grows to ~0.26 s by 24 s.
@@ -57,14 +62,17 @@ App::App(QObject *parent)
     // it is zero.
     , m_imuDrift(0.0)
     , m_imuAccelKi(0.005)
-    , m_flowStitch(false)
+    // Parallax stitching on by default too: the plain blend visibly ghosts
+    // anything near the seam, and the disparity matcher is what makes the
+    // stitch look right out of the box.
+    , m_flowStitch(true)
     , m_flowStrength(1.0)
     , m_flowIterations(kDefaultFlowIterations)
     , m_flowAlpha(kDefaultFlowAlpha)
     , m_flowEncode(16.0)
     , m_flowPending(false)
     , m_flowLastTs(-1.0)
-    , m_seamStitch(false)
+    , m_seamStitch(true)
     , m_seamStrength(1.0)
     , m_usePreview(false)
     , m_activeLens(2)
@@ -187,11 +195,44 @@ App::App(QObject *parent)
         emit exportStatusChanged();
     });
     connect(m_exporter, &Exporter::exportFinished, this, [this](const QString &path) {
-        m_exportStatus = tr("Export complete: %1").arg(QFileInfo(path).fileName());
+        QString finalPath = path;
+        if (!m_exportFinalUri.isEmpty()) {
+            // Copy the rendered file into the granted folder's document, then
+            // drop the scratch copy.
+            QFile src(path);
+            QFile dst(m_exportFinalUri);
+            bool ok = src.open(QIODevice::ReadOnly)
+                   && dst.open(QIODevice::WriteOnly | QIODevice::Truncate);
+            if (ok) {
+                const qint64 kChunk = 1 << 20;
+                while (!src.atEnd()) {
+                    const QByteArray buf = src.read(kChunk);
+                    if (buf.isEmpty() || dst.write(buf) != buf.size()) { ok = false; break; }
+                }
+            }
+            src.close();
+            dst.close();
+            QFile::remove(path);
+            if (!ok) {
+                qWarning().noquote() << "Export: could not copy the render into" << m_exportFinalUri;
+                m_exportStatus = tr("Export failed: could not write to the chosen folder");
+                emit exportStatusChanged();
+                QTimer::singleShot(2500, this, [this]() { setExportRunning(false); });
+                m_exportFinalUri.clear();
+                return;
+            }
+            finalPath = m_exportFinalUri;
+            m_exportFinalUri.clear();
+        }
+        qInfo().noquote() << "Export complete:" << finalPath;
+        m_exportStatus = tr("Export complete: %1").arg(QFileInfo(finalPath).fileName());
         emit exportStatusChanged();
         QTimer::singleShot(1500, this, [this]() { setExportRunning(false); });
     });
     connect(m_exporter, &Exporter::exportError, this, [this](const QString &message) {
+        // Also to the log: the status text is transient and easy to miss, and
+        // a failed export otherwise looks like nothing happening at all.
+        qWarning().noquote() << "Export failed:" << message;
         m_exportStatus = tr("Export failed: %1").arg(message);
         emit exportStatusChanged();
         QTimer::singleShot(2500, this, [this]() { setExportRunning(false); });
@@ -271,6 +312,35 @@ App::~App()
 QString App::videoPath() const
 {
     return m_videoPath;
+}
+
+QString App::exportDestination(const QString &suggestedName)
+{
+    if (!m_folder || !m_folder->hasFolder())
+        return suggestedName;
+
+    // Reduce to a BARE FILE NAME. A document in the tree is created by name,
+    // so anything path- or URI-shaped has to be stripped -- otherwise the
+    // whole content:// URI becomes the file name, and because the dialog then
+    // remembers it, each export nests the previous URI inside the next one and
+    // the name grows without limit.
+    QString name = suggestedName;
+    const int slash = name.lastIndexOf(QLatin1Char('/'));
+    if (slash >= 0)
+        name = name.mid(slash + 1);
+
+    const bool looksLikeUriLitter = name.contains(QLatin1String("content___"))
+                                 || name.contains(QLatin1Char('%'))
+                                 || name.contains(QLatin1Char(':'));
+    if (name.isEmpty() || looksLikeUriLitter) {
+        const QString base = m_folderClipName.isEmpty()
+                ? QStringLiteral("render360")
+                : QFileInfo(m_folderClipName).completeBaseName();
+        name = base + QStringLiteral("_export.mp4");
+    }
+
+    const QString uri = m_folder->writableUriFor(name, QStringLiteral("video/mp4"));
+    return uri.isEmpty() ? suggestedName : uri;
 }
 
 void App::openClipFromFolder(const QString &displayName)
@@ -1172,6 +1242,26 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     if (m_exporter->isRunning())
         return;
 
+    // A content:// destination cannot be muxed into directly. Two reasons,
+    // both fatal:
+    //   * the document could not be rewound at the end, so av_write_trailer()
+    //     failed, and
+    //   * the fragmented-MP4 workaround writes the header BEFORE MediaCodec
+    //     has produced its SPS/PPS, leaving a file with no usable avcC --
+    //     20 MB of "No start code is found" that nothing will play.
+    // So render to a real file in app-private storage, which is seekable and
+    // gets a normal MP4, and copy it into the folder afterwards. 20 MB is a
+    // fraction of a second.
+    QString writePath = path;
+    m_exportFinalUri.clear();
+    if (path.contains(QStringLiteral("://"))) {
+        m_exportFinalUri = path;
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+        QDir().mkpath(dir);
+        writePath = dir + QStringLiteral("/render360_export.mp4");
+        QFile::remove(writePath);
+    }
+
     setExportProgress(0.0);
     setExportRunning(true);
     m_exportStatus = tr("Preparing export…");
@@ -1191,7 +1281,7 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     settings.vidstabInformed = vidstabInformed;
 
     ExportSnapshot snap = buildExportSnapshot();
-    m_exporter->exportVideo(m_videoPath, path, settings, startTime, endTime,
+    m_exporter->exportVideo(m_videoPath, writePath, settings, startTime, endTime,
                             [snap](double t) { return snap.stateAt(t); },
                             gpuBackend);
 }

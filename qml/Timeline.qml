@@ -24,6 +24,23 @@ Pane {
     rightPadding: 8 + safeRight
     bottomPadding: 8 + safeBottom
 
+    Dialog {
+        id: clearKeyframesDialog
+        title: qsTr("Clear keyframes?")
+        modal: true
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(380, (parent ? parent.width : 380) - 24)
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: app.keyframes.clearKeyframes()
+        Label {
+            width: parent ? parent.width : 300
+            wrapMode: Text.Wrap
+            text: qsTr("Remove all %1 keyframes from this clip? This cannot be undone.")
+                    .arg(app.keyframes.count)
+        }
+    }
+
     RowLayout {
         anchors.fill: parent
         spacing: 8
@@ -86,6 +103,15 @@ Pane {
             ToolTip.visible: hovered
             onClicked: app.addKeyframeAtCurrent()
             enabled: app.videoPath !== ""
+        }
+
+        ToolButton {
+            text: qsTr("Clear")
+            font.pixelSize: 12
+            enabled: app.videoPath !== "" && app.keyframes.count > 0
+            onClicked: clearKeyframesDialog.open()
+            ToolTip.text: qsTr("Remove every keyframe from this clip")
+            ToolTip.visible: hovered
         }
 
         Item {
@@ -230,6 +256,13 @@ Pane {
                         }
                         onDoubleClicked: {
                             kfEditDialog.openFor(index)
+                        }
+                        // Touch has no right button, so a long press opens the
+                        // same menu: without this there was no way at all to
+                        // delete a keyframe on Android.
+                        onPressAndHold: {
+                            kfContextMenu.targetIndex = index
+                            kfContextMenu.popup()
                         }
                     }
                 }

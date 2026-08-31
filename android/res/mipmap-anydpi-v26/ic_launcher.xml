@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon (API 26+, and this app's floor is 28). The launcher masks
+     the foreground to whatever shape the device uses, so the mark is drawn
+     with a wide safe margin; the legacy PNGs in mipmap-<density> are what
+     older tooling and the Play listing fall back to. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background"/>
+    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+</adaptive-icon>

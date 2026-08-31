@@ -91,3 +91,87 @@ void AvInput::close()
     delete m_file;
     m_file = nullptr;
 }
+
+// --- writing ---------------------------------------------------------------
+
+namespace {
+
+// Non-const buf: that is the signature libavformat 60 (FFmpeg 6.x) expects.
+int qfileWrite(void *opaque, uint8_t *buf, int bufSize)
+{
+    QFile *f = static_cast<QFile *>(opaque);
+    const qint64 n = f->write(reinterpret_cast<const char *>(buf), bufSize);
+    return n < 0 ? AVERROR(EIO) : int(n);
+}
+
+} // namespace
+
+int AvOutput::open(const QString &path, const char *shortName)
+{
+    close();
+
+    int ret = avformat_alloc_output_context2(&fmt, nullptr, shortName,
+                                             path.contains(QStringLiteral("://"))
+                                                 ? nullptr : path.toUtf8().constData());
+    if (ret < 0 || !fmt)
+        return ret < 0 ? ret : AVERROR_UNKNOWN;
+
+    if (!path.contains(QStringLiteral("://"))) {
+        ret = avio_open(&fmt->pb, path.toUtf8().constData(), AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            close();
+            return ret;
+        }
+        m_ownsAvioOpen = true;
+        m_seekable = true;
+        return 0;
+    }
+
+    m_file = new QFile(path);
+    if (!m_file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        delete m_file;
+        m_file = nullptr;
+        close();
+        return AVERROR(EACCES);
+    }
+
+    const int kIoBuf = 64 * 1024;
+    unsigned char *buf = static_cast<unsigned char *>(av_malloc(kIoBuf));
+    if (!buf) {
+        close();
+        return AVERROR(ENOMEM);
+    }
+    // write_flag = 1, and a seek callback: the MP4 muxer rewinds to patch the
+    // header. QFile over a content:// document is seekable when the provider
+    // gave a real file descriptor, which the Storage Access Framework does for
+    // documents on local storage.
+    m_avio = avio_alloc_context(buf, kIoBuf, 1, m_file, nullptr, qfileWrite, qfileSeek);
+    if (!m_avio) {
+        av_free(buf);
+        close();
+        return AVERROR(ENOMEM);
+    }
+    m_seekable = m_file->seek(0);
+    m_avio->seekable = m_seekable ? AVIO_SEEKABLE_NORMAL : 0;
+    fmt->pb = m_avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    return 0;
+}
+
+void AvOutput::close()
+{
+    if (fmt) {
+        if (m_ownsAvioOpen && fmt->pb)
+            avio_closep(&fmt->pb);
+        avformat_free_context(fmt);
+        fmt = nullptr;
+    }
+    if (m_avio) {
+        av_freep(&m_avio->buffer);
+        avio_context_free(&m_avio);
+    }
+    delete m_file;
+    m_file = nullptr;
+    m_ownsAvioOpen = false;
+    m_seekable = true;
+}

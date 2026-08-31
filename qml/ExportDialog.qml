@@ -44,10 +44,24 @@ Dialog {
         // Restore the last-used output path for this video (persisted in the
         // keyframe sidecar) if we have one; otherwise fall back to deriving
         // one from the current folder/base.
-        if (app.exportFileName !== "")
+        // On Android a remembered value is a bare NAME; anything path- or
+        // URI-shaped is stale litter from a content:// URI and must not be
+        // reused, or each export nests the last URI inside the next name.
+        if (app.exportFileName !== ""
+            && !(Qt.platform.os === "android"
+                 && (app.exportFileName.indexOf("/") >= 0
+                     || app.exportFileName.indexOf("%") >= 0
+                     || app.exportFileName.indexOf(":") >= 0)))
             outputField.text = app.exportFileName
-        else if (outputField.text === "")
-            outputField.text = defaultFolder + "/" + defaultBase + "_export.mp4"
+        else if (outputField.text === "") {
+            // On Android there is no writable path to prefill: the export
+            // becomes a document created in the granted folder, so only the
+            // NAME is meaningful here (a content:// URI has no usable folder
+            // part, and the old prefill produced an unusable string).
+            outputField.text = Qt.platform.os === "android"
+                ? defaultBase + "_export.mp4"
+                : defaultFolder + "/" + defaultBase + "_export.mp4"
+        }
         // Keep the resolution / fps / codec / quality combos synced to the
         // persisted settings (they may have been restored at startup).
         syncResolutionCombo()
@@ -166,11 +180,15 @@ Dialog {
             ComboBox {
                 id: codecCombo
                 Layout.fillWidth: true
-                model: [
-                    { text: "H.264 (libx264) – CPU", value: "libx264" },
-                    { text: "H.265 (libx265) – CPU", value: "libx265" },
-                    { text: "HEVC NVENC – GPU (NVIDIA)", value: "hevc_nvenc" }
-                ]
+                // Android has no libx264/libx265/NVENC; it has the phone's
+                // hardware encoders, which are bitrate-driven (no CRF).
+                readonly property bool onAndroid: Qt.platform.os === "android"
+                model: onAndroid
+                    ? [ { text: "H.264 – hardware", value: "h264_mediacodec" },
+                        { text: "H.265 / HEVC – hardware", value: "hevc_mediacodec" } ]
+                    : [ { text: "H.264 (libx264) – CPU", value: "libx264" },
+                        { text: "H.265 (libx265) – CPU", value: "libx265" },
+                        { text: "HEVC NVENC – GPU (NVIDIA)", value: "hevc_nvenc" } ]
                 textRole: "text"
                 valueRole: "value"
                 onActivated: app.exportCodec = currentValue
@@ -211,7 +229,12 @@ Dialog {
         Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
 
         // ---- Extra stabilization (mutually exclusive options) ----
+        // Both options shell out to the ffmpeg CLI for vidstabdetect /
+        // vidstabtransform. There is no ffmpeg executable on Android (and no
+        // way to ship one usefully), so the whole section is hidden there
+        // rather than offering a control that silently fails.
         ColumnLayout {
+            visible: Qt.platform.os !== "android"
             spacing: 4
             Label {
                 text: qsTr("Extra stabilization:")
@@ -292,7 +315,11 @@ Dialog {
     }
 
     onAccepted: {
-        var path = ensureSuffix(outputField.text)
+        // On Android the text field holds a name, not a writable path: nothing
+        // can be written by path there. exportDestination() turns it into a
+        // document in the granted folder and hands back its content:// URI.
+        // On desktop it returns the path unchanged.
+        var path = app.exportDestination(ensureSuffix(outputField.text))
         app.exportVideo(path,
                         app.exportWidth, app.exportHeight,
                         app.exportFps,

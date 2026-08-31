@@ -96,11 +96,11 @@ Item {
                 color: "#bbb"
                 Layout.fillWidth: true
             }
-            MouseArea {
-                anchors.fill: parent
-                onClicked: disc.open = !disc.open
-                cursorShape: Qt.PointingHandCursor
-            }
+            // Handlers, not a MouseArea: an anchored MouseArea inside a
+            // RowLayout is layout-managed and Qt warns it is undefined
+            // behaviour. TapHandler covers the whole row without anchoring.
+            TapHandler { onTapped: disc.open = !disc.open }
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
         }
         ColumnLayout {
             id: discContent

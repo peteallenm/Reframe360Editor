@@ -19,6 +19,13 @@
 #include "gpurenderer.h"
 #include "flowrenderer.h"
 #include "vidstab.h"
+
+// vidstab runs through the ffmpeg CLI, which does not exist on Android.
+#ifdef Q_OS_ANDROID
+#  define RENDER360_HAVE_FFMPEG_CLI 0
+#else
+#  define RENDER360_HAVE_FFMPEG_CLI 1
+#endif
 #include "grade.h"
 #include "avinput.h"
 
@@ -550,6 +557,7 @@ private:
     AVFormatContext *m_fmt = nullptr;
     AVCodecContext *m_enc = nullptr;
     AVStream *m_stream = nullptr;
+    AvOutput m_output;              // owns m_fmt and its I/O
     SwsContext *m_conv = nullptr;
     AVFrame *m_yuv = nullptr;
     AVRational m_tb{1000, 30000};  // 1/fps in units of 1/1000s
@@ -561,10 +569,8 @@ VideoWriter::~VideoWriter()
     if (m_conv) sws_freeContext(m_conv);
     if (m_yuv) av_frame_free(&m_yuv);
     if (m_enc) avcodec_free_context(&m_enc);
-    if (m_fmt) {
-        avio_closep(&m_fmt->pb);
-        avformat_free_context(m_fmt);
-    }
+    m_output.close();               // owns m_fmt
+    m_fmt = nullptr;
 }
 
 bool VideoWriter::open(const QString &path, int w, int h, double fps,
@@ -574,31 +580,98 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
     const int den = qMax(1, qRound(fps * 1000.0));
     m_tb = AVRational{1000, den};
 
-    if (avformat_alloc_output_context2(&m_fmt, nullptr, nullptr, path.toUtf8().constData()) < 0 || !m_fmt) {
-        if (error) *error = QObject::tr("Cannot determine output container from filename");
+    // Allocate and open the sink together: on Android the destination is a
+    // document in the granted folder addressed by content://, which
+    // avio_open() cannot open. AvOutput bridges it through QFile.
+    // The muxer is named explicitly because a content:// URI has no usable
+    // extension to infer it from.
+    if (m_output.open(path, "mp4") < 0 || !m_output.fmt) {
+        if (error) *error = QObject::tr("Cannot open the output for writing");
+        return false;
+    }
+    m_fmt = m_output.fmt;
+    if (false) {
         return false;
     }
 
     const AVCodec *codec = avcodec_find_encoder_by_name(codecName.toUtf8().constData());
-    if (!codec && codecName == QLatin1String("libx264"))
-        codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+    if (!codec) {
+        // Fall back only WITHIN the same format, and say so. The old code
+        // silently substituted MPEG-4 whenever libx264 was missing, which on
+        // Android (where it always is) meant every "H.264" export quietly came
+        // out as MPEG-4.
+        struct { const char *want; const char *alt; } kEquivalents[] = {
+            { "libx264", "h264_mediacodec" },
+            { "h264_mediacodec", "libx264" },
+            { "libx265", "hevc_mediacodec" },
+            { "hevc_mediacodec", "libx265" },
+            { "hevc_nvenc", "hevc_mediacodec" },
+        };
+        for (const auto &e : kEquivalents) {
+            if (codecName == QLatin1String(e.want)) {
+                codec = avcodec_find_encoder_by_name(e.alt);
+                if (codec) {
+                    qInfo().noquote() << "Export:" << codecName << "is unavailable; using"
+                                      << e.alt << "(same format)";
+                }
+                break;
+            }
+        }
+    }
     if (!codec) {
         if (error) *error = QObject::tr("No video encoder available (%1)").arg(codecName);
         return false;
     }
+
+    // Hardware encoders advertise the pixel formats they accept -- MediaCodec
+    // generally wants NV12, not YUV420P. Ask, rather than assume, and convert
+    // to whatever it wants.
+    AVPixelFormat encPixFmt = AV_PIX_FMT_YUV420P;
+    if (codec->pix_fmts) {
+        // Preference order matters. MediaCodec lists AV_PIX_FMT_MEDIACODEC
+        // (a hardware surface) among its formats, and taking the first entry
+        // blindly hands the encoder a format no software frame can satisfy --
+        // avcodec_open2() then fails with "Failed to open video encoder".
+        // Skip any hardware-backed format and take the best software one.
+        auto isHardware = [](AVPixelFormat f) {
+            const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f);
+            return !d || (d->flags & AV_PIX_FMT_FLAG_HWACCEL);
+        };
+        AVPixelFormat firstSoftware = AV_PIX_FMT_NONE;
+        bool haveYuv420p = false, haveNv12 = false;
+        for (const AVPixelFormat *p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+            if (isHardware(*p))
+                continue;
+            if (firstSoftware == AV_PIX_FMT_NONE) firstSoftware = *p;
+            if (*p == AV_PIX_FMT_YUV420P) haveYuv420p = true;
+            if (*p == AV_PIX_FMT_NV12)    haveNv12 = true;
+        }
+        encPixFmt = haveYuv420p ? AV_PIX_FMT_YUV420P
+                  : haveNv12    ? AV_PIX_FMT_NV12
+                  : firstSoftware != AV_PIX_FMT_NONE ? firstSoftware
+                  : AV_PIX_FMT_YUV420P;
+    }
+    qInfo().noquote() << "Export encoder:" << codec->name
+                      << "pixel format" << av_get_pix_fmt_name(encPixFmt);
 
     m_stream = avformat_new_stream(m_fmt, codec);
     m_enc = avcodec_alloc_context3(codec);
     m_enc->width = w;
     m_enc->height = h;
     m_enc->time_base = m_tb;
-    m_enc->pix_fmt = AV_PIX_FMT_YUV420P;
+    m_enc->pix_fmt = encPixFmt;
     m_enc->gop_size = qMax(1, qRound(fps * 2.0));
     m_enc->max_b_frames = 0;  // keep the muxer simple (no reorder delay)
 
     // Per-codec options: CPU codecs use a CRF constant-quality scale, NVENC
     // uses a target bitrate.
-    if (codec->id == AV_CODEC_ID_H264) {
+    const bool isMediaCodec = codec->name && QString::fromLatin1(codec->name).contains(QLatin1String("mediacodec"));
+    if (isMediaCodec) {
+        // Hardware: bitrate-driven only. It has no CRF and no "preset", and
+        // setting them logs option errors for nothing.
+        m_enc->bit_rate = qMax(1, bitrateMbps) * 1000000;
+        m_enc->rc_max_rate = m_enc->bit_rate;
+    } else if (codec->id == AV_CODEC_ID_H264) {
         m_enc->bit_rate = qMax(1, bitrateMbps) * 1000000;
         av_opt_set(m_enc->priv_data, "preset", "veryfast", 0);
         av_opt_set(m_enc->priv_data, "crf", QString::number(crf).toUtf8().constData(), 0);
@@ -618,8 +691,15 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
     if (m_fmt->oformat->flags & AVFMT_GLOBALHEADER)
         m_enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    if (avcodec_open2(m_enc, codec, nullptr) < 0) {
-        if (error) *error = QObject::tr("Failed to open video encoder");
+    const int openRet = avcodec_open2(m_enc, codec, nullptr);
+    if (openRet < 0) {
+        {
+            char eb[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(openRet, eb, sizeof(eb));
+            qWarning().noquote() << "avcodec_open2 failed for" << codec->name << ":" << eb;
+            if (error) *error = QObject::tr("Failed to open video encoder (%1: %2)")
+                                    .arg(QString::fromLatin1(codec->name), QString::fromLatin1(eb));
+        }
         return false;
     }
 
@@ -635,22 +715,33 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
     av_dict_set(&m_fmt->metadata, "creation_time",
                 QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8().constData(), 0);
 
-    if (avio_open(&m_fmt->pb, path.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
-        if (error) *error = QObject::tr("Cannot write to output file");
-        return false;
+    // A sink that cannot seek (some content:// providers) cannot carry a
+    // normal MP4: the muxer rewinds to patch the header once the moov size is
+    // known. Fragmented MP4 is written strictly forwards. Passed as a muxer
+    // option to write_header, which is where movflags is actually read.
+    AVDictionary *muxOpts = nullptr;
+    // Custom I/O as well as an outright unseekable sink: a content:// document
+    // accepted the seek probe but still could not be rewound at the end, and
+    // av_write_trailer() failed with "Failed to finalize output file". A
+    // fragmented MP4 is written strictly forwards and needs no rewind.
+    if (!m_output.seekable() || m_output.isCustomIo()) {
+        qInfo("Export: output cannot be rewound; writing a fragmented MP4");
+        av_dict_set(&muxOpts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
     }
-    if (avformat_write_header(m_fmt, nullptr) < 0) {
+    const int hdr = avformat_write_header(m_fmt, &muxOpts);
+    av_dict_free(&muxOpts);
+    if (hdr < 0) {
         if (error) *error = QObject::tr("Failed to write output header");
         return false;
     }
 
     m_yuv = av_frame_alloc();
-    m_yuv->format = AV_PIX_FMT_YUV420P;
+    m_yuv->format = encPixFmt;
     m_yuv->width = w;
     m_yuv->height = h;
     av_frame_get_buffer(m_yuv, 32);
 
-    m_conv = sws_getContext(w, h, AV_PIX_FMT_RGB24, w, h, AV_PIX_FMT_YUV420P,
+    m_conv = sws_getContext(w, h, AV_PIX_FMT_RGB24, w, h, encPixFmt,
                             SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (!m_conv) {
         if (error) *error = QObject::tr("Failed to create pixel converter");
@@ -666,8 +757,11 @@ bool VideoWriter::writeFrame(const QImage &rgb, QString *error)
 
     uint8_t *srcData[4] = { const_cast<uchar *>(rgb.constBits()), nullptr, nullptr, nullptr };
     int srcStride[4] = { (int)rgb.bytesPerLine(), 0, 0, 0 };
-    uint8_t *dstData[4] = { m_yuv->data[0], m_yuv->data[1], m_yuv->data[2], nullptr };
-    int dstStride[4] = { m_yuv->linesize[0], m_yuv->linesize[1], m_yuv->linesize[2], 0 };
+    // Planes straight from the frame: this has to work for planar YUV420P
+    // (3 planes) and semi-planar NV12 (2), which is what a MediaCodec encoder
+    // typically wants.
+    uint8_t *dstData[4] = { m_yuv->data[0], m_yuv->data[1], m_yuv->data[2], m_yuv->data[3] };
+    int dstStride[4] = { m_yuv->linesize[0], m_yuv->linesize[1], m_yuv->linesize[2], m_yuv->linesize[3] };
     av_frame_make_writable(m_yuv);
     sws_scale(m_conv, srcData, srcStride, 0, m_yuv->height, dstData, dstStride);
 
@@ -716,8 +810,12 @@ bool VideoWriter::finish(QString *error)
     avcodec_send_frame(m_enc, nullptr);
     if (!flushPackets(error))
         return false;
-    if (av_write_trailer(m_fmt) < 0) {
-        if (error) *error = QObject::tr("Failed to finalize output file");
+    const int trailerRet = av_write_trailer(m_fmt);
+    if (trailerRet < 0) {
+        char tb[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(trailerRet, tb, sizeof(tb));
+        qWarning().noquote() << "av_write_trailer failed:" << tb;
+        if (error) *error = QObject::tr("Failed to finalize output file (%1)").arg(QString::fromLatin1(tb));
         return false;
     }
     return true;
@@ -1149,6 +1247,13 @@ bool Exporter::runVidStab(const QString &input, const QString &output,
 bool Exporter::runFfmpeg(const QStringList &args, double startProgress,
                          double weight, int fps)
 {
+#if !RENDER360_HAVE_FFMPEG_CLI
+    // No ffmpeg executable on Android. Fail loudly rather than let the caller
+    // believe a vidstab pass ran; the UI hides these options there anyway.
+    Q_UNUSED(args); Q_UNUSED(startProgress); Q_UNUSED(weight); Q_UNUSED(fps);
+    qWarning("vidstab needs the ffmpeg command-line tool, which is not available on this platform");
+    return false;
+#else
     QProcess proc;
     proc.setProcessChannelMode(QProcess::MergedChannels);
     proc.start(QStringLiteral("ffmpeg"), args);
@@ -1186,4 +1291,5 @@ bool Exporter::runFfmpeg(const QStringList &args, double startProgress,
         qWarning().noquote() << "ffmpeg failed:" << args.join(QLatin1Char(' '))
                              << "\n" << QString::fromUtf8(log);
     return ok;
+#endif
 }

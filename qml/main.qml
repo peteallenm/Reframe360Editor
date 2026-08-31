@@ -10,7 +10,7 @@ ApplicationWindow {
     width: 1280
     height: 720
     visible: true
-    title: "360 Render"
+    title: "Reframe360 Editor"
     Material.theme: Material.Dark
     Material.accent: Material.Blue
 
@@ -36,8 +36,12 @@ ApplicationWindow {
     }
 
     function videoBaseName() {
-        var p = app.videoPath
-        var i = p.lastIndexOf("/")
+        // Decode first: a content:// URI percent-encodes the separators
+        // (%2F for "/", %3A for ":"), so a raw lastIndexOf("/") finds the one
+        // in ".../document/" and returns the whole encoded document id as the
+        // "base name". That string then became the export file name.
+        var p = decodeURIComponent(app.videoPath.toString())
+        var i = Math.max(p.lastIndexOf("/"), p.lastIndexOf(":"))
         var base = i >= 0 ? p.substring(i + 1) : p
         var d = base.lastIndexOf(".")
         return d > 0 ? base.substring(0, d) : base
@@ -115,7 +119,7 @@ ApplicationWindow {
             Item { Layout.fillWidth: true }
 
             Label {
-                text: "360 Render"
+                text: "Reframe360 Editor"
                 font.pixelSize: 18
                 font.bold: true
                 Layout.rightMargin: 16

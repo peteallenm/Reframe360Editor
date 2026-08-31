@@ -26,13 +26,29 @@ if(ANDROID)
             "Android build needs -DRENDER360_FFMPEG_DIR=<prebuilt ffmpeg for ${ANDROID_ABI}>. "
             "See android/README.md.")
     endif()
-    set(FFMPEG_INCLUDE_DIRS "${RENDER360_FFMPEG_DIR}/include")
+
+    # A multi-ABI APK configures once per ABI, so the path may name either one
+    # ABI's tree directly or a parent holding one subdirectory per ABI. Prefer
+    # the ABI-specific subdirectory when it exists.
+    set(_ff "${RENDER360_FFMPEG_DIR}")
+    if(EXISTS "${RENDER360_FFMPEG_DIR}/${ANDROID_ABI}/lib/libavcodec.a")
+        set(_ff "${RENDER360_FFMPEG_DIR}/${ANDROID_ABI}")
+    endif()
+    if(NOT EXISTS "${_ff}/lib/libavcodec.a")
+        message(FATAL_ERROR "No FFmpeg for ${ANDROID_ABI} under ${RENDER360_FFMPEG_DIR}")
+    endif()
+    message(STATUS "FFmpeg for ${ANDROID_ABI}: ${_ff}")
+    # Deliberately NOT written back into RENDER360_FFMPEG_DIR: that variable is
+    # forwarded verbatim to the per-ABI sub-configures of a multi-ABI build
+    # (QT_ANDROID_MULTI_ABI_FORWARD_VARS), so overwriting it here sent every ABI
+    # to whichever tree the first one resolved.
+    set(FFMPEG_INCLUDE_DIRS "${_ff}/include")
     # Link order matters with static FFmpeg: dependents before dependencies.
     set(FFMPEG_LIBRARIES
-        "${RENDER360_FFMPEG_DIR}/lib/libavformat.a"
-        "${RENDER360_FFMPEG_DIR}/lib/libavcodec.a"
-        "${RENDER360_FFMPEG_DIR}/lib/libswscale.a"
-        "${RENDER360_FFMPEG_DIR}/lib/libavutil.a"
+        "${_ff}/lib/libavformat.a"
+        "${_ff}/lib/libavcodec.a"
+        "${_ff}/lib/libswscale.a"
+        "${_ff}/lib/libavutil.a"
         # MediaCodec decode/encode wrappers call into the Android media NDK.
         mediandk android log z)
 else()

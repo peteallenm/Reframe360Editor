@@ -37,8 +37,14 @@ int main(int argc, char *argv[])
     // We also deliberately do NOT set QT_QUICK_CONTROLS_NATIVE_DIALOGS=0:
     // the non-native Qt Quick dialog implementation ignores SaveFile mode.
     QGuiApplication app(argc, argv);
+    // Display name is set separately below. applicationName/organizationName
+    // are the SETTINGS IDENTITY -- QSettings derives ~/.config/<org>/<app>.conf
+    // from them, and tracking_tests hardcodes the same pair. Renaming these
+    // would orphan every stored setting and the camera-wide gyro calibration,
+    // so they stay as they are.
     app.setApplicationName("render360");
     app.setOrganizationName("render360");
+    app.setApplicationDisplayName("Reframe360 Editor");
     app.setApplicationVersion("1.0.0");
 
     QCommandLineParser parser;

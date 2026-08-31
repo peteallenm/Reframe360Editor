@@ -26,6 +26,9 @@ struct Keyframe {
 class KeyframeModel : public QAbstractListModel
 {
     Q_OBJECT
+    // Bindable from QML (enabling the Clear button, and its confirmation
+    // text). A plain count() method is invisible to a QML binding.
+    Q_PROPERTY(int count READ count NOTIFY keyframesChanged)
 public:
     enum Roles { TimeRole = Qt::UserRole + 1, YawRole, PitchRole, RollRole, FovRole };
 
@@ -37,6 +40,9 @@ public:
 
     Q_INVOKABLE void addKeyframe(double time, double yaw, double pitch, double roll, double fov);
     Q_INVOKABLE void removeKeyframe(int index);
+    // Remove every keyframe. Separate from removeKeyframe() in a loop so the
+    // model resets once rather than emitting a signal per row.
+    Q_INVOKABLE void clearKeyframes();
     Q_INVOKABLE void updateKeyframe(int index, double time, double yaw, double pitch, double roll, double fov);
 
     // Export trim range (in/out markers). Stored in the same sidecar file as
