@@ -215,7 +215,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Qt
-          key: qt-${{ env.QT_VERSION }}-linux-android-v1
+          key: qt-${{ env.QT_VERSION }}-linux-android-v2
 
       - name: Install Qt (host + both Android ABIs)
         if: steps.qt-cache.outputs.cache-hit != 'true'
@@ -225,11 +225,18 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/aqt-venv"
           "$RUNNER_TEMP/aqt-venv/bin/pip" install --upgrade pip aqtinstall
           aqt="$RUNNER_TEMP/aqt-venv/bin/aqt"
+          # qtshadertools is NOT part of the base install even though
+          # qtdeclarative needs it: qt_add_shaders() wants Qt6ShaderTools on
+          # the target, and qsb comes from the host copy.
+          mods="-m qtshadertools"
           # The host Qt must be the same version to the patch: qt-cmake needs
           # it for QT_HOST_PATH (qsb, androiddeployqt, the QML compiler).
-          "$aqt" install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O "$HOME/Qt"
-          "$aqt" install-qt linux android "$QT_VERSION" android_arm64_v8a -O "$HOME/Qt"
-          "$aqt" install-qt linux android "$QT_VERSION" android_x86_64    -O "$HOME/Qt"
+          # shellcheck disable=SC2086
+          "$aqt" install-qt linux desktop "$QT_VERSION" linux_gcc_64 $mods -O "$HOME/Qt"
+          # shellcheck disable=SC2086
+          "$aqt" install-qt linux android "$QT_VERSION" android_arm64_v8a $mods -O "$HOME/Qt"
+          # shellcheck disable=SC2086
+          "$aqt" install-qt linux android "$QT_VERSION" android_x86_64 $mods -O "$HOME/Qt"
 
       - name: Cache Gradle
         uses: actions/cache@v4
