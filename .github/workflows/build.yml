@@ -311,6 +311,21 @@ jobs:
           msg="${msg//$'\r'/'%0D'}"
           echo "::error title=APK build tail::$msg"
 
+      # A green tick proved not to be enough (a masked failure once uploaded
+      # nothing), so state what was actually built. Notices are visible in the
+      # run summary and through the API.
+      - name: Describe the APKs
+        run: |
+          bt="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
+          for f in artifacts/*.apk; do
+            abis=$(unzip -l "$f" | sed -n 's#.*lib/\([^/]*\)/.*\.so#\1#p' | sort -u | tr '\n' ' ')
+            badge=$("$bt/aapt2" dump badging "$f" 2>/dev/null | head -1 || true)
+            signed=no
+            "$bt/apksigner" verify "$f" >/dev/null 2>&1 && signed=yes
+            msg="$(du -h "$f" | cut -f1), abis: ${abis:-none}, signed: $signed, $badge"
+            echo "::notice title=$(basename "$f")::${msg//$'\n'/ }"
+          done
+
       - name: Shred the keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/release.keystore"
