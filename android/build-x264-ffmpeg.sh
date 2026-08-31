@@ -4,11 +4,19 @@
 # encoder. Needed for 5.7K (5760x2880) exports: MediaCodec encoders cap at
 # ~4096x2304, and until this the Android build had no other H.264 encoder.
 set -e
-NDK=$HOME/Android/Sdk/ndk/27.2.12479018
+# Paths are overridable so the same script runs on a dev machine and on a
+# GitHub runner (see .github/workflows/build.yml). Defaults are this machine.
+NDK=${ANDROID_NDK_ROOT:-$HOME/Android/Sdk/ndk/27.2.12479018}
 TC=$NDK/toolchains/llvm/prebuilt/linux-x86_64
-API=28
-DEPS=$HOME/Build/360Render/android-deps
+API=${ANDROID_API:-28}
+DEPS=${DEPS:-$HOME/Build/360Render/android-deps}
 X264=$DEPS/x264-src
+FFMPEG_VERSION=${FFMPEG_VERSION:-6.1.1}
+
+for p in "$TC/bin/aarch64-linux-android$API-clang" "$X264/configure" \
+         "$DEPS/ffmpeg-$FFMPEG_VERSION/configure" "$DEPS/ffmpeg-x86_64-src/configure"; do
+    [ -e "$p" ] || { echo "missing prerequisite: $p (run android/fetch-deps.sh)" >&2; exit 1; }
+done
 
 build_x264() { # <triple> <prefix> <extra configure args...>
     local triple=$1 prefix=$2; shift 2
@@ -38,10 +46,13 @@ ffmpeg_common="--enable-static --disable-shared --enable-pic
  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,h264_metadata,hevc_metadata
  --enable-protocol=file,pipe,fd
  --enable-swscale --enable-avformat --enable-avcodec
- --enable-gpl --enable-libx264"
+ --enable-gpl --enable-libx264
+ --extra-libs=-lm"   # bionic keeps exp2/log/log10 in libm; x264 needs them,
+                     # and without it configure reports the misleading
+                     # "x264 not found using pkg-config"
 
 # ---- arm64 ----
-cd $DEPS/ffmpeg-6.1.1
+cd $DEPS/ffmpeg-$FFMPEG_VERSION
 PREFIX=$DEPS/ffmpeg-arm64
 make distclean >/dev/null 2>&1 || true
 ./configure --prefix=$PREFIX --target-os=android --arch=aarch64 --cpu=armv8-a \
@@ -50,7 +61,7 @@ make distclean >/dev/null 2>&1 || true
   --ar=$TC/bin/llvm-ar --nm=$TC/bin/llvm-nm --ranlib=$TC/bin/llvm-ranlib --strip=$TC/bin/llvm-strip \
   --sysroot=$TC/sysroot \
   --extra-cflags="-I$PREFIX/include" --extra-ldflags="-L$PREFIX/lib" \
-  $ffmpeg_common >/dev/null
+  $ffmpeg_common
 make -j"$(nproc)" >/dev/null && make install >/dev/null
 echo "ffmpeg arm64 done"
 
@@ -65,7 +76,15 @@ make distclean >/dev/null 2>&1 || true
   --sysroot=$TC/sysroot \
   --disable-x86asm --disable-inline-asm \
   --extra-cflags="-I$PREFIX/include" --extra-ldflags="-L$PREFIX/lib" \
-  $ffmpeg_common >/dev/null
+  $ffmpeg_common
 make -j"$(nproc)" >/dev/null && make install >/dev/null
 echo "ffmpeg x86_64 done"
+
+# The multi-ABI (universal) build is given one parent directory and resolves
+# $DIR/$ANDROID_ABI itself, so lay that view out here. Relative links, so the
+# whole tree stays movable (a CI cache restores it under a different $HOME).
+mkdir -p "$DEPS/ffmpeg"
+ln -sfn ../ffmpeg-arm64  "$DEPS/ffmpeg/arm64-v8a"
+ln -sfn ../ffmpeg-x86_64 "$DEPS/ffmpeg/x86_64"
+
 echo ALL-DONE

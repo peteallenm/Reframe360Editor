@@ -1,0 +1,19 @@
+# Build trees (CMake/Ninja, desktop and Android)
+build/
+build-*/
+stage/
+compile_commands.json
+
+# Packaged output
+*.apk
+*.apk.idsig
+*.tar.gz
+
+# Locally built tools (tools/glescheck.c is the source that matters)
+tools/glescheck
+
+# Third-party prebuilts live outside the repo (android/fetch-deps.sh puts them
+# in ../android-deps by default); never commit them.
+android-deps/
+
+__pycache__/

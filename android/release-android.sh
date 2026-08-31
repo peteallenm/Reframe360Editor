@@ -1,59 +1,115 @@
 #!/usr/bin/env bash
-# Build and SIGN the release APKs:
+# Build (and, if a keystore is available, SIGN) the release APKs:
 #   reframe360-arm64.apk      arm64-v8a only (phones; the Edge 40)
 #   reframe360-universal.apk  arm64-v8a + x86_64 (adds Chromebooks/emulators)
 #
-# Signing uses ~/.android/render360-release.keystore (alias render360). Keep
-# that file safe: Android only accepts UPDATES signed by the same key, so a
-# lost keystore means users must uninstall (losing their folder grant and
-# settings) to move to a new build.
+#   android/release-android.sh            # both variants (default)
+#   android/release-android.sh arm64      # just the phone APK
+#   android/release-android.sh universal
+#
+# Every path is an environment override with this machine's layout as the
+# default, so the same script drives the GitHub runner (.github/workflows/
+# build.yml). Signing is skipped -- and the APK left with an "-unsigned"
+# suffix -- when no keystore is present, which is what a fork or a PR build
+# gets.
+#
+# Signing normally uses ~/.android/render360-release.keystore (alias
+# render360). Keep that file safe: Android only accepts UPDATES signed by the
+# same key, so a lost keystore means users must uninstall (losing their folder
+# grant and settings) to move to a new build.
 set -euo pipefail
 
-QT_VER=6.11.2
-QT_HOST=$HOME/Qt/$QT_VER/gcc_64
-DEPS=$HOME/Build/360Render/android-deps
+VARIANT=${1:-both}
+
+QT_VER=${QT_VER:-6.11.2}
+QT_ROOT=${QT_ROOT:-$HOME/Qt}
+QT_HOST=${QT_HOST:-$QT_ROOT/$QT_VER/gcc_64}
+QT_ANDROID=${QT_ANDROID:-$QT_ROOT/$QT_VER/android_arm64_v8a}
+DEPS=${DEPS:-$HOME/Build/360Render/android-deps}
 SRC=$(cd "$(dirname "$0")/.." && pwd)
-OUT=$HOME/Build/360Render
+OUT=${OUT:-$HOME/Build/360Render}
+ANDROID_PLATFORM=${ANDROID_PLATFORM:-android-28}
+# Overridable so a test build against a different dependency tree does not
+# invalidate the working build directory.
+BUILD_ARM64=${BUILD_ARM64:-$SRC/build-android}
+BUILD_UNIVERSAL=${BUILD_UNIVERSAL:-$SRC/build-android-universal}
 
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
 export PATH=$JAVA_HOME/bin:$PATH
-export ANDROID_SDK_ROOT=$HOME/Android/Sdk
-export ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.2.12479018
-APKSIGNER=$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner
-KS=$HOME/.android/render360-release.keystore
+export ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}
+export ANDROID_HOME=$ANDROID_SDK_ROOT
+export ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-$ANDROID_SDK_ROOT/ndk/27.2.12479018}
 
-sign() { # sign <unsigned.apk> <out.apk>
-    "$APKSIGNER" sign --ks "$KS" --ks-pass pass:render360 \
-        --ks-key-alias render360 --out "$2" "$1"
-    "$APKSIGNER" verify "$2"
-    echo "signed: $2 ($(du -h "$2" | cut -f1))"
+# Qt's own CMake if it is there (the installer ships one), else whatever is on
+# PATH -- aqtinstall, which CI uses, does not install Tools/CMake.
+if [ -z "${CMAKE:-}" ]; then
+    CMAKE=$QT_ROOT/Tools/CMake/bin/cmake
+    [ -x "$CMAKE" ] || CMAKE=$(command -v cmake)
+fi
+
+KEYSTORE=${KEYSTORE:-$HOME/.android/render360-release.keystore}
+KEYSTORE_PASS=${KEYSTORE_PASS:-render360}
+KEY_ALIAS=${KEY_ALIAS:-render360}
+APKSIGNER=${APKSIGNER:-$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)}
+
+mkdir -p "$OUT"
+
+for p in "$QT_HOST" "$ANDROID_NDK_ROOT" "$JAVA_HOME" \
+         "$DEPS/OpenCV-android-sdk/sdk/native/jni"; do
+    [ -e "$p" ] || { echo "missing prerequisite: $p" >&2; exit 1; }
+done
+
+publish() { # publish <unsigned.apk> <name-without-extension>
+    local apk=$1 name=$2
+    if [ -f "$KEYSTORE" ] && [ -n "$APKSIGNER" ]; then
+        "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass "pass:$KEYSTORE_PASS" \
+            --ks-key-alias "$KEY_ALIAS" --out "$OUT/$name.apk" "$apk"
+        "$APKSIGNER" verify "$OUT/$name.apk"
+        echo "signed: $OUT/$name.apk ($(du -h "$OUT/$name.apk" | cut -f1))"
+    else
+        cp "$apk" "$OUT/$name-unsigned.apk"
+        echo "NO KEYSTORE at $KEYSTORE -- left unsigned: $OUT/$name-unsigned.apk"
+    fi
 }
 
-# ---- arm64-only ------------------------------------------------------------
-"$HOME/Qt/$QT_VER/android_arm64_v8a/bin/qt-cmake" -S "$SRC" -B "$SRC/build-android" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DQT_HOST_PATH="$QT_HOST" \
-    -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-28 \
-    -DRENDER360_FFMPEG_DIR="$DEPS/ffmpeg-arm64" \
-    -DOpenCV_DIR="$DEPS/OpenCV-android-sdk/sdk/native/jni"
-"$HOME/Qt/Tools/CMake/bin/cmake" --build "$SRC/build-android" -j"$(nproc)"
-sign "$(find "$SRC/build-android/android-build/build/outputs/apk" -name '*.apk' | head -1)" \
-     "$OUT/reframe360-arm64.apk"
+build_arm64() {
+    [ -e "$DEPS/ffmpeg-arm64/lib/libavcodec.a" ] || {
+        echo "missing $DEPS/ffmpeg-arm64 (run android/build-x264-ffmpeg.sh)" >&2; exit 1; }
+    "$QT_ANDROID/bin/qt-cmake" -S "$SRC" -B "$BUILD_ARM64" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DQT_HOST_PATH="$QT_HOST" \
+        -DANDROID_ABI=arm64-v8a \
+        -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+        -DRENDER360_FFMPEG_DIR="$DEPS/ffmpeg-arm64" \
+        -DOpenCV_DIR="$DEPS/OpenCV-android-sdk/sdk/native/jni"
+    "$CMAKE" --build "$BUILD_ARM64" -j"$(nproc)"
+    publish "$(find "$BUILD_ARM64/android-build/build/outputs/apk" -name '*.apk' | head -1)" \
+            reframe360-arm64
+}
 
-# ---- universal (arm64-v8a + x86_64) ----------------------------------------
 # RENDER360_FFMPEG_DIR points at the parent tree holding one subdirectory per
 # ABI ($DEPS/ffmpeg/{arm64-v8a,x86_64}); CMakeLists resolves the right one per
 # sub-configure. MULTI_ABI_FORWARD_VARS forwards it verbatim -- CMakeLists
 # must never write the resolved path back into it.
-"$HOME/Qt/$QT_VER/android_arm64_v8a/bin/qt-cmake" -S "$SRC" -B "$SRC/build-android-universal" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DQT_HOST_PATH="$QT_HOST" \
-    -DANDROID_PLATFORM=android-28 \
-    -DQT_ANDROID_ABIS="arm64-v8a;x86_64" \
-    -DQT_ANDROID_MULTI_ABI_FORWARD_VARS="RENDER360_FFMPEG_DIR;OpenCV_DIR" \
-    -DRENDER360_FFMPEG_DIR="$DEPS/ffmpeg" \
-    -DOpenCV_DIR="$DEPS/OpenCV-android-sdk/sdk/native/jni"
-"$HOME/Qt/Tools/CMake/bin/cmake" --build "$SRC/build-android-universal" -j"$(nproc)"
-sign "$(find "$SRC/build-android-universal/android-build/build/outputs/apk" -name '*.apk' | head -1)" \
-     "$OUT/reframe360-universal.apk"
+build_universal() {
+    [ -e "$DEPS/ffmpeg/x86_64/lib/libavcodec.a" ] || {
+        echo "missing $DEPS/ffmpeg/x86_64 (run android/build-x264-ffmpeg.sh)" >&2; exit 1; }
+    "$QT_ANDROID/bin/qt-cmake" -S "$SRC" -B "$BUILD_UNIVERSAL" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DQT_HOST_PATH="$QT_HOST" \
+        -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+        -DQT_ANDROID_ABIS="arm64-v8a;x86_64" \
+        -DQT_ANDROID_MULTI_ABI_FORWARD_VARS="RENDER360_FFMPEG_DIR;OpenCV_DIR" \
+        -DRENDER360_FFMPEG_DIR="$DEPS/ffmpeg" \
+        -DOpenCV_DIR="$DEPS/OpenCV-android-sdk/sdk/native/jni"
+    "$CMAKE" --build "$BUILD_UNIVERSAL" -j"$(nproc)"
+    publish "$(find "$BUILD_UNIVERSAL/android-build/build/outputs/apk" -name '*.apk' | head -1)" \
+            reframe360-universal
+}
+
+case "$VARIANT" in
+    arm64)     build_arm64 ;;
+    universal) build_universal ;;
+    both)      build_arm64; build_universal ;;
+    *) echo "usage: $0 [arm64|universal|both]" >&2; exit 2 ;;
+esac

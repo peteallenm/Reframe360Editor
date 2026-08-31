@@ -517,3 +517,76 @@ ported**, and each will bite at runtime:
    MRT + `layout(binding=...)` + RG32F. Colour-buffer float rendering and the
    binding-layout syntax need verifying on the Mali-G77 before the seam
    matcher can be trusted on-device.
+
+---
+
+## Continuous integration (GitHub Actions)
+
+`.github/workflows/build.yml` reproduces this whole setup on a hosted
+`ubuntu-24.04` runner. It calls the *same three scripts* a developer calls —
+`fetch-deps.sh`, `build-x264-ffmpeg.sh`, `release-android.sh` — which is why
+they take their paths from the environment (`DEPS`, `QT_ROOT`, `QT_VER`,
+`OUT`, `ANDROID_SDK_ROOT`, `ANDROID_NDK_ROOT`, `KEYSTORE`, `KEYSTORE_PASS`,
+`KEY_ALIAS`, `CMAKE`) and fall back to this machine's layout. Change the build
+in one place and both paths follow.
+
+What the runner has to install, and how long it costs:
+
+| piece | how | cold | cached |
+|---|---|---|---|
+| JDK 21 | `actions/setup-java` | ~10 s | — |
+| Android SDK 36, build-tools 36.0.0, NDK 27.2.12479018 | `sdkmanager` (the image already has cmdline-tools) | ~2 min | — |
+| Qt 6.11.2 host + `android_arm64_v8a` + `android_x86_64` | `aqtinstall` (unattended; the Qt online installer's account login is not scriptable) | ~5 min | ~1 min |
+| FFmpeg + x264, both ABIs, and the OpenCV Android SDK | the two scripts above, in a separate `android-deps` job | ~20 min | ~1 min |
+| Gradle | androiddeployqt's own wrapper | ~2 min | ~20 s |
+
+The dependency cache key is
+`android-deps-ff<ffmpeg>-ocv<opencv>-x264<commit>-ndk<ver>-<hash of both
+scripts>`, so editing a configure flag rebuilds it and nothing else does. The
+job probes the cache with `lookup-only` and skips even the download on a hit;
+only the APK job restores the tree.
+
+`fetch-deps.sh --prune` (CI only — it deletes source trees) drops the FFmpeg
+sources, the OpenCV samples/Java SDK and the two ABIs we do not ship, which is
+what keeps the cached tree inside GitHub's 10 GB repo cache budget alongside
+Qt.
+
+### Signing
+
+Without secrets the workflow still builds; `release-android.sh` just writes
+`reframe360-arm64-unsigned.apk` and says so. To have CI produce installable
+APKs, add three repository secrets (Settings → Secrets and variables →
+Actions):
+
+| secret | value |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 ~/.android/render360-release.keystore` |
+| `ANDROID_KEYSTORE_PASSWORD` | the store password (`render360`) |
+| `ANDROID_KEY_ALIAS` | the key alias (`render360`) |
+
+Understand what that means before doing it: the release key then lives in
+GitHub, and anyone who can push a workflow change to this repository can sign
+an APK as you. On a private repo with only you as a collaborator that is a
+reasonable trade; if that ever stops being true, drop the secrets and sign the
+CI artifact locally with `apksigner` instead. The keystore itself must still be
+backed up off this machine — losing it means every user has to uninstall (and
+loses their SAF folder grant and settings) to move to a rebuilt key.
+
+The workflow writes the decoded keystore to `$RUNNER_TEMP`, never into the
+workspace, and deletes it in an `always()` step so a failed build cannot leave
+it behind for an artifact upload to pick up.
+
+### Triggers
+
+* push to `main`, and any pull request → Linux build + **arm64 APK**
+* manual run (Actions → build → Run workflow) → optional **universal APK** too
+* push a `v*` tag → both APKs, plus a GitHub release with everything attached
+
+Two things the CI deliberately does **not** do: it does not bump
+`QT_ANDROID_VERSION_CODE` (that stays a conscious edit in `CMakeLists.txt`
+before a release), and it does not run the on-device tests — nothing in the
+workflow has a phone, a GPU or a sample clip, so a green run means "it
+compiles, links and starts", not "it renders correctly".
+
+Note that the Android binaries are **GPL** (x264 is linked in for the 5.7K
+software encode), so a published release carries that licence.

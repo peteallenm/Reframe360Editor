@@ -1,0 +1,268 @@
+name: build
+
+# Linux desktop build on every push/PR, Android APK alongside it. Pushing a
+# v* tag additionally publishes a GitHub release carrying both.
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      universal:
+        description: 'Also build the arm64-v8a + x86_64 universal APK'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight PR run; a run on main is left alone so
+# the dependency cache it may be populating survives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Changing any of these invalidates the dependency cache on its own -- the
+  # key is built out of them.
+  QT_VERSION: 6.11.2
+  NDK_VERSION: 27.2.12479018
+  ANDROID_BUILD_TOOLS: 36.0.0
+  ANDROID_SDK_PLATFORM: 36
+  FFMPEG_VERSION: 6.1.1
+  OPENCV_VERSION: 4.10.0
+  X264_COMMIT: 0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+
+jobs:
+  # ---------------------------------------------------------------- Linux ---
+  # Distro Qt 6.4 / FFmpeg 6.1 / OpenCV 4.6 -- deliberately the same versions
+  # as the development machine, so a red build means a real regression rather
+  # than version skew.
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            qt6-base-dev qt6-base-dev-tools \
+            qt6-declarative-dev qt6-declarative-dev-tools \
+            qt6-shadertools-dev \
+            libgl-dev libglx-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+            libopencv-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Smoke test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          # Redirected so a run can never write into a real ~/.config/render360.
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config"
+          mkdir -p "$XDG_CONFIG_HOME"
+          ./build/reframe360-editor --version
+          ./build/reframe360-editor --help > /dev/null
+
+      - name: Stage install tree
+        run: |
+          cmake --install build --prefix "$PWD/stage/usr"
+          tar -C stage -czf reframe360-editor-linux-x86_64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reframe360-editor-linux-x86_64
+          path: reframe360-editor-linux-x86_64.tar.gz
+
+  # ------------------------------------------------- Android dependencies ---
+  # FFmpeg (+x264, for the 5.7K software encode) cross-built for both ABIs,
+  # plus the prebuilt OpenCV Android SDK. ~20 minutes cold, ~10 seconds when
+  # the key already exists -- the lookup-only probe means a hit does not even
+  # download the tree here; only the job that consumes it does.
+  android-deps:
+    runs-on: ubuntu-24.04
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: key
+        run: |
+          echo "value=android-deps-ff${FFMPEG_VERSION}-ocv${OPENCV_VERSION}-x264${X264_COMMIT:0:12}-ndk${NDK_VERSION}-${{ hashFiles('android/fetch-deps.sh', 'android/build-x264-ffmpeg.sh') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Is it already cached?
+        id: probe
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/android-deps
+          key: ${{ steps.key.outputs.value }}
+          lookup-only: true
+
+      - name: Install NDK
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: |
+          sdk=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
+          yes | "$sdk" --licenses > /dev/null 2>&1 || true
+          "$sdk" "ndk;$NDK_VERSION" > /dev/null
+
+      - name: Fetch sources
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: DEPS="$HOME/android-deps" android/fetch-deps.sh
+
+      - name: Cross-build x264 + FFmpeg (arm64-v8a and x86_64)
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: |
+          export DEPS="$HOME/android-deps"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+          android/build-x264-ffmpeg.sh
+
+      - name: Prune to what the app build needs
+        if: steps.probe.outputs.cache-hit != 'true'
+        run: DEPS="$HOME/android-deps" android/fetch-deps.sh --prune
+
+      - name: Save dependency cache
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/android-deps
+          key: ${{ steps.key.outputs.value }}
+
+  # ---------------------------------------------------------- Android APK ---
+  android:
+    needs: android-deps
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'          # Qt 6.11's Gradle needs a real JDK 21
+
+      - name: Restore dependency cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/android-deps
+          key: ${{ needs.android-deps.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Install Android SDK pieces
+        run: |
+          sdk=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
+          yes | "$sdk" --licenses > /dev/null 2>&1 || true
+          "$sdk" "platforms;android-$ANDROID_SDK_PLATFORM" \
+                 "build-tools;$ANDROID_BUILD_TOOLS" \
+                 "ndk;$NDK_VERSION" > /dev/null
+
+      - name: Cache Qt
+        id: qt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Qt
+          key: qt-${{ env.QT_VERSION }}-linux-android-v1
+
+      - name: Install Qt (host + both Android ABIs)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          # A venv, not --user: Ubuntu 24.04's Python is externally managed
+          # (PEP 668) and refuses a plain pip install into it.
+          python3 -m venv "$RUNNER_TEMP/aqt-venv"
+          "$RUNNER_TEMP/aqt-venv/bin/pip" install --upgrade pip aqtinstall
+          aqt="$RUNNER_TEMP/aqt-venv/bin/aqt"
+          # The host Qt must be the same version to the patch: qt-cmake needs
+          # it for QT_HOST_PATH (qsb, androiddeployqt, the QML compiler).
+          "$aqt" install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O "$HOME/Qt"
+          "$aqt" install-qt linux android "$QT_VERSION" android_arm64_v8a -O "$HOME/Qt"
+          "$aqt" install-qt linux android "$QT_VERSION" android_x86_64    -O "$HOME/Qt"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ env.QT_VERSION }}-${{ hashFiles('android/AndroidManifest.xml') }}
+          restore-keys: gradle-${{ env.QT_VERSION }}-
+
+      # No `if:` guard -- the secrets context is not available in a step
+      # condition, so the emptiness test has to happen inside the step. An
+      # absent secret (a fork's PR, or before the secret is set up) simply
+      # leaves the keystore path empty and the APK unsigned.
+      - name: Decode signing keystore
+        id: keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "no ANDROID_KEYSTORE_BASE64 secret -- the APK will be unsigned"
+            exit 0
+          fi
+          # Written outside the workspace so it can never reach an artifact.
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK(s)
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          KEYSTORE_PASS_IN: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS_IN: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          export DEPS="$HOME/android-deps"
+          export QT_ROOT="$HOME/Qt"
+          export QT_VER="$QT_VERSION"
+          export OUT="$GITHUB_WORKSPACE/artifacts"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+          export APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          # No keystore secret -> the script leaves the APK unsigned rather
+          # than failing, which is what a fork's PR build should get.
+          export KEYSTORE="${KEYSTORE_PATH:-/nonexistent}"
+          export KEYSTORE_PASS="${KEYSTORE_PASS_IN:-render360}"
+          export KEY_ALIAS="${KEY_ALIAS_IN:-render360}"
+          # Both ABIs only where they earn their ~8 extra minutes.
+          variant=arm64
+          if [ "${{ github.event.inputs.universal }}" = "true" ] || \
+             [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            variant=both
+          fi
+          android/release-android.sh "$variant"
+
+      - name: Shred the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reframe360-android
+          path: artifacts/*.apk
+
+  # -------------------------------------------------------------- Release ---
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ linux, android ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Reframe360 Editor $GITHUB_REF_NAME" \
+            --generate-notes \
+            $(find dist -type f \( -name '*.apk' -o -name '*.tar.gz' \))
