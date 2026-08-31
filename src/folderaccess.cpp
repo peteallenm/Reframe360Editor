@@ -71,8 +71,15 @@ QStringList FolderAccess::clips() const
 {
     QStringList out;
     for (auto it = m_entries.constBegin(); it != m_entries.constEnd(); ++it) {
-        if (looksLikeVideo(it.key()) && !looksLikeProxy(it.key()))
-            out.append(it.key());
+        if (!looksLikeVideo(it.key()) || looksLikeProxy(it.key()))
+            continue;
+        // The app's own exports (default name <clip>_export.mp4) land in this
+        // same folder; listing them as source clips is clutter -- they are
+        // flat renders, not dual-fisheye sources. Openable via the file
+        // picker if ever needed.
+        if (it.key().contains(QLatin1String("_export."), Qt::CaseInsensitive))
+            continue;
+        out.append(it.key());
     }
     out.sort(Qt::CaseInsensitive);
     return out;
@@ -112,6 +119,14 @@ void FolderAccess::forgetFolder()
 {
     m_tree.clear();
     m_entries.clear();
+    emit folderChanged();
+}
+
+void FolderAccess::rescan()
+{
+    if (m_tree.isEmpty())
+        return;
+    refresh();
     emit folderChanged();
 }
 

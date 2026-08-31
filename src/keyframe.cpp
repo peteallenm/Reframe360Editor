@@ -428,6 +428,11 @@ void KeyframeModel::loadFromFile(const QString &path)
     m_exportVidstab = expVidstab;
     m_exportVidstabInformed = expVidstabInformed;
     m_exportFileName = expFileName;
+    // Notify count/bindings (the Clear button was stuck disabled for RESTORED
+    // keyframes: the model reset repaints the markers, but the count
+    // Q_PROPERTY notifies via this signal). App::saveKeyframes() is guarded
+    // by m_restoringSidecar, so this cannot rewrite the file just read.
+    emit keyframesChanged();
     emit trimChanged();
     emit exportSettingsChanged();
 }

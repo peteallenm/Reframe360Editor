@@ -124,6 +124,16 @@ void VideoDecoder::loadVideo(const QString &path)
         return;
     }
 
+#ifdef Q_OS_ANDROID
+    // Hardware first: MediaCodec decodes the proxy for free (the CPU cost of
+    // software decode was the largest remaining per-frame CPU consumer on the
+    // phone -- battery and thermal headroom). tryOpenMediaCodec() is
+    // conservative: it only claims the clip after decoding a real frame from
+    // it, so a failure of any kind lands on the software path below.
+    if (!tryOpenMediaCodec(codecpar))
+        m_codecCtx = nullptr;
+    if (!m_codecCtx) {
+#endif
     m_codecCtx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(m_codecCtx, codecpar);
 
@@ -140,6 +150,11 @@ void VideoDecoder::loadVideo(const QString &path)
         emit errorOccurred("Failed to open codec");
         return;
     }
+#ifdef Q_OS_ANDROID
+    m_usingHwDecoder = false;
+    m_hwBadStreak = 0;
+    }
+#endif
 
     m_videoWidth = codecpar->width;
     m_videoHeight = codecpar->height;
@@ -434,6 +449,130 @@ void VideoDecoder::decodeLoop()
     }
 }
 
+#ifdef Q_OS_ANDROID
+bool VideoDecoder::tryOpenMediaCodec(const AVCodecParameters *codecpar)
+{
+    // MediaCodec tops out around 4K; the 2880x5760 original always exceeds it
+    // (nothing decodes 5760 tall in hardware), the 720x1440 proxy never does.
+    const int w = codecpar->width, h = codecpar->height;
+    if (w <= 0 || h <= 0 || qMax(w, h) > 4096 || qint64(w) * h > qint64(4096) * 2304)
+        return false;
+
+    const char *name = nullptr;
+    if (codecpar->codec_id == AV_CODEC_ID_H264)      name = "h264_mediacodec";
+    else if (codecpar->codec_id == AV_CODEC_ID_HEVC) name = "hevc_mediacodec";
+    if (!name)
+        return false;
+
+    const AVCodec *hw = avcodec_find_decoder_by_name(name);
+    if (!hw)
+        return false;
+
+    AVCodecContext *ctx = avcodec_alloc_context3(hw);
+    if (!ctx)
+        return false;
+    avcodec_parameters_to_context(ctx, codecpar);
+    if (avcodec_open2(ctx, hw, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        return false;
+    }
+
+    // Some devices accept the open and then fail on real data, so nothing is
+    // trusted until several consecutive frames have come out WITH VALID
+    // TIMESTAMPS -- a decoder that errors internally (C2MtkVdec onError) can
+    // still hand frames back, but without PTS, and a timestampless stream
+    // pins the playback clock at 0:00. Bounded: a couple of GOPs' worth of
+    // packets at most.
+    const int kNeedGoodFrames = 5;
+    int goodFrames = 0;
+    bool decoderBroken = false;
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *pkt = av_packet_alloc();
+    for (int i = 0; i < 120 && goodFrames < kNeedGoodFrames && !decoderBroken; ++i) {
+        if (av_read_frame(m_formatCtx, pkt) < 0)
+            break;
+        if (pkt->stream_index != m_videoStreamIndex) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        const int sendRet = avcodec_send_packet(ctx, pkt);
+        av_packet_unref(pkt);
+        if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) {
+            decoderBroken = true;
+            break;
+        }
+        const int recvRet = avcodec_receive_frame(ctx, frame);
+        if (recvRet == 0) {
+            if (frame->best_effort_timestamp == AV_NOPTS_VALUE)
+                decoderBroken = true;   // frames without time are unusable
+            else
+                ++goodFrames;
+        } else if (recvRet != AVERROR(EAGAIN)) {
+            decoderBroken = true;
+        }
+    }
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+
+    // Rewind: the probe consumed packets the playback loop must see again.
+    av_seek_frame(m_formatCtx, m_videoStreamIndex, 0, AVSEEK_FLAG_BACKWARD);
+
+    if (goodFrames < kNeedGoodFrames) {
+        avcodec_free_context(&ctx);
+        qInfo() << "MediaCodec decoder" << name << "failed the probe"
+                << "(good frames:" << goodFrames << "); using software decode";
+        return false;
+    }
+
+    avcodec_flush_buffers(ctx);
+    m_codecCtx = ctx;
+    m_usingHwDecoder = true;
+    m_hwBadStreak = 0;
+    qInfo() << "Hardware decode:" << name << "for" << w << "x" << h;
+    return true;
+}
+
+// Replace a misbehaving hardware decoder with the software one, in place,
+// keeping the demuxer and playback position. Called from decodeFrame with
+// m_ffmpegMutex already held.
+bool VideoDecoder::switchToSoftwareDecoder()
+{
+    if (!m_codecCtx || !m_videoStream)
+        return false;
+    const AVCodec *sw = avcodec_find_decoder(m_videoStream->codecpar->codec_id);
+    if (!sw)
+        return false;
+    AVCodecContext *ctx = avcodec_alloc_context3(sw);
+    if (!ctx)
+        return false;
+    avcodec_parameters_to_context(ctx, m_videoStream->codecpar);
+    ctx->thread_count = 0;
+    ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    if (avcodec_open2(ctx, sw, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        return false;
+    }
+    avcodec_free_context(&m_codecCtx);
+    m_codecCtx = ctx;
+    m_usingHwDecoder = false;
+    m_hwBadStreak = 0;
+
+    // Resume from a keyframe at (or before) where playback got to, and let
+    // the loop's seek logic republish time once a fresh frame lands.
+    double t;
+    {
+        QMutexLocker lock(&m_mutex);
+        t = qMax(0.0, m_currentTime);
+        m_targetTime = t;
+        m_hasFrame = false;
+    }
+    const int64_t ts = (int64_t)(t / av_q2d(m_videoStream->time_base));
+    av_seek_frame(m_formatCtx, m_videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
+    qInfo() << "Hardware decoder produced unusable output; switched to software decode at t =" << t;
+    return true;
+}
+#endif
+
 VideoDecoder::DecodeResult VideoDecoder::decodeFrame()
 {
     QMutexLocker ffmpegLock(&m_ffmpegMutex);
@@ -462,11 +601,30 @@ VideoDecoder::DecodeResult VideoDecoder::decodeFrame()
     av_packet_free(&pkt);
     if (ret < 0) {
         av_frame_free(&frame);
+#ifdef Q_OS_ANDROID
+        if (m_usingHwDecoder && ++m_hwBadStreak >= 12)
+            switchToSoftwareDecoder();
+#endif
         return DecodeResult::NoData;
     }
 
     ret = avcodec_receive_frame(m_codecCtx, frame);
     if (ret == 0) {
+#ifdef Q_OS_ANDROID
+        if (m_usingHwDecoder) {
+            // A frame without a timestamp cannot advance the clock; a stream
+            // of them reads as a hang (time pinned at 0:00 while pictures
+            // move). Tolerate a few, then abandon the hardware decoder.
+            if (frame->best_effort_timestamp == AV_NOPTS_VALUE) {
+                if (++m_hwBadStreak >= 12 && switchToSoftwareDecoder()) {
+                    av_frame_free(&frame);
+                    return DecodeResult::NoData;
+                }
+            } else {
+                m_hwBadStreak = 0;
+            }
+        }
+#endif
         DecodedFrame decoded;
         decoded.width = frame->width;
         decoded.height = frame->height;
@@ -476,16 +634,40 @@ VideoDecoder::DecodeResult VideoDecoder::decodeFrame()
         decoded.timestamp = frame->best_effort_timestamp * av_q2d(m_videoStream->time_base);
 
         int ySize = decoded.yStride * decoded.height;
-        int uSize = decoded.uStride * (decoded.height / 2);
-        int vSize = decoded.vStride * (decoded.height / 2);
 
         decoded.yData.resize(ySize);
-        decoded.uData.resize(uSize);
-        decoded.vData.resize(vSize);
-
         memcpy(decoded.yData.data(), frame->data[0], ySize);
-        memcpy(decoded.uData.data(), frame->data[1], uSize);
-        memcpy(decoded.vData.data(), frame->data[2], vSize);
+
+        if (frame->format == AV_PIX_FMT_NV12) {
+            // MediaCodec output: chroma is one interleaved UV plane. The
+            // viewer, histogram and flow chain all assume three planes, so
+            // deinterleave here -- for the proxy that is ~0.5 MB per frame,
+            // vastly cheaper than the software decode this path replaced.
+            const int cw = decoded.width / 2;
+            const int chh = decoded.height / 2;
+            decoded.uStride = cw;
+            decoded.vStride = cw;
+            decoded.uData.resize(cw * chh);
+            decoded.vData.resize(cw * chh);
+            uchar *du = reinterpret_cast<uchar *>(decoded.uData.data());
+            uchar *dv = reinterpret_cast<uchar *>(decoded.vData.data());
+            for (int y = 0; y < chh; ++y) {
+                const uint8_t *src = frame->data[1] + qint64(y) * frame->linesize[1];
+                uchar *u = du + qint64(y) * cw;
+                uchar *v = dv + qint64(y) * cw;
+                for (int x = 0; x < cw; ++x) {
+                    u[x] = src[2 * x];
+                    v[x] = src[2 * x + 1];
+                }
+            }
+        } else {
+            int uSize = decoded.uStride * (decoded.height / 2);
+            int vSize = decoded.vStride * (decoded.height / 2);
+            decoded.uData.resize(uSize);
+            decoded.vData.resize(vSize);
+            memcpy(decoded.uData.data(), frame->data[1], uSize);
+            memcpy(decoded.vData.data(), frame->data[2], vSize);
+        }
 
         {
             QMutexLocker frameLock(&m_mutex);
@@ -499,5 +681,11 @@ VideoDecoder::DecodeResult VideoDecoder::decodeFrame()
     }
 
     av_frame_free(&frame);
+#ifdef Q_OS_ANDROID
+    // EAGAIN just means "feed more packets"; anything else from a hardware
+    // decoder counts against it.
+    if (m_usingHwDecoder && ret != AVERROR(EAGAIN) && ++m_hwBadStreak >= 12)
+        switchToSoftwareDecoder();
+#endif
     return DecodeResult::NoData;
 }

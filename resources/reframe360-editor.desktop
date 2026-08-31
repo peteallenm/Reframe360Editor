@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Reframe360 Editor
+GenericName=360 Video Stabiliser
+Comment=Stabilise, stitch and reframe 360 footage from a dual-fisheye camera
+Exec=reframe360-editor %f
+Icon=reframe360-editor
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/quicktime;video/x-matroska;
+StartupNotify=true

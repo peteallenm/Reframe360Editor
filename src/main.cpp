@@ -13,6 +13,13 @@
 #include "videodecoder.h"
 #include "flowrenderer.h"
 
+#ifdef Q_OS_ANDROID
+#include <QJniEnvironment>
+extern "C" {
+#include <libavcodec/jni.h>
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     // Register the types queued to the optical-flow worker thread.
@@ -37,6 +44,13 @@ int main(int argc, char *argv[])
     // We also deliberately do NOT set QT_QUICK_CONTROLS_NATIVE_DIALOGS=0:
     // the non-native Qt Quick dialog implementation ignores SaveFile mode.
     QGuiApplication app(argc, argv);
+
+#ifdef Q_OS_ANDROID
+    // FFmpeg's MediaCodec decoders/encoders reach Java through JNI and need
+    // the VM registered once up front; without this every *_mediacodec open
+    // fails and playback silently stays on software decode.
+    av_jni_set_java_vm(QJniEnvironment::javaVM(), nullptr);
+#endif
     // Display name is set separately below. applicationName/organizationName
     // are the SETTINGS IDENTITY -- QSettings derives ~/.config/<org>/<app>.conf
     // from them, and tracking_tests hardcodes the same pair. Renaming these
@@ -98,7 +112,9 @@ int main(int argc, char *argv[])
     QCommandLineOption exportEndOption("export-end", "Export end time in seconds (default: clip duration)", "sec");
     parser.addOption(exportEndOption);
     QCommandLineOption exportBackendOption("export-backend", "Render backend: gpu, cpu or auto (default auto)", "backend");
+    QCommandLineOption exportSphericalOption("export-spherical", "Tag the export as a 360 equirectangular video (requires --projection 1)");
     parser.addOption(exportBackendOption);
+    parser.addOption(exportSphericalOption);
     QCommandLineOption exportCodecOption("export-codec", "Encoder: libx264, libx265 or hevc_nvenc (default libx264)", "codec");
     parser.addOption(exportCodecOption);
     QCommandLineOption exportCrfOption("export-crf", "CRF quality for CPU codecs, 0..51 (default 19)", "crf");
@@ -185,13 +201,14 @@ int main(int argc, char *argv[])
                 });
                 QTimer *wait = new QTimer(&app);
                 wait->setInterval(100);
-                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab, vidstabInformed]() {
+                const bool exportSpherical = parser.isSet(exportSphericalOption);
+                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab, vidstabInformed, exportSpherical]() {
                     if (appController.duration() <= 0.0)
                         return;   // keep waiting for the decoder
                     wait->stop();
                     const double startTime = start;
                     const double endTime = (end >= 0.0) ? end : appController.duration();
-                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, vidstabInformed, gpu);
+                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, vidstabInformed, gpu, exportSpherical);
 
                     // Poll until the export finishes, then exit with a code
                     // that reflects success/failure.

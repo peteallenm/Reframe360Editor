@@ -27,6 +27,11 @@ Dialog {
     property string defaultBase: "export"
 
     readonly property bool isNvenc: app.exportCodec === "hevc_nvenc"
+    // Encoders driven by a target bitrate rather than CRF: NVENC and both
+    // Android MediaCodec encoders. The slider was showing CRF on Android,
+    // which the hardware encoder silently ignores -- the "quality" choice did
+    // nothing and only the (hidden) bitrate mattered.
+    readonly property bool bitrateMode: isNvenc || Qt.platform.os === "android"
 
     function ensureSuffix(path) {
         var p = path.toString()
@@ -124,16 +129,35 @@ Dialog {
         // ---- Output file ----
         RowLayout {
             spacing: 8
-            Label { text: qsTr("Output:"); Layout.preferredWidth: 60 }
+            Label {
+                text: Qt.platform.os === "android" ? qsTr("Name:") : qsTr("Output:")
+                Layout.preferredWidth: 60
+            }
             TextField {
                 id: outputField
                 Layout.fillWidth: true
-                placeholderText: qsTr("Output MP4 path")
+                placeholderText: Qt.platform.os === "android" ? qsTr("Output file name")
+                                                              : qsTr("Output MP4 path")
             }
+            // No Browse on Android: the export is created by NAME inside the
+            // granted folder (nothing else is writable by path), so a native
+            // save picker would only produce an unusable content:// string.
             Button {
+                visible: Qt.platform.os !== "android"
                 text: qsTr("Browse…")
                 onClicked: saveDialog.open()
             }
+        }
+
+        Label {
+            visible: Qt.platform.os === "android"
+            text: app.folder.hasFolder
+                  ? qsTr("Saved into “%1”.").arg(app.folder.folderName)
+                  : qsTr("Open a folder first (Open… in the toolbar) so the export has somewhere to be saved.")
+            color: app.folder.hasFolder ? Material.secondaryTextColor : "#ffb0b0"
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
         }
 
         Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
@@ -152,12 +176,29 @@ Dialog {
                     ListElement { label: "1080p (1920×1080)";  w: 1920; h: 1080 }
                     ListElement { label: "1440p (2560×1440)";  w: 2560; h: 1440 }
                     ListElement { label: "4K (3840×2160)";     w: 3840; h: 2160 }
+                    // 2:1 sizes -- the native shape of a full equirectangular
+                    // sphere. Up to 3840×1920 the phone's hardware encoder
+                    // copes; 5.7K exceeds it and falls back to software
+                    // encoding on Android (warned below).
+                    ListElement { label: "360 2.5K (2560×1280)"; w: 2560; h: 1280 }
+                    ListElement { label: "360 4K (3840×1920)";   w: 3840; h: 1920 }
+                    ListElement { label: "360 5.7K (5760×2880)"; w: 5760; h: 2880 }
                 }
                 onActivated: {
                     app.exportWidth = resolutionModel.get(currentIndex).w
                     app.exportHeight = resolutionModel.get(currentIndex).h
                 }
             }
+        }
+
+        Label {
+            visible: Qt.platform.os === "android"
+                     && (app.exportWidth > 4096 || app.exportHeight > 2304)
+            text: qsTr("\u26a0 Bigger than the phone's hardware encoder can handle: a software encoder takes over. Expect the export to take many times the clip length, and keep the app in the foreground.")
+            color: "#ffcc80"
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
         }
 
         RowLayout {
@@ -198,32 +239,51 @@ Dialog {
         // ---- Quality: CRF for CPU codecs, bitrate for NVENC ----
         RowLayout {
             spacing: 8
-            Label { text: isNvenc ? qsTr("Bitrate:") : qsTr("Quality:"); Layout.preferredWidth: 60 }
+            Label { text: bitrateMode ? qsTr("Bitrate:") : qsTr("Quality:"); Layout.preferredWidth: 60 }
             Slider {
                 id: qualitySlider
                 Layout.fillWidth: true
-                from: isNvenc ? 1 : 0
-                to: isNvenc ? 50 : 51
+                from: bitrateMode ? 1 : 0
+                to: bitrateMode ? 50 : 51
                 stepSize: 1
-                value: isNvenc ? app.exportBitrate : app.exportCrf
+                value: bitrateMode ? app.exportBitrate : app.exportCrf
                 onMoved: {
-                    if (isNvenc) app.exportBitrate = value
+                    if (bitrateMode) app.exportBitrate = value
                     else app.exportCrf = value
                 }
             }
             Label {
                 Layout.preferredWidth: 70
-                text: isNvenc ? qualitySlider.value.toFixed(0) + " Mbps" : qsTr("CRF ") + qualitySlider.value.toFixed(0)
+                text: bitrateMode ? qualitySlider.value.toFixed(0) + " Mbps" : qsTr("CRF ") + qualitySlider.value.toFixed(0)
             }
         }
 
         Label {
-            text: isNvenc ? qsTr("Lower = smaller file. HEVC NVENC targets this average bitrate.")
+            text: bitrateMode ? qsTr("Higher = better quality, bigger file. The hardware encoder targets this average bitrate (12–20 Mbps is good for 1080p).")
                           : qsTr("CRF scale 0–51: lower is higher quality (≈19 recommended).")
             font.pixelSize: 11
             color: Material.secondaryTextColor
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
+        }
+
+        // ---- 360 metadata (equirectangular renders only) ----
+        ColumnLayout {
+            visible: app.projection === 1
+            spacing: 2
+            CheckBox {
+                id: sphericalCheck
+                text: qsTr("Tag as 360 video")
+                checked: true
+            }
+            Label {
+                text: qsTr("Embeds the spherical-video metadata so YouTube and media players show the export as an interactive sphere. Best with a 2:1 \u201c360\u201d resolution above.")
+                font.pixelSize: 11
+                color: Material.secondaryTextColor
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                Layout.leftMargin: 8
+            }
         }
 
         Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
@@ -309,6 +369,7 @@ Dialog {
                 text: qsTr("Export")
                 highlighted: true
                 enabled: app.videoPath !== "" && !app.exportRunning && outputField.text !== ""
+                         && (Qt.platform.os !== "android" || app.folder.hasFolder)
                 onClicked: exportDialog.accept()
             }
         }
@@ -329,7 +390,8 @@ Dialog {
                         app.exportBitrate,
                         app.exportVidstab,
                         app.exportVidstabInformed,
-                        true)
+                        true,
+                        app.projection === 1 && sphericalCheck.checked)
     }
 
     FileDialog {

@@ -382,6 +382,8 @@ bool VisualRotationComputer::decodeFrames(const QString &videoPath, int frameSki
         fd.timestamp = timestamp;
         fd.grayFront = grayMat(cv::Rect(0, 0, dstWidth, halfHeight)).clone();
         fd.grayRear = grayMat(cv::Rect(0, halfHeight, dstWidth, halfHeight)).clone();
+        fd.halfWidth = dstWidth;
+        fd.halfHeight = halfHeight;
 
         frames.append(fd);
         processedCount++;
@@ -568,10 +570,12 @@ bool VisualRotationComputer::matchFeatures(const FrameData &frameA, const FrameD
     }
 
     // Convert matches to bearing vectors
-    int halfHeightA = frameA.grayFront.rows;
-    int halfWidthA = frameA.grayFront.cols;
-    int halfHeightB = frameB.grayFront.rows;
-    int halfWidthB = frameB.grayFront.cols;
+    // From the stored dimensions, not the Mats: those are released after
+    // feature extraction to give the memory back.
+    int halfHeightA = frameA.halfHeight;
+    int halfWidthA = frameA.halfWidth;
+    int halfHeightB = frameB.halfHeight;
+    int halfWidthB = frameB.halfWidth;
 
     // Front matches
     for (const auto &m : frontMatches) {
@@ -884,6 +888,24 @@ void VisualRotationComputer::compute(const QString &videoPath,
             });
 
             const qint64 msFeatures = tMatch.elapsed();
+
+            // Give the pixels back. Nothing past this point reads the images --
+            // matchFeatures() works from the descriptors and needs only the
+            // half-frame dimensions, which FrameData now stores itself. At
+            // 640x720 x 2 halves x up to MAX_DECODED_FRAMES this was ~645 MB
+            // held for the whole solve, which is more than a phone can spare.
+            {
+                qint64 freed = 0;
+                for (FrameData &fd : frames) {
+                    freed += (qint64)fd.grayFront.total() * fd.grayFront.elemSize()
+                           + (qint64)fd.grayRear.total() * fd.grayRear.elemSize();
+                    fd.grayFront.release();
+                    fd.grayRear.release();
+                }
+                qInfo("VisualRotation: released %lld MB of decoded frames after feature extraction",
+                      (long long)(freed / (1024 * 1024)));
+            }
+
             emit progressChanged(0.65, QStringLiteral("Matching features..."));
 
             // 2. Match features and solve rotations with motion-adaptive density.

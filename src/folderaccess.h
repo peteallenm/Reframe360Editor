@@ -50,6 +50,10 @@ public:
     // Forget the current grant.
     Q_INVOKABLE void forgetFolder();
 
+    // Re-list the granted folder (e.g. the camera was plugged in after the
+    // grant, or files were added). No-op without a folder.
+    Q_INVOKABLE void rescan();
+
     // The document URI of a file in the folder, or an empty string when the
     // folder holds no such name.
     Q_INVOKABLE QString uriFor(const QString &displayName) const;

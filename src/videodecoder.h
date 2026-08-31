@@ -95,6 +95,22 @@ private slots:
 
 private:
     void closeInput();
+#ifdef Q_OS_ANDROID
+    // Try to open the clip on the phone's hardware decoder (MediaCodec via
+    // FFmpeg). Sets m_codecCtx and returns true only after a probe has
+    // decoded several consecutive frames with valid timestamps; on any
+    // failure the caller falls back to the software decoder. Leaves the
+    // demuxer rewound to the start either way.
+    bool tryOpenMediaCodec(const AVCodecParameters *codecpar);
+    // Mid-stream escape hatch: some clips pass the probe and then make the
+    // vendor decoder misbehave later (YIVR_0839 drives the MTK codec into
+    // repeated onError and timestampless frames -- the clock pins at 0:00 and
+    // the UI reads as hung). Called from decodeFrame (m_ffmpegMutex held)
+    // once enough consecutive bad results accumulate.
+    bool switchToSoftwareDecoder();
+    bool m_usingHwDecoder = false;
+    int m_hwBadStreak = 0;
+#endif
 
 private:
     enum class DecodeResult { Frame, Eof, NoData };

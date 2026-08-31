@@ -430,6 +430,19 @@ void App::setVideoPath(const QString &path)
             m_loadError.clear();
             emit loadErrorChanged();
         }
+#ifdef Q_OS_ANDROID
+        // On a phone the proxy is the only preview source that plays smoothly
+        // (the 5.7K original software-decodes at a few fps), so preview
+        // defaults to the proxy whenever the clip has one. m_videoPath keeps
+        // pointing at the full-resolution video, so export is unaffected, and
+        // the toolbar toggle still switches to the original on request.
+        const QString androidProxy = previewThumbnailPath();
+        if (!androidProxy.isEmpty()) {
+            m_usePreview = true;
+            emit usePreviewThumbnailChanged();
+            m_decoder->loadVideo(androidProxy);
+        } else
+#endif
         m_decoder->loadVideo(path);
 
         // loadVideo() resets the decoder clock to 0 without emitting
@@ -437,6 +450,11 @@ void App::setVideoPath(const QString &path)
         // keyframes right away instead of waiting for the next seek/play tick.
         m_currentTime = m_decoder->currentTime();
         applyKeyframeInterpolation();
+
+        // Paint the first frame. Without this the viewer stayed black until
+        // Play: loadVideo() leaves the decode loop idle, but a seek decodes
+        // to its target even while paused (and starts the loop if needed).
+        m_decoder->seekTo(0.0);
 
         QString imuPath = m_imuOverride.isEmpty() ? (path + ".imu") : m_imuOverride;
         if (m_imuOverride.isEmpty() && !QFileInfo::exists(imuPath)) {
@@ -1232,7 +1250,7 @@ void App::exportFrame(const QString &path, int width, int height)
                             snap.stateAt(m_currentTime));
 }
 
-void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend)
+void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend, bool spherical360)
 {
     if (m_videoPath.isEmpty()) {
         m_exportStatus = tr("Export failed: no video loaded");
@@ -1279,6 +1297,9 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     settings.bitrateMbps = bitrateMbps;
     settings.vidstab = vidstab;
     settings.vidstabInformed = vidstabInformed;
+    // Only an equirectangular render is actually a sphere; tagging any other
+    // projection would make players warp a flat picture around one.
+    settings.spherical = spherical360 && m_projection == 1;
 
     ExportSnapshot snap = buildExportSnapshot();
     m_exporter->exportVideo(m_videoPath, writePath, settings, startTime, endTime,
@@ -1526,6 +1547,12 @@ void App::saveSettings() const
 void App::saveKeyframes()
 {
     if (m_videoPath.isEmpty())
+        return;
+    // loadFromFile() now emits keyframesChanged (the count property needs the
+    // notify); writing here during that restore would rewrite the sidecar we
+    // are reading -- and for a folder clip it would miss m_folderClipName,
+    // which is only set after the open completes.
+    if (m_restoringSidecar)
         return;
     // Sync the live trim range into the model so the sidecar always records
     // the current in/out markers (the model keeps them only as loaded state).

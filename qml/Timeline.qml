@@ -34,7 +34,11 @@ Pane {
         standardButtons: Dialog.Yes | Dialog.No
         onAccepted: app.keyframes.clearKeyframes()
         Label {
-            width: parent ? parent.width : 300
+            // FIXED width: a sole Label becomes the Dialog's contentItem, so
+            // any binding from the dialog's own geometry (parent.width,
+            // availableWidth) loops through implicitHeight. The dialog is
+            // capped at 380 wide, so 330 always fits inside the padding.
+            width: 330
             wrapMode: Text.Wrap
             text: qsTr("Remove all %1 keyframes from this clip? This cannot be undone.")
                     .arg(app.keyframes.count)
@@ -98,7 +102,7 @@ Pane {
         }
 
         ToolButton {
-            text: "KF"   // no icon.name: no icon theme on Android (see play button)
+            text: "+ KF"   // no icon.name: no icon theme on Android (see play button)
             ToolTip.text: "Add keyframe at current time"
             ToolTip.visible: hovered
             onClicked: app.addKeyframeAtCurrent()
@@ -243,7 +247,10 @@ Pane {
                     border.width: 1
 
                     MouseArea {
+                        // An 8 px marker is an impossible touch target; the
+                        // hit area extends well past the dot.
                         anchors.fill: parent
+                        anchors.margins: -8
                         cursorShape: Qt.PointingHandCursor
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: (mouse) => {

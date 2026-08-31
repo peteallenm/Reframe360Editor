@@ -27,6 +27,61 @@ ApplicationWindow {
     // Side panel folded away to give the viewer the full width.
     property bool panelCollapsed: false
 
+    // Display name (in the granted folder) of the loaded clip, for the clip
+    // list highlight and the title. Cleared when a file is opened directly.
+    property string currentClipName: ""
+
+    // True between asking for a folder and the grant arriving, so the clip
+    // list pops up as the immediate next step exactly once.
+    property bool folderPickPending: false
+
+    // The one "open something" action. On Android everything goes through the
+    // granted folder (picking it first if there is none); on desktop the file
+    // dialog already does everything.
+    function openPrimary() {
+        if (app.folder.available) {
+            if (app.folder.hasFolder) {
+                app.folder.rescan()
+                clipListDialog.open()
+            } else {
+                folderPickPending = true
+                app.folder.pickFolder()
+            }
+        } else {
+            fileDialog.open()
+        }
+    }
+
+    Connections {
+        target: app.folder
+        function onFolderChanged() {
+            if (window.folderPickPending && app.folder.hasFolder) {
+                window.folderPickPending = false
+                clipListDialog.open()
+            }
+        }
+        function onPickFailed(message) {
+            window.folderPickPending = false
+            folderToast.show(message)
+        }
+    }
+
+    // Stop decoding when the app is not on screen. The decode thread does not
+    // care that nothing is being painted, and on a phone that is a core kept
+    // busy for nothing -- battery, and the thermal headroom the 8020 needs for
+    // the 5.7K path. Deliberately keyed on Suspended/Hidden rather than
+    // Inactive: merely losing focus (clicking another window on the desktop)
+    // should not stop playback.
+    Connections {
+        target: Qt.application
+        function onStateChanged() {
+            if (Qt.application.state === Qt.ApplicationSuspended
+                || Qt.application.state === Qt.ApplicationHidden) {
+                app.isPlaying = false
+            }
+        }
+    }
+
     // Folder of the currently loaded video (where exports default to) and its
     // base name, used to suggest sensible export filenames.
     function videoFolderPath() {
@@ -52,6 +107,9 @@ ApplicationWindow {
     // a bare filename like "myvideo" still becomes "myvideo.mp4".
     function ensureSuffix(path, suffix) {
         var p = path.toString()
+        // A content:// URI is an opaque document id -- appending to it breaks
+        // it, and SAF has already fixed the real file name anyway.
+        if (p.indexOf("content://") === 0) return p
         return p.toLowerCase().endsWith("." + suffix) ? p : p + "." + suffix
     }
 
@@ -65,21 +123,22 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 0
 
+            // One "Open" per platform. Desktop: the ordinary file dialog
+            // (sidecars derive from the path). Android: everything goes
+            // through a granted folder instead -- a folder grant is the only
+            // way sidecars resolve and keyframes can be written back -- so a
+            // second file-picking "Open" button next to it only confused.
             ToolButton {
+                visible: !app.folder.available
                 text: qsTr("Open")
                 icon.name: "document-open"
                 onClicked: fileDialog.open()
             }
 
-            // Android only: grant a whole folder once (Storage Access
-            // Framework tree). Sidecars then resolve by name and keyframes can
-            // be written back -- neither is possible with a single-file grant.
-            // On desktop the ordinary file dialog already does everything.
             ToolButton {
                 visible: app.folder.available
-                text: app.folder.hasFolder ? qsTr("Folder: ") + app.folder.folderName
-                                           : qsTr("Open Folder")
-                onClicked: app.folder.hasFolder ? clipListDialog.open() : app.folder.pickFolder()
+                text: app.folder.hasFolder ? app.folder.folderName : qsTr("Open…")
+                onClicked: window.openPrimary()
                 ToolTip.text: qsTr("Pick the folder your clips are in, once. Sidecars (.imu, _thm) are then found automatically and keyframes can be saved.")
                 ToolTip.visible: hovered
             }
@@ -100,7 +159,12 @@ ApplicationWindow {
                 icon.name: "camera-photo"
                 enabled: app.videoPath !== "" && !app.exportRunning
                 onClicked: {
-                    exportFrameDialog.currentFile = "file://" + videoFolderPath() + "/" + videoBaseName() + "_frame.png"
+                    // On Android only the NAME is meaningful: the save picker
+                    // chooses the location itself, and the old file:// prefill
+                    // put a content:// URI inside a path, which it rejected.
+                    exportFrameDialog.currentFile = Qt.platform.os === "android"
+                        ? videoBaseName() + "_frame.png"
+                        : "file://" + videoFolderPath() + "/" + videoBaseName() + "_frame.png"
                     exportFrameDialog.open()
                 }
             }
@@ -119,9 +183,11 @@ ApplicationWindow {
             Item { Layout.fillWidth: true }
 
             Label {
-                text: "Reframe360 Editor"
+                text: app.videoPath ? videoBaseName() : "Reframe360 Editor"
                 font.pixelSize: 18
                 font.bold: true
+                elide: Text.ElideMiddle
+                Layout.maximumWidth: 300
                 Layout.rightMargin: 16
             }
         }
@@ -136,6 +202,7 @@ ApplicationWindow {
         ViewerPane {
             Layout.fillWidth: true
             Layout.fillHeight: true
+            onOpenRequested: window.openPrimary()
         }
 
         // Collapse handle. The panel is 340 px of a phone's ~1200 logical
@@ -186,8 +253,8 @@ ApplicationWindow {
         Layout.fillWidth: true
     }
 
-    // The clips in the granted folder. Chosen by name, so the app can pair each
-    // one with its .imu / _thm / .keyframes.json inside the same grant.
+    // The clips in the granted folder. Chosen by name, so the app can pair
+    // each one with its .imu / _thm / .keyframes.json inside the same grant.
     Dialog {
         id: clipListDialog
         title: qsTr("Clips in ") + app.folder.folderName
@@ -197,15 +264,31 @@ ApplicationWindow {
         width: Math.min(520, (parent ? parent.width : 520) - 24)
         height: Math.min(560, (parent ? parent.height : 560) - 24)
         standardButtons: Dialog.Close
+        // Re-list every time: the camera may have been plugged in (or files
+        // copied) since the folder was granted.
+        onAboutToShow: app.folder.rescan()
+
+        // Small pill shown when a clip's sidecar is present.
+        component SidecarBadge: Label {
+            required property bool present
+            visible: present
+            font.pixelSize: 10
+            color: "#9fdc9f"
+            leftPadding: 6; rightPadding: 6
+            topPadding: 1; bottomPadding: 1
+            background: Rectangle { color: "#1f3a1f"; radius: 7 }
+        }
 
         ColumnLayout {
             anchors.fill: parent
             spacing: 8
 
             Label {
+                Layout.fillWidth: true
                 text: app.folder.clips.length > 0
                       ? qsTr("%1 clips").arg(app.folder.clips.length)
-                      : qsTr("No videos found in this folder.")
+                      : qsTr("No videos in this folder. Plug the camera in (or copy clips here), then reopen this list.")
+                wrapMode: Text.Wrap
                 color: "#bbb"
                 font.pixelSize: 12
             }
@@ -218,20 +301,63 @@ ApplicationWindow {
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
                     width: ListView.view.width
-                    text: modelData
+                    highlighted: modelData === window.currentClipName
                     onClicked: {
+                        window.currentClipName = modelData
                         app.openClipFromFolder(modelData)
                         clipListDialog.close()
+                    }
+                    contentItem: RowLayout {
+                        spacing: 8
+                        Label {
+                            text: modelData
+                            elide: Text.ElideMiddle
+                            Layout.fillWidth: true
+                        }
+                        // What the folder holds for this clip. No sensor-data
+                        // badge means the clip cannot be stabilised.
+                        SidecarBadge { present: app.folder.imuFor(modelData) !== ""; text: qsTr("sensor") }
+                        SidecarBadge { present: app.folder.proxyFor(modelData) !== ""; text: qsTr("preview") }
+                        SidecarBadge { present: app.folder.keyframesFor(modelData) !== ""; text: qsTr("edits") }
                     }
                 }
             }
 
-            Button {
+            RowLayout {
                 Layout.fillWidth: true
-                text: qsTr("Choose a different folder…")
-                onClicked: { clipListDialog.close(); app.folder.pickFolder() }
+                spacing: 8
+                Button {
+                    Layout.fillWidth: true
+                    text: qsTr("Change folder…")
+                    onClicked: {
+                        clipListDialog.close()
+                        window.folderPickPending = true
+                        app.folder.pickFolder()
+                    }
+                }
+                // Escape hatch for a clip outside any folder (e.g. shared into
+                // Downloads): the old multi-select file picker.
+                Button {
+                    Layout.fillWidth: true
+                    text: qsTr("Open files instead…")
+                    onClicked: { clipListDialog.close(); fileDialog.open() }
+                }
             }
         }
+    }
+
+    // Transient error notice (folder pick failures and the like).
+    Popup {
+        id: folderToast
+        parent: Overlay.overlay
+        x: (parent.width - width) / 2
+        y: parent.height - height - 80
+        padding: 10
+        modal: false
+        function show(message) { toastLabel.text = message; open(); toastTimer.restart() }
+        Timer { id: toastTimer; interval: 4000; onTriggered: folderToast.close() }
+        contentItem: Label { id: toastLabel; color: "#ffb0b0" }
+        background: Rectangle { color: "#cc202020"; radius: 6; border.color: "#555" }
     }
 
     CalibrationDialog {
@@ -304,8 +430,10 @@ ApplicationWindow {
             }
             // Only a proxy chosen? Then that IS the clip they want to view.
             if (video === "" && proxy !== "") { video = proxy; proxy = "" }
-            if (video !== "")
+            if (video !== "") {
+                window.currentClipName = ""
                 app.openClip(video, imu, proxy, keyframes)
+            }
         }
     }
 

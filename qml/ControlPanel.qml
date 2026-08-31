@@ -110,6 +110,19 @@ Item {
         }
     }
 
+    // A ScrollView that can be flicked by touch even where a slider sits
+    // under the finger: pressDelay holds the press back long enough for a
+    // flick to win, while press-and-hold (or any drag after the delay) still
+    // goes to the slider. Desktop keeps instant presses.
+    component PanelScroll: ScrollView {
+        contentWidth: availableWidth
+        clip: true
+        Component.onCompleted: {
+            if (Qt.platform.os === "android" && contentItem instanceof Flickable)
+                contentItem.pressDelay = 120
+        }
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -165,9 +178,7 @@ Item {
             currentIndex: panelTabs.currentIndex
 
             // =========================== View ===========================
-            ScrollView {
-                contentWidth: availableWidth
-                clip: true
+            PanelScroll {
 
                 ColumnLayout {
                     width: parent.width
@@ -252,9 +263,7 @@ Item {
             }
 
             // ========================= Stabilise =========================
-            ScrollView {
-                contentWidth: availableWidth
-                clip: true
+            PanelScroll {
 
                 ColumnLayout {
                     width: parent.width
@@ -276,6 +285,41 @@ Item {
                                 checked: app.imuStabilize
                                 onCheckedChanged: app.imuStabilize = checked
                             }
+
+                            // Auto sync first: it is the one per-clip action
+                            // (aligns the sensor clock to the video, then adds
+                            // optical yaw correction) and it must be reachable
+                            // without scrolling on a phone.
+                            RowLayout {
+                                enabled: imuCheck.checked
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Button {
+                                    text: qsTr("Auto sync")
+                                    enabled: !app.autoSyncRunning && imuCheck.checked
+                                    onClicked: app.autoSyncAndCalibrate()
+                                    ToolTip.text: qsTr("Aligns the motion sensor to the video by tracking the picture, then adds optical yaw-drift correction. Takes ~20 s on a 2-minute clip.")
+                                    ToolTip.visible: hovered
+                                }
+                                Label {
+                                    id: autoSyncLabel
+                                    text: app.autoSyncRunning
+                                          ? qsTr("Syncing… %1%").arg((app.autoSyncProgress * 100).toFixed(0))
+                                          : (app.autoSyncStatus.length ? app.autoSyncStatus
+                                                                       : qsTr("Sync offset %1 s").arg(app.imuSyncOffset.toFixed(3)))
+                                    font.pixelSize: 11
+                                    color: app.autoSyncRunning ? "#aaa" : "#8f8"
+                                    Layout.fillWidth: true
+                                    Layout.preferredWidth: 0
+                                    Layout.minimumWidth: 0
+                                    elide: Text.ElideRight
+                                    HoverHandler { id: autoSyncHover }
+                                    ToolTip.text: autoSyncLabel.text
+                                    ToolTip.visible: autoSyncHover.hovered && autoSyncLabel.truncated
+                                }
+                            }
+
+                            Rectangle { Layout.fillWidth: true; height: 1; color: "#444"; Layout.topMargin: 4 }
 
                             // The two behaviours used to be the ends of one slider with a
                             // hidden threshold at 0.9. They are different things, so they
@@ -311,39 +355,6 @@ Item {
                                 controlEnabled: imuCheck.checked && followMode.checked
                                 visible: followMode.checked
                                 tip: qsTr("How much of the camera's own motion to keep. Low = follows the camera closely, high = smooth, floaty motion.")
-                            }
-
-                            Rectangle { Layout.fillWidth: true; height: 1; color: "#444"; Layout.topMargin: 4 }
-
-                            // Auto sync: aligns the sensor clock to the video and runs the
-                            // optical yaw correction. Everything else is automatic.
-                            RowLayout {
-                                enabled: imuCheck.checked
-                                Layout.fillWidth: true
-                                spacing: 8
-                                Button {
-                                    text: qsTr("Auto sync")
-                                    enabled: !app.autoSyncRunning && imuCheck.checked
-                                    onClicked: app.autoSyncAndCalibrate()
-                                    ToolTip.text: qsTr("Aligns the motion sensor to the video by tracking the picture, then adds optical yaw-drift correction. Takes ~20 s on a 2-minute clip.")
-                                    ToolTip.visible: hovered
-                                }
-                                Label {
-                                    id: autoSyncLabel
-                                    text: app.autoSyncRunning
-                                          ? qsTr("Syncing… %1%").arg((app.autoSyncProgress * 100).toFixed(0))
-                                          : (app.autoSyncStatus.length ? app.autoSyncStatus
-                                                                       : qsTr("Sync offset %1 s").arg(app.imuSyncOffset.toFixed(3)))
-                                    font.pixelSize: 11
-                                    color: app.autoSyncRunning ? "#aaa" : "#8f8"
-                                    Layout.fillWidth: true
-                                    Layout.preferredWidth: 0
-                                    Layout.minimumWidth: 0
-                                    elide: Text.ElideRight
-                                    HoverHandler { id: autoSyncHover }
-                                    ToolTip.text: autoSyncLabel.text
-                                    ToolTip.visible: autoSyncHover.hovered && autoSyncLabel.truncated
-                                }
                             }
 
                             Disclosure {
@@ -410,9 +421,7 @@ Item {
             }
 
             // =========================== Stitch ===========================
-            ScrollView {
-                contentWidth: availableWidth
-                clip: true
+            PanelScroll {
 
                 ColumnLayout {
                     width: parent.width
@@ -567,9 +576,7 @@ Item {
             }
 
             // =========================== Colour ===========================
-            ScrollView {
-                contentWidth: availableWidth
-                clip: true
+            PanelScroll {
 
                 ColumnLayout {
                     width: parent.width

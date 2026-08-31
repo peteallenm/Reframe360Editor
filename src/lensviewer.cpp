@@ -223,17 +223,33 @@ QSGNode *LensViewer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         if (frameKey != m_lastFrameTimestamp) {
             m_lastFrameTimestamp = frameKey;
 
-            // These .copy() calls are REQUIRED, not waste. Removing them
-            // segfaults on the RHI backend: createTextureFromImage() does not
-            // upload synchronously, it wraps the QImage in a QSGPlainTexture
-            // and defers the upload to commit time on the render thread. A
-            // QImage constructed over `frame`'s buffer is dangling by then,
-            // because `frame` goes out of scope at the end of this function.
-            // (Verified: reverting this crashes on load with a real GL
-            // context; the offscreen platform does not exercise the path.)
-            QImage yImg = QImage(reinterpret_cast<const uchar*>(frame.yData.constData()), frame.width, frame.height, frame.yStride, QImage::Format_Grayscale8).copy();
-            QImage uImg = QImage(reinterpret_cast<const uchar*>(frame.uData.constData()), frame.width / 2, frame.height / 2, frame.uStride, QImage::Format_Grayscale8).copy();
-            QImage vImg = QImage(reinterpret_cast<const uchar*>(frame.vData.constData()), frame.width / 2, frame.height / 2, frame.vStride, QImage::Format_Grayscale8).copy();
+            // The frame is HELD, not copied. createTextureFromImage() does
+            // not upload synchronously -- it wraps the QImage in a
+            // QSGPlainTexture and defers the upload to commit time on the
+            // render thread -- so a QImage built over the local `frame`, which
+            // dies at the end of this function, was dangling by then. The old
+            // fix was .copy() on each plane: ~25 MB of memcpy per painted
+            // frame at 2880x5760, three times over.
+            //
+            // DecodedFrame holds QByteArrays, which are implicitly shared, so
+            // keeping one as a member costs three refcount increments and
+            // keeps the pixels alive for as long as we need them. The decoder
+            // builds a fresh DecodedFrame per iteration rather than writing
+            // into the old buffers, so what we hold can never be overwritten
+            // underneath the pending upload. The previous frame is held for
+            // one extra paint as well, in case its upload has not committed.
+            m_prevHeldFrame = m_heldFrame;
+            m_heldFrame = frame;
+
+            QImage yImg(reinterpret_cast<const uchar *>(m_heldFrame.yData.constData()),
+                        m_heldFrame.width, m_heldFrame.height, m_heldFrame.yStride,
+                        QImage::Format_Grayscale8);
+            QImage uImg(reinterpret_cast<const uchar *>(m_heldFrame.uData.constData()),
+                        m_heldFrame.width / 2, m_heldFrame.height / 2, m_heldFrame.uStride,
+                        QImage::Format_Grayscale8);
+            QImage vImg(reinterpret_cast<const uchar *>(m_heldFrame.vData.constData()),
+                        m_heldFrame.width / 2, m_heldFrame.height / 2, m_heldFrame.vStride,
+                        QImage::Format_Grayscale8);
 
             delete m_yTexture;
             delete m_uTexture;

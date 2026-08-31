@@ -1,4 +1,7 @@
 #include "exporter.h"
+extern "C" {
+#include <libavutil/spherical.h>
+}
 
 #include <QImage>
 #include <QThread>
@@ -547,7 +550,8 @@ public:
 
     bool open(const QString &path, int w, int h, double fps,
               const QString &codecName, int crf, int bitrateMbps,
-              const QString &title, const QString &comment, QString *error);
+              const QString &title, const QString &comment, bool spherical,
+              QString *error);
     bool writeFrame(const QImage &rgb, QString *error);
     bool finish(QString *error);
 
@@ -575,7 +579,8 @@ VideoWriter::~VideoWriter()
 
 bool VideoWriter::open(const QString &path, int w, int h, double fps,
                        const QString &codecName, int crf, int bitrateMbps,
-                       const QString &title, const QString &comment, QString *error)
+                       const QString &title, const QString &comment, bool spherical,
+                       QString *error)
 {
     const int den = qMax(1, qRound(fps * 1000.0));
     m_tb = AVRational{1000, den};
@@ -594,7 +599,22 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
         return false;
     }
 
-    const AVCodec *codec = avcodec_find_encoder_by_name(codecName.toUtf8().constData());
+    QString effectiveCodec = codecName;
+#ifdef Q_OS_ANDROID
+    // The phone's hardware encoders top out around 4096x2304, and they fail
+    // at avcodec_open2 time rather than falling back. Above the cap, route
+    // straight to the software encoder (libx264 -- H.264 level 6 covers
+    // 5760x2880); the export dialog warns that this is many times slower.
+    if ((w > 4096 || h > 2304)
+        && (codecName == QLatin1String("h264_mediacodec")
+            || codecName == QLatin1String("hevc_mediacodec"))) {
+        effectiveCodec = QStringLiteral("libx264");
+        qInfo().noquote() << "Export:" << w << "x" << h
+                          << "exceeds the hardware encoder; using libx264 (software)";
+    }
+#endif
+
+    const AVCodec *codec = avcodec_find_encoder_by_name(effectiveCodec.toUtf8().constData());
     if (!codec) {
         // Fall back only WITHIN the same format, and say so. The old code
         // silently substituted MPEG-4 whenever libx264 was missing, which on
@@ -608,10 +628,10 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
             { "hevc_nvenc", "hevc_mediacodec" },
         };
         for (const auto &e : kEquivalents) {
-            if (codecName == QLatin1String(e.want)) {
+            if (effectiveCodec == QLatin1String(e.want)) {
                 codec = avcodec_find_encoder_by_name(e.alt);
                 if (codec) {
-                    qInfo().noquote() << "Export:" << codecName << "is unavailable; using"
+                    qInfo().noquote() << "Export:" << effectiveCodec << "is unavailable; using"
                                       << e.alt << "(same format)";
                 }
                 break;
@@ -619,7 +639,7 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
         }
     }
     if (!codec) {
-        if (error) *error = QObject::tr("No video encoder available (%1)").arg(codecName);
+        if (error) *error = QObject::tr("No video encoder available (%1)").arg(effectiveCodec);
         return false;
     }
 
@@ -705,6 +725,29 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
 
     m_stream->time_base = m_tb;
     avcodec_parameters_from_context(m_stream->codecpar, m_enc);
+
+    // 360 tagging: attach an equirectangular AVSphericalMapping as stream
+    // side data; the MP4 muxer turns it into the Spatial Media V2 sv3d box
+    // (movenc mov_write_sv3d_tag), which is what YouTube and 360-aware
+    // players key on to render the file as an interactive sphere.
+    if (spherical) {
+        // movenc only writes sv3d under "unofficial" compliance (the box is a
+        // Google extension, not part of ISO BMFF proper) -- without this the
+        // side data is silently dropped at mux time.
+        m_fmt->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+        size_t sphSize = 0;
+        AVSphericalMapping *sph = av_spherical_alloc(&sphSize);
+        if (sph) {
+            sph->projection = AV_SPHERICAL_EQUIRECTANGULAR;
+            if (!av_packet_side_data_add(&m_stream->codecpar->coded_side_data,
+                                         &m_stream->codecpar->nb_coded_side_data,
+                                         AV_PKT_DATA_SPHERICAL,
+                                         sph, sphSize, 0))
+                av_freep(&sph);   // add failed: still ours to free
+            else
+                qInfo() << "Export tagged as 360 equirectangular (sv3d)";
+        }
+    }
     av_opt_set(m_fmt->priv_data, "movflags", "+faststart", 0);  // ignore if unsupported
 
     // Embed useful metadata (input filename + export summary). creation_time
@@ -1020,7 +1063,7 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
 
         VideoWriter aw;
         if (aw.open(analysisPath, aW, aH, fpsd, QStringLiteral("libx264"),
-                    23, 4, QString(), QString(), &err)) {
+                    23, 4, QString(), QString(), /*spherical*/ false, &err)) {
             const int aFrames = renderPass(aw, aW, aH, /*withFlow*/ false, 0.0, 0.25);
             QString ferr;
             aw.finish(&ferr);
@@ -1083,7 +1126,7 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     VideoWriter writer;
     if (!writer.open(outFile, width, height, fpsd, settings.codec,
                      settings.crf, settings.bitrateMbps,
-                     srcInfo.fileName(), comment, &err)) {
+                     srcInfo.fileName(), comment, settings.spherical, &err)) {
         fail(err);
         return;
     }

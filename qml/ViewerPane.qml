@@ -7,6 +7,10 @@ import Render360 1.0
 Item {
     id: viewerPane
 
+    // Emitted by the empty-state button; main.qml routes it to the platform's
+    // open flow (folder on Android, file dialog on desktop).
+    signal openRequested()
+
     Rectangle {
         anchors.fill: parent
         color: "#1a1a1a"
@@ -67,12 +71,40 @@ Item {
             }
         }
 
-        Label {
+        // Empty state: a first launch used to be a black screen with a
+        // passive sentence, and on Android nothing hinted that a FOLDER (not
+        // a file) is what gets opened. The action itself is the hint.
+        Column {
             anchors.centerIn: parent
-            text: qsTr("Open a 360 video to begin")
-            font.pixelSize: 24
-            color: "#888888"
+            spacing: 16
             visible: !app.videoPath && !app.loadError
+
+            Label {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: qsTr("Open a 360 video to begin")
+                font.pixelSize: 24
+                color: "#888888"
+            }
+            Label {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: app.folder.available
+                width: Math.min(viewerPane.width * 0.8, 460)
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+                text: app.folder.hasFolder
+                      ? qsTr("Your folder \u201c%1\u201d is connected. The sensor data and preview files next to each clip are found automatically.").arg(app.folder.folderName)
+                      : qsTr("Pick the folder your clips are in (the camera's DCIM folder, or wherever you copied them). The sensor data and preview files next to each clip are found automatically.")
+                font.pixelSize: 13
+                color: "#666666"
+            }
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                highlighted: true
+                text: app.folder.available
+                      ? (app.folder.hasFolder ? qsTr("Choose a clip…") : qsTr("Open folder…"))
+                      : qsTr("Open video…")
+                onClicked: viewerPane.openRequested()
+            }
         }
 
         // A failed open used to be invisible: the error signal went nowhere and

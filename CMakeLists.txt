@@ -47,10 +47,13 @@ if(ANDROID)
     set(FFMPEG_LIBRARIES
         "${_ff}/lib/libavformat.a"
         "${_ff}/lib/libavcodec.a"
+        # Software H.264 encoder (5.7K exports exceed MediaCodec's ~4K cap).
+        # After avcodec, which depends on it.
+        "${_ff}/lib/libx264.a"
         "${_ff}/lib/libswscale.a"
         "${_ff}/lib/libavutil.a"
         # MediaCodec decode/encode wrappers call into the Android media NDK.
-        mediandk android log z)
+        mediandk android log z m)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
@@ -193,7 +196,7 @@ if(ANDROID)
     set_property(TARGET render360 PROPERTY QT_ANDROID_TARGET_SDK_VERSION 36)
     set_property(TARGET render360 PROPERTY QT_ANDROID_MIN_SDK_VERSION 28)
     set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_NAME "1.0.0")
-    set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_CODE 1)
+    set_property(TARGET render360 PROPERTY QT_ANDROID_VERSION_CODE 2)
 
     # To point a release APK at a clip for testing, configure with
     #   -DQT_ANDROID_APPLICATION_ARGUMENTS="-i /sdcard/.../clip.MP4 --imu"
@@ -228,3 +231,19 @@ target_compile_definitions(render360 PRIVATE
     QT_DEPRECATED_WARNINGS
     QT_DISABLE_DEPRECATED_BEFORE=0x060000
 )
+
+# --- Linux/desktop naming and installation ---------------------------------
+# The CMake target stays "render360" (the QML module URI, the Android library
+# name androiddeployqt writes into the manifest, and every build command in the
+# docs depend on it). Only the produced BINARY is renamed, and only off Android.
+if(NOT ANDROID)
+    set_target_properties(render360 PROPERTIES OUTPUT_NAME "reframe360-editor")
+
+    include(GNUInstallDirs)
+    install(TARGETS render360 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES resources/reframe360-editor.desktop
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(FILES resources/icon-512.png
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/512x512/apps
+            RENAME reframe360-editor.png)
+endif()

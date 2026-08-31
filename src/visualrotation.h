@@ -99,6 +99,12 @@ private:
         double timestamp;
         cv::Mat grayFront;    // grayscale front fisheye half
         cv::Mat grayRear;     // grayscale rear fisheye half
+        // Dimensions of those halves, kept separately because the pixel data
+        // is RELEASED once ORB has run: after feature extraction nothing reads
+        // the images again, only their size. Holding 1400 frame pairs at
+        // 640x720 was ~645 MB, which a phone cannot spare.
+        int halfWidth = 0;
+        int halfHeight = 0;
     };
 
     // ORB output for one frame, computed ONCE up front. The adaptive hop search

@@ -130,6 +130,18 @@ private:
     QQuaternion m_imuOrientation;
 
     QSGTexture *m_yTexture;
+
+    // The decoded frames whose pixels the current (and previous) textures
+
+    // were built over. QByteArray is implicitly shared, so holding them is
+
+    // three refcounts, not a copy -- and it keeps the data alive until the
+
+    // deferred texture upload has committed.
+
+    DecodedFrame m_heldFrame;
+
+    DecodedFrame m_prevHeldFrame;
     QSGTexture *m_uTexture;
     QSGTexture *m_vTexture;
     int m_lastFrameTimestamp;
