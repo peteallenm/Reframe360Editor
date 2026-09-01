@@ -14,6 +14,7 @@
 #include <QObject>
 #include <QAbstractListModel>
 #include <QVector>
+#include <QJsonObject>
 #include <QMatrix3x3>
 #include <QVector3D>
 #include <algorithm>
@@ -174,6 +175,12 @@ private:
     QMatrix3x3 m_gyroMatrix;   // default identity
     QVector3D m_gyroBias;      // default zero
     bool m_hasGyroCalibration = false;
+    // Top-level sidecar keys this build does not understand, kept verbatim so
+    // saving does not delete a newer build's data. The sidecar travels between
+    // desktop and phone, which are not always the same version, and saveToFile
+    // rebuilds the whole document from members -- without this, the older of
+    // the two silently drops whatever the newer one added.
+    QJsonObject m_unknownKeys;
 };
 
 #endif // KEYFRAME_H

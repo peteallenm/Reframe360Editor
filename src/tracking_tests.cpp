@@ -23,6 +23,7 @@
 #include "gyrocalibration.h"
 #include "visualfusion.h"
 #include "keyframe.h"
+#include <QDir>
 #include <QFile>
 #include <QTextStream>
 #include <QJsonDocument>
@@ -2038,6 +2039,55 @@ static void testGyroIntegrator(const QString &video)
 // ---------------------------------------------------------------------------
 // Test 3: Bearing back-projection — center/edges map to expected directions
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Sidecar: keys this build does not understand must survive a load/save cycle.
+// The sidecar moves between desktop and phone, which are not always the same
+// version, and saveToFile rebuilds the document from members -- so without
+// preservation the older build silently deletes whatever the newer one wrote.
+// ---------------------------------------------------------------------------
+static void testSidecarUnknownKeys()
+{
+    const QString path = QDir::temp().filePath(QStringLiteral("r360_sidecar_test.json"));
+    QFile::remove(path);
+
+    // A sidecar as some future build might write it: known keys plus two this
+    // build has never heard of, one of them a non-trivial array.
+    QJsonObject future{
+        {"version", 6},
+        {"in", 1.5},
+        {"out", 9.5},
+        {"keyframes", QJsonArray{ QJsonObject{{"time", 0.0}, {"yaw", 10.0},
+                                              {"pitch", 5.0}, {"roll", 0.0}, {"fov", 80.0}} }},
+        {"tracks", QJsonArray{ QJsonObject{{"id", "t1"}, {"start", 2.0}, {"lost", true}} }},
+        {"someFutureScalar", 42.0},
+    };
+    {
+        QFile f(path);
+        f.open(QIODevice::WriteOnly);
+        f.write(QJsonDocument(future).toJson(QJsonDocument::Indented));
+    }
+
+    KeyframeModel kf;
+    kf.loadFromFile(path);
+    const bool readKnown = kf.rowCount() == 1 && qFuzzyCompare(kf.trimIn(), 1.5);
+    kf.saveToFile(path);
+
+    QFile f(path);
+    f.open(QIODevice::ReadOnly);
+    const QJsonObject after = QJsonDocument::fromJson(f.readAll()).object();
+
+    const bool keptTracks = after.value("tracks").toArray().size() == 1
+                         && after.value("tracks").toArray()[0].toObject()
+                                 .value("id").toString() == QStringLiteral("t1");
+    const bool keptScalar = qFuzzyCompare(after.value("someFutureScalar").toDouble(), 42.0);
+    const bool keptOwn    = after.value("keyframes").toArray().size() == 1;
+
+    report("Sidecar preserves unknown keys", readKnown && keptTracks && keptScalar && keptOwn,
+           QStringLiteral("known=%1 tracks=%2 scalar=%3 keyframes=%4")
+               .arg(readKnown).arg(keptTracks).arg(keptScalar).arg(keptOwn));
+    QFile::remove(path);
+}
+
 static void testBearingBackProjection()
 {
     // Reimplement the front/rear expectation based on the shader model.
@@ -2418,6 +2468,9 @@ int main(int argc, char *argv[])
 
         qInfo() << "--- Test 0b: calibration acceptance gates ---";
         testCalibrationGates();
+
+        qInfo() << "--- Test 0c: sidecar forward-compatibility ---";
+        testSidecarUnknownKeys();
 
         qInfo() << "--- Test 1: IMU parser ---";
         testImuParser(video);

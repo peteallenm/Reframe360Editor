@@ -299,6 +299,11 @@ void KeyframeModel::saveToFile(const QString &path) const
         root.insert(QStringLiteral("gyroBias"), biasArr);
     }
 
+    // Anything a newer build wrote and this one does not parse, put back.
+    for (auto it = m_unknownKeys.constBegin(); it != m_unknownKeys.constEnd(); ++it)
+        if (!root.contains(it.key()))
+            root.insert(it.key(), it.value());
+
     QFile f(path);
     if (f.open(QIODevice::WriteOnly))
         f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
@@ -314,6 +319,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     QMatrix3x3 gyroMatrix;    // default identity
     QVector3D gyroBias;       // default zero
     bool hasGyroCalibration = false;
+    QJsonObject unknown;
     int expWidth = m_exportWidth;
     int expHeight = m_exportHeight;
     double expFps = m_exportFps;
@@ -379,6 +385,18 @@ void KeyframeModel::loadFromFile(const QString &path)
             if (exp.contains("vidstabInformed")) expVidstabInformed = exp.value("vidstabInformed").toBool();
             if (exp.contains("fileName") && !exp.value("fileName").toString().isEmpty())
                 expFileName = exp.value("fileName").toString();
+
+            // Keep what this build does not know about (see m_unknownKeys).
+            static const QStringList known = {
+                QStringLiteral("version"),   QStringLiteral("in"),
+                QStringLiteral("out"),       QStringLiteral("export"),
+                QStringLiteral("keyframes"), QStringLiteral("imuDrift"),
+                QStringLiteral("syncOffset"), QStringLiteral("gyroMatrix"),
+                QStringLiteral("gyroBias"),
+            };
+            for (auto it = root.constBegin(); it != root.constEnd(); ++it)
+                if (!known.contains(it.key()))
+                    unknown.insert(it.key(), it.value());
         }
     }
     std::sort(loaded.begin(), loaded.end());
@@ -414,6 +432,7 @@ void KeyframeModel::loadFromFile(const QString &path)
         && qFuzzyCompare(imuDrift, m_imuDrift)
         && qFuzzyCompare(syncOffset, m_syncOffset)
         && hasGyroCalibration == m_hasGyroCalibration
+        && unknown == m_unknownKeys
         && exportUnchanged)
         return;
 
@@ -429,6 +448,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     m_gyroMatrix = gyroMatrix;
     m_gyroBias = gyroBias;
     m_hasGyroCalibration = hasGyroCalibration;
+    m_unknownKeys = unknown;
     m_exportWidth = expWidth;
     m_exportHeight = expHeight;
     m_exportFps = expFps;
