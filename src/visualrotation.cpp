@@ -91,6 +91,13 @@ StreamFacts probeStream(const QString &path)
 
 QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath) const
 {
+    return chooseDecodeSource(videoPath, m_decodeOverride, TARGET_WIDTH);
+}
+
+QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath,
+                                                   const QString &m_decodeOverride,
+                                                   int minWidth)
+{
     if (!qgetenv("RENDER360_NO_PROXY").isEmpty())
         return videoPath;
 
@@ -115,7 +122,7 @@ QString VisualRotationComputer::chooseDecodeSource(const QString &videoPath) con
     // proxy must still be at least as wide as the analysis resolution.
     const bool sameFrames = (a.frames > 0 && a.frames == b.frames);
     const bool sameDuration = std::abs(a.duration - b.duration) < 0.05;
-    const bool bigEnough = b.w >= TARGET_WIDTH;
+    const bool bigEnough = b.w >= minWidth;
     if (sameFrames && sameDuration && bigEnough) {
         qInfo() << "VisualRotation: decoding proxy" << QFileInfo(proxy).fileName()
                 << "(" << b.w << "x" << b.h << "," << b.frames << "frames) in place of the"

@@ -25,6 +25,7 @@
 #include "keyframe.h"
 #include "projection.h"
 #include "track.h"
+#include "objecttracker.h"
 #include <QRandomGenerator>
 #include <cstring>
 #include <QDir>
@@ -2531,6 +2532,246 @@ static void testTrackJson()
                .arg(jsonBytes / 1024).arg(worstUv, 0, 'g', 2).arg(worstT, 0, 'g', 2));
 }
 
+// ---------------------------------------------------------------------------
+// The tracker itself, with ground truth. A textured blob sits at a KNOWN world
+// direction; the camera pans and shakes; frames are synthesised into a stacked
+// dual-fisheye luma buffer. The tracker must recover that world direction
+// whatever the camera did -- which is the whole promise of tracking on a
+// stabilised tile.
+// ---------------------------------------------------------------------------
+namespace synth {
+
+constexpr int kW = 360;              // stacked frame: 360x720, two 360x360 halves
+constexpr int kH = 720;
+
+// Deterministic high-contrast texture in coordinates NORMALISED to the blob,
+// so a bigger blob is genuinely a scaled version of the same subject. (A
+// fixed pixel-space pattern is a different texture at every size, which no
+// scale estimator could or should match.)
+inline uchar blobTexel(double nx, double ny)
+{
+    const int qx = (int)std::floor(nx * 7.0), qy = (int)std::floor(ny * 7.0);
+    const int cell = (qx + qy) & 1;
+    const int fine = ((qx * 7 + qy * 13) & 31);
+    return (uchar)(cell ? 200 + (fine >> 3) : 40 + (fine >> 2));
+}
+
+// Paint one frame: bland background, one blob at `worldDir` as the camera at
+// `qAct` sees it. Returns false if the blob is not visible.
+inline bool render(QVector<uchar> &buf, const QVector3D &worldDir, double radiusRad,
+                   const QQuaternion &qAct, const TrackLenses &lenses)
+{
+    buf.fill(118);
+    for (int i = 0; i < buf.size(); i += 7)          // faint texture everywhere
+        buf[i] = (uchar)(112 + (i % 11));
+
+    const QVector3D cam = qAct.conjugated().rotatedVector(worldDir.normalized());
+    double theta, phi;
+    proj::dirToThetaPhi(proj::Vec3{cam.x(), cam.y(), cam.z()}, theta, phi);
+    const bool front = theta <= M_PI * 0.5;
+    const auto &lp = front ? lenses.front : lenses.rear;
+    double u, v;
+    proj::lensUv(front, theta, phi,
+                 proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                      lp.rotation, lp.hflip), u, v);
+    if (u < 0.02 || u > 0.98 || v < 0.02 || v > 0.98) return false;
+
+    const double px = u * kW;
+    const double py = proj::stackedV(front, v) * kH;
+    // Angular radius -> pixels, only to bound the loop.
+    const int rad = (int)qRound(radiusRad / (M_PI * 0.5) * lp.radius * kW);
+    if (rad < 6) return false;
+
+    // The subject is a textured disc ON THE SPHERE, painted by inverse-mapping
+    // each candidate pixel back to a bearing. Painting a flat circle in image
+    // space instead would deform it near the fisheye rim in a way no real
+    // object does -- which reads as tracker drift that is not there.
+    const QVector3D fwd = worldDir.normalized();
+    QVector3D upRef(0.0f, 1.0f, 0.0f);
+    if (std::fabs(QVector3D::dotProduct(fwd, upRef)) > 0.99f) upRef = QVector3D(0, 0, 1);
+    const QVector3D bx = QVector3D::crossProduct(upRef, fwd).normalized();
+    const QVector3D by = QVector3D::crossProduct(fwd, bx).normalized();
+    const double tanR = std::tan(radiusRad);
+
+    VisualRotationComputer::LensParams lpFront = lenses.front, lpRear = lenses.rear;
+    const int box = (int)(rad * 1.8) + 2;
+    bool painted = false;
+    for (int y = (int)py - box; y <= (int)py + box; ++y) {
+        if (y < 0 || y >= kH) continue;
+        for (int x = (int)px - box; x <= (int)px + box; ++x) {
+            if (x < 0 || x >= kW) continue;
+            const double su = (x + 0.5) / kW;
+            const double sv = (y + 0.5) / kH;
+            const bool topHalf = sv < 0.5;
+            const double halfV = topHalf ? sv * 2.0 : (sv - 0.5) * 2.0;
+            const QVector3D cam = VisualRotationComputer::pixelToBearing(
+                su, halfV, topHalf ? lpFront : lpRear);
+            const QVector3D world = qAct.rotatedVector(cam).normalized();
+            const double along = QVector3D::dotProduct(world, fwd);
+            if (along <= 0.0) continue;
+            const double nx = QVector3D::dotProduct(world, bx) / along / tanR;
+            const double ny = QVector3D::dotProduct(world, by) / along / tanR;
+            if (nx * nx + ny * ny > 1.0) continue;
+            buf[y * kW + x] = blobTexel((nx + 1.0) * 0.5, (ny + 1.0) * 0.5);
+            painted = true;
+        }
+    }
+    return painted;
+}
+
+} // namespace synth
+
+static void testTileTrackerGroundTruth()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth = QVector3D(0.30f, 0.10f, -0.95f).normalized();
+    const double radius = proj::degToRad(7.0);
+
+    // 30 deg/s pan with a 10 Hz, 1.5 deg shake -- a handheld camera.
+    auto camAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(30.0 * t))
+             * QQuaternion::fromAxisAndAngle(1, 0, 0,
+                   (float)(1.5 * std::sin(2 * M_PI * 10.0 * t)));
+    };
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = radius;
+
+    QElapsedTimer clock;
+    clock.start();
+    double worstDeg = 0.0;
+    int tracked = 0, stepped = 0, rejected = 0, notRendered = 0;
+    QString err, lossWhy;
+    bool seeded = false, lost = false;
+
+    // Two seconds of pan: any longer and the subject leaves the lens, which is
+    // a different test (see the loss case).
+    for (int i = 0; i < 60; ++i) {
+        const double t = i / 30.0;
+        const QQuaternion q = camAt(t);
+        if (!synth::render(buf, truth, radius, q, lenses)) { ++notRendered; continue; }
+
+        if (!seeded) {
+            cfg.seedDirCam = q.conjugated().rotatedVector(truth);
+            seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                   synth::kW, q, t, &err);
+            if (!seeded) break;
+            continue;
+        }
+        ++stepped;
+        const TileTracker::Step st = tracker.step(buf.constData(), synth::kW, synth::kH,
+                                                  synth::kW, q, t);
+        if (st == TileTracker::Step::Lost) { lost = true; lossWhy = tracker.lossReason(); break; }
+        if (st != TileTracker::Step::Ok) { ++rejected; continue; }
+
+        const double dot = qBound(-1.0f, QVector3D::dotProduct(tracker.worldDir().normalized(),
+                                                                truth), 1.0f);
+        worstDeg = qMax(worstDeg, std::acos(dot) * 180.0 / M_PI);
+        ++tracked;
+    }
+
+    const double msPerFrame = tracked > 0 ? (double)clock.elapsed() / tracked : 0.0;
+    report("Tracker recovers a fixed world bearing under camera motion",
+           seeded && !lost && tracked > 50 && worstDeg < 0.5,
+           QStringLiteral("%1 ok of %2 stepped (%3 rejected, %4 not rendered), "
+                          "worst %5 deg, %6 ms/frame%7%8")
+               .arg(tracked).arg(stepped).arg(rejected).arg(notRendered)
+               .arg(worstDeg, 0, 'f', 3).arg(msPerFrame, 0, 'f', 2)
+               .arg(lost ? QStringLiteral(", LOST: ") + lossWhy : QString())
+               .arg(seeded ? QString() : QStringLiteral(", seed failed: ") + err));
+}
+
+static void testTileTrackerLoss()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth = QVector3D(0.0f, 0.0f, -1.0f);
+    const double radius = proj::degToRad(7.0);
+    auto camAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(10.0 * t));
+    };
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = radius;
+    QString err;
+    bool seeded = false;
+    double lostAt = -1.0;
+    int after = 0;
+
+    for (int i = 0; i < 90; ++i) {
+        const double t = i / 30.0;
+        const QQuaternion q = camAt(t);
+        // The subject is painted out at 1 s: occluded, gone.
+        const bool present = t < 1.0;
+        if (present) {
+            if (!synth::render(buf, truth, radius, q, lenses)) continue;
+        } else {
+            buf.fill(118);
+            for (int k = 0; k < buf.size(); k += 7) buf[k] = (uchar)(112 + (k % 11));
+        }
+
+        if (!seeded) {
+            cfg.seedDirCam = q.conjugated().rotatedVector(truth);
+            seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                   synth::kW, q, t, &err);
+            continue;
+        }
+        const TileTracker::Step st = tracker.step(buf.constData(), synth::kW, synth::kH,
+                                                  synth::kW, q, t);
+        if (st == TileTracker::Step::Lost) { lostAt = t; break; }
+        if (t > 1.0) ++after;      // frames it kept "tracking" after it vanished
+    }
+
+    report("Tracker gives up when the subject disappears",
+           seeded && lostAt > 1.0 && lostAt < 1.35,
+           QStringLiteral("lost at %1 s (subject vanished at 1.00 s), %2 frames of coasting")
+               .arg(lostAt, 0, 'f', 2).arg(after));
+}
+
+static void testTileTrackerScale()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth = QVector3D(0.0f, 0.0f, -1.0f);
+    auto camAt = [](double) { return QQuaternion(); };
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = proj::degToRad(6.0);
+    QString err, lossWhy;
+    bool seeded = false, lost = false;
+    int lostAtFrame = -1;
+
+    for (int i = 0; i < 90; ++i) {
+        const double t = i / 30.0;
+        const double grow = 1.0 + 0.5 * (t / 3.0);        // x1.5 over 3 s
+        const double radius = proj::degToRad(6.0 * grow);
+        if (!synth::render(buf, truth, radius, camAt(t), lenses)) continue;
+        if (!seeded) {
+            cfg.seedDirCam = truth;
+            seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                   synth::kW, camAt(t), t, &err);
+            continue;
+        }
+        if (tracker.step(buf.constData(), synth::kW, synth::kH, synth::kW,
+                         camAt(t), t) == TileTracker::Step::Lost) {
+            lost = true; lossWhy = tracker.lossReason(); lostAtFrame = i; break;
+        }
+    }
+
+    const double ratio = tracker.scaleRatio();
+    report("Tracker follows the subject growing", seeded && !lost && ratio > 1.25 && ratio < 1.75,
+           QStringLiteral("subject grew x1.50, tracker measured x%1%2").arg(ratio, 0, 'f', 2)
+               .arg(lost ? QStringLiteral(", LOST at frame %1: %2").arg(lostAtFrame).arg(lossWhy)
+                         : QString()));
+}
+
 static void testSidecarUnknownKeys()
 {
     const QString path = QDir::temp().filePath(QStringLiteral("r360_sidecar_test.json"));
@@ -2961,6 +3202,11 @@ int main(int argc, char *argv[])
         qInfo() << "--- Test 0d: projection maths ---";
         testProjectionRefactor();
         testLensMapRoundTrip();
+
+        qInfo() << "--- Test 0f: object tracker (synthetic footage) ---";
+        testTileTrackerGroundTruth();
+        testTileTrackerLoss();
+        testTileTrackerScale();
 
         qInfo() << "--- Test 0e: object-track resolver ---";
         testTrackResolve();

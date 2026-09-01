@@ -1,0 +1,536 @@
+// Reframe360 Editor -- 360 video stabiliser and stitcher for dual-fisheye footage.
+// Copyright (C) 2026 Peter Allen
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software under the GNU General Public License, version
+// 3 or (at your option) any later version; see LICENSE for the full text.
+// It is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE.
+
+#include "objecttracker.h"
+#include "avinput.h"
+#include "projection.h"
+#include "visualrotation.h"
+
+#include <QElapsedTimer>
+#include <QFileInfo>
+#include <QThread>
+#include <QtMath>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+}
+
+#include <algorithm>
+#include <cmath>
+
+namespace {
+
+// --- tuning ---------------------------------------------------------------
+// Provisional: set from first principles and sanity-checked on synthetic
+// footage. They want re-fitting from measured distributions on real clips
+// (tracking_tests --track-stats) before anyone calls them final.
+constexpr int    kTemplate          = 48;    // template edge, px
+constexpr double kScaleStep         = 1.09;  // the +/- scale probed each frame
+constexpr double kScoreHardFloor    = 0.30;  // this bad for kHardRun frames
+constexpr int    kHardRun           = 2;     // ... two, so a single motion-blurred
+                                             // frame cannot end a good track
+constexpr double kScoreSoftFloor    = 0.45;  // this bad for kBadRun frames ends it
+constexpr int    kBadRun            = 5;
+constexpr int    kRejectRun         = 6;     // consecutive gated frames -> lost
+constexpr double kMinValidFraction  = 0.80;  // of the tile inside a lens circle
+constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
+constexpr double kMaxWorldSpeedDeg  = 40.0;  // object angular speed gate
+constexpr double kMaxScaleStepLog   = 0.223; // log(1.25) per frame
+constexpr double kSeamThetaDeg      = 90.0;
+constexpr double kSeamHysteresisDeg = 4.0;
+
+double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Bilinear sample of a luma plane, GL texel centres.
+double sampleY(const uchar *Y, int w, int h, int stride, double u, double v)
+{
+    const double x = clampd(u * w - 0.5, 0.0, w - 1.0);
+    const double y = clampd(v * h - 0.5, 0.0, h - 1.0);
+    const int x0 = (int)x, y0 = (int)y;
+    const int x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+    const double fx = x - x0, fy = y - y0;
+    const double a = Y[y0 * stride + x0], b = Y[y0 * stride + x1];
+    const double c = Y[y1 * stride + x0], d = Y[y1 * stride + x1];
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+}
+
+QVector3D toQ(const proj::Vec3 &v) { return QVector3D((float)v.x, (float)v.y, (float)v.z); }
+proj::Vec3 toV(const QVector3D &v) { return proj::Vec3{v.x(), v.y(), v.z()}; }
+
+// A gnomonic tile in the INERTIAL frame around `fwd`, sampled out of the
+// stacked dual-fisheye luma. World-up anchored, so camera roll never rotates
+// the patch.
+bool buildTile(const uchar *Y, int w, int h, int stride,
+               const TrackLenses &lenses, const QQuaternion &qAct,
+               const QVector3D &fwd, double pTan, int S, bool preferRear,
+               cv::Mat &out, double *validFraction)
+{
+    QVector3D up(0.0f, 1.0f, 0.0f);
+    if (std::fabs(QVector3D::dotProduct(fwd, up)) > 0.996f)
+        up = QVector3D(0.0f, 0.0f, 1.0f);          // near the poles
+    const QVector3D right = QVector3D::crossProduct(up, fwd).normalized();
+    const QVector3D tileUp = QVector3D::crossProduct(fwd, right).normalized();
+
+    out.create(S, S, CV_8U);
+    const QQuaternion qInv = qAct.conjugated();
+    const double half = S * 0.5;
+    int valid = 0;
+
+    // One lens for the whole tile: blending them here would ghost a near
+    // subject (the parallax the stitcher exists to fix) and NCC wants a clean
+    // patch. Hysteresis stops it flapping at the seam.
+    const double centreTheta = std::acos(clampd(-qInv.rotatedVector(fwd).z(), -1.0, 1.0))
+                             * 180.0 / M_PI;
+    const bool useRear = preferRear ? (centreTheta > kSeamThetaDeg - kSeamHysteresisDeg)
+                                    : (centreTheta > kSeamThetaDeg + kSeamHysteresisDeg);
+    const auto &lp = useRear ? lenses.rear : lenses.front;
+    const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                                     lp.rotation, lp.hflip);
+    double sum = 0.0;
+
+    for (int j = 0; j < S; ++j) {
+        uchar *row = out.ptr<uchar>(j);
+        const double ty = -((j + 0.5) - half) * pTan;      // row 0 is the top
+        for (int i = 0; i < S; ++i) {
+            const double tx = ((i + 0.5) - half) * pTan;
+            const QVector3D rayWorld = (fwd + right * (float)tx + tileUp * (float)ty).normalized();
+            const QVector3D rayCam = qInv.rotatedVector(rayWorld);
+            double theta, phi;
+            proj::dirToThetaPhi(toV(rayCam), theta, phi);
+            const bool inField = useRear ? (theta > M_PI * 0.5 - 0.02)
+                                         : (theta < M_PI * 0.5 + 0.02);
+            if (!inField) { row[i] = 0; continue; }
+            double u, v;
+            proj::lensUv(!useRear, theta, phi, geom, u, v);
+            if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) { row[i] = 0; continue; }
+            const double val = sampleY(Y, w, h, stride, u, proj::stackedV(!useRear, v));
+            row[i] = (uchar)clampd(val, 0.0, 255.0);
+            sum += val;
+            ++valid;
+        }
+    }
+
+    const double frac = (double)valid / (double)(S * S);
+    if (validFraction) *validFraction = frac;
+    if (valid == 0) return false;
+
+    // Invalid pixels get the tile mean rather than black: TM_CCOEFF_NORMED
+    // takes no mask, and a black wedge would dominate the correlation.
+    const uchar mean = (uchar)clampd(sum / valid, 0.0, 255.0);
+    for (int j = 0; j < S; ++j) {
+        uchar *row = out.ptr<uchar>(j);
+        for (int i = 0; i < S; ++i)
+            if (row[i] == 0) row[i] = mean;
+    }
+    return frac >= 0.10;
+}
+
+// The camera orientation at a time, from the pre-sampled chain.
+QQuaternion orientationAt(const TrackRequest &req, double t)
+{
+    const int n = req.camTimes.size();
+    if (n == 0) return QQuaternion();
+    if (t <= req.camTimes.first()) return req.camOrientations.first();
+    if (t >= req.camTimes.last()) return req.camOrientations.last();
+    int lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (req.camTimes[mid] <= t) lo = mid; else hi = mid;
+    }
+    const double span = req.camTimes[hi] - req.camTimes[lo];
+    const float f = span > 1e-9 ? (float)((t - req.camTimes[lo]) / span) : 0.0f;
+    return QQuaternion::slerp(req.camOrientations[lo], req.camOrientations[hi], f);
+}
+
+// A minimal sequential decoder: open, seek once, hand out luma frames.
+class LumaReader
+{
+public:
+    bool open(const QString &path, QString *error)
+    {
+        if (m_input.open(path) < 0) { if (error) *error = QObject::tr("cannot open video"); return false; }
+        m_fmt = m_input.fmt;
+        if (avformat_find_stream_info(m_fmt, nullptr) < 0) {
+            if (error) *error = QObject::tr("no stream info"); return false; }
+        m_stream = av_find_best_stream(m_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (m_stream < 0) { if (error) *error = QObject::tr("no video stream"); return false; }
+        const AVCodec *codec = avcodec_find_decoder(m_fmt->streams[m_stream]->codecpar->codec_id);
+        if (!codec) { if (error) *error = QObject::tr("no decoder"); return false; }
+        m_ctx = avcodec_alloc_context3(codec);
+        avcodec_parameters_to_context(m_ctx, m_fmt->streams[m_stream]->codecpar);
+        // Two threads: this runs alongside whatever else the app is doing, and
+        // handing a decoder every core measurably starves the other stage
+        // (see the note in exporter.cpp's DecodeReader::open).
+        m_ctx->thread_count = qBound(1, QThread::idealThreadCount() / 2, 2);
+        m_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        if (avcodec_open2(m_ctx, codec, nullptr) < 0) {
+            if (error) *error = QObject::tr("cannot open decoder"); return false; }
+        m_pkt = av_packet_alloc();
+        m_frame = av_frame_alloc();
+        return true;
+    }
+
+    void seek(double t)
+    {
+        const AVStream *st = m_fmt->streams[m_stream];
+        const int64_t ts = (int64_t)(t / av_q2d(st->time_base));
+        av_seek_frame(m_fmt, m_stream, ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(m_ctx);
+    }
+
+    // Next frame at or after `minTime`. False at end of stream.
+    bool next(double minTime, double *tOut)
+    {
+        const AVStream *st = m_fmt->streams[m_stream];
+        const double tb = av_q2d(st->time_base);
+        while (true) {
+            int ret = av_read_frame(m_fmt, m_pkt);
+            if (ret < 0) return false;
+            if (m_pkt->stream_index != m_stream) { av_packet_unref(m_pkt); continue; }
+            ret = avcodec_send_packet(m_ctx, m_pkt);
+            av_packet_unref(m_pkt);
+            if (ret < 0) continue;
+            while (true) {
+                ret = avcodec_receive_frame(m_ctx, m_frame);
+                if (ret < 0) break;
+                const double t = m_frame->best_effort_timestamp * tb;
+                if (t + 1e-6 >= minTime) { if (tOut) *tOut = t; return true; }
+                av_frame_unref(m_frame);
+            }
+        }
+    }
+
+    void release() { av_frame_unref(m_frame); }
+    const uchar *y() const { return m_frame->data[0]; }
+    int width() const { return m_frame->width; }
+    int height() const { return m_frame->height; }
+    int stride() const { return m_frame->linesize[0]; }
+
+    ~LumaReader()
+    {
+        if (m_pkt) av_packet_free(&m_pkt);
+        if (m_frame) av_frame_free(&m_frame);
+        if (m_ctx) avcodec_free_context(&m_ctx);
+        m_input.close();
+    }
+
+private:
+    AvInput m_input;
+    AVFormatContext *m_fmt = nullptr;
+    AVCodecContext *m_ctx = nullptr;
+    AVPacket *m_pkt = nullptr;
+    AVFrame *m_frame = nullptr;
+    int m_stream = -1;
+};
+
+} // namespace
+
+// --- TileTracker ----------------------------------------------------------
+
+struct TileTracker::AnchorHolder { cv::Mat anchor; };
+
+double TileTracker::scaleRatio() const { return std::exp(m_scaleLog); }
+
+bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int stride,
+                        const QQuaternion &camOrientation, double t, QString *error)
+{
+    m_cfg = cfg;
+    m_anchorHolder = QSharedPointer<AnchorHolder>::create();
+    m_dirWorld = camOrientation.rotatedVector(cfg.seedDirCam.normalized());
+    m_scaleLog = 0.0;
+    m_frames = 0;
+    m_badRun = m_rejectRun = m_hardRun = 0;
+    m_prevTime = t;
+    m_lossReason.clear();
+    m_omegaRate = 0.0;
+
+    // Fixed pixel budget, adaptive angular resolution: the cost of a frame
+    // does not then depend on how big the subject is.
+    const double d0Deg = qMax(0.5, cfg.seedRadiusRad * 2.0 * 180.0 / M_PI);
+    m_pDeg = clampd(1.3 * d0Deg / kTemplate, 0.125, 0.5);
+    const double searchHalfDeg = clampd(0.65 * d0Deg, 3.0, 12.0);
+    m_tileSize = (int)clampd(kTemplate + 2 * std::ceil(searchHalfDeg / m_pDeg), 80, 128);
+
+    cv::Mat tile;
+    double validFrac = 0.0;
+    const double pTan = std::tan(m_pDeg * M_PI / 180.0);
+    if (!buildTile(y, w, h, stride, cfg.lenses, camOrientation, m_dirWorld,
+                   pTan, m_tileSize, false, tile, &validFrac)) {
+        if (error) *error = QObject::tr("that point is not visible in either lens");
+        return false;
+    }
+    const int o = (m_tileSize - kTemplate) / 2;
+    m_anchorHolder->anchor = tile(cv::Rect(o, o, kTemplate, kTemplate)).clone();
+
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(m_anchorHolder->anchor, mean, stddev);
+    if (stddev[0] < kMinSeedStdDev) {
+        if (error)
+            *error = QObject::tr("that patch has too little contrast to track "
+                                 "(detail %1, needs %2) -- try a more distinct part of it")
+                         .arg(stddev[0], 0, 'f', 1).arg(kMinSeedStdDev);
+        return false;
+    }
+
+    m_last = TrackSample{};
+    m_last.t = t;
+    m_lastScore = 1.0;
+    recordSample(camOrientation, t, 1.0);
+    ++m_frames;
+    return true;
+}
+
+void TileTracker::recordSample(const QQuaternion &qAct, double t, double score)
+{
+    const QVector3D cam = qAct.conjugated().rotatedVector(m_dirWorld);
+    double theta, phi;
+    proj::dirToThetaPhi(toV(cam), theta, phi);
+    const bool front = theta <= M_PI * 0.5;
+    m_preferRear = !front;
+    const auto &lp = front ? m_cfg.lenses.front : m_cfg.lenses.rear;
+    const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                                     lp.rotation, lp.hflip);
+    TrackSample smp;
+    smp.t = t;
+    smp.lens = front ? 0 : 1;
+    proj::lensUv(front, theta, phi, geom, smp.u, smp.v);
+
+    // The subject's edge, in the same coordinates, so the resolver can turn
+    // it back into an angular size.
+    QVector3D up(0.0f, 1.0f, 0.0f);
+    if (std::fabs(QVector3D::dotProduct(m_dirWorld, up)) > 0.996f)
+        up = QVector3D(0.0f, 0.0f, 1.0f);
+    const QVector3D right = QVector3D::crossProduct(up, m_dirWorld).normalized();
+    const double radRad = m_cfg.seedRadiusRad * std::exp(m_scaleLog);
+    const QVector3D edgeWorld = (m_dirWorld + right * (float)std::tan(radRad)).normalized();
+    const QVector3D edgeCam = qAct.conjugated().rotatedVector(edgeWorld);
+    double eTheta, ePhi;
+    proj::dirToThetaPhi(toV(edgeCam), eTheta, ePhi);
+    double eu, ev;
+    proj::lensUv(front, eTheta, ePhi, geom, eu, ev);
+    smp.halfW = std::hypot(eu - smp.u, ev - smp.v);
+    smp.halfH = smp.halfW;
+    smp.conf = clampd(score, 0.0, 1.0);
+    m_last = smp;
+}
+
+TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
+                                    const QQuaternion &qAct, double t)
+{
+    if (!m_anchorHolder || m_anchorHolder->anchor.empty()) {
+        m_lossReason = QStringLiteral("not seeded");
+        return Step::Lost;
+    }
+    const double dt = qMax(1e-3, t - m_prevTime);
+
+    // Predict: constant angular velocity in the world frame.
+    QVector3D predicted = m_dirWorld;
+    if (m_omegaRate > 1e-4)
+        predicted = QQuaternion::fromAxisAndAngle(m_omegaAxis, (float)(m_omegaRate * dt))
+                        .rotatedVector(m_dirWorld).normalized();
+
+    const double pTanBase = std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog);
+    double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0;
+    double scores[3] = {-2.0, -2.0, -2.0};
+    int bestK = 1;
+
+    for (int k = 0; k < 3; ++k) {
+        const double pTan = pTanBase * std::pow(kScaleStep, k - 1);
+        cv::Mat tile;
+        double validFrac = 0.0;
+        if (!buildTile(y, w, h, stride, m_cfg.lenses, qAct, predicted, pTan,
+                       m_tileSize, m_preferRear, tile, &validFrac))
+            continue;
+        cv::Mat scoreMap;
+        cv::matchTemplate(tile, m_anchorHolder->anchor, scoreMap, cv::TM_CCOEFF_NORMED);
+        double minV, maxV;
+        cv::Point minL, maxL;
+        cv::minMaxLoc(scoreMap, &minV, &maxV, &minL, &maxL);
+        scores[k] = maxV;
+        if (maxV > bestScore) {
+            bestScore = maxV;
+            bestK = k;
+            bestValid = validFrac;
+            bestDx = (maxL.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
+            bestDy = -(maxL.y + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
+        }
+    }
+    m_lastScore = bestScore;
+
+    if (bestScore < -1.0) { m_lossReason = QStringLiteral("out of field"); return Step::Lost; }
+    if (bestValid < kMinValidFraction) { m_lossReason = QStringLiteral("left the lens"); return Step::Lost; }
+    m_hardRun = (bestScore < kScoreHardFloor) ? m_hardRun + 1 : 0;
+    if (m_hardRun >= kHardRun) { m_lossReason = QStringLiteral("lost the subject"); return Step::Lost; }
+    m_badRun = (bestScore < kScoreSoftFloor) ? m_badRun + 1 : 0;
+    if (m_badRun >= kBadRun) { m_lossReason = QStringLiteral("match too weak"); return Step::Lost; }
+
+    QVector3D up(0.0f, 1.0f, 0.0f);
+    if (std::fabs(QVector3D::dotProduct(predicted, up)) > 0.996f)
+        up = QVector3D(0.0f, 0.0f, 1.0f);
+    const QVector3D right = QVector3D::crossProduct(up, predicted).normalized();
+    const QVector3D tileUp = QVector3D::crossProduct(predicted, right).normalized();
+    const QVector3D measured = (predicted + right * (float)bestDx
+                                          + tileUp * (float)bestDy).normalized();
+
+    const double stepDeg = std::acos(clampd(QVector3D::dotProduct(m_dirWorld, measured), -1.0, 1.0))
+                         * 180.0 / M_PI;
+    if (stepDeg / dt > m_cfg.maxWorldSpeedDeg) {
+        // Faster than the subject could plausibly move: skip the frame and
+        // coast, and only give up if it keeps happening.
+        if (++m_rejectRun >= kRejectRun) {
+            m_lossReason = QStringLiteral("moved too fast to follow");
+            return Step::Lost;
+        }
+        m_prevTime = t;
+        return Step::Rejected;
+    }
+    m_rejectRun = 0;
+
+    // Scale, from a parabola through the three scores.
+    if (bestK == 1 && scores[0] > -1.0 && scores[2] > -1.0
+        && scores[1] > scores[0] && scores[1] > scores[2]) {
+        const double denom = scores[0] - 2.0 * scores[1] + scores[2];
+        if (std::fabs(denom) > 1e-6) {
+            const double delta = 0.5 * (scores[0] - scores[2]) / denom;
+            m_scaleLog += clampd(delta * std::log(kScaleStep), -kMaxScaleStepLog, kMaxScaleStepLog);
+        }
+    } else if (bestK != 1) {
+        m_scaleLog += clampd((bestK - 1) * std::log(kScaleStep),
+                             -kMaxScaleStepLog, kMaxScaleStepLog);
+    }
+
+    if (stepDeg > 1e-4) {
+        m_omegaAxis = QVector3D::crossProduct(m_dirWorld, measured).normalized();
+        m_omegaRate = 0.5 * m_omegaRate + 0.5 * qMin(stepDeg / dt, m_cfg.maxWorldSpeedDeg);
+    }
+
+    m_dirWorld = measured;
+    m_prevTime = t;
+    ++m_frames;
+    recordSample(qAct, t, bestScore);
+    return Step::Ok;
+}
+
+ObjectTracker::ObjectTracker(QObject *parent) : QObject(parent) {}
+
+ObjectTracker::~ObjectTracker()
+{
+    cancel();
+    if (m_thread) {
+        m_thread->wait(5000);          // never detach: a worker outliving the
+        m_thread = nullptr;            // app is a shutdown crash
+    }
+}
+
+void ObjectTracker::track(const TrackRequest &req)
+{
+    if (m_running.loadRelaxed() != 0)
+        return;
+    if (m_thread) { m_thread->wait(5000); m_thread = nullptr; }
+    m_cancel.storeRelaxed(0);
+    m_running.storeRelaxed(1);
+    m_thread = QThread::create([this, req]() { run(req); });
+    connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
+    m_thread->start();
+}
+
+void ObjectTracker::run(TrackRequest req)
+{
+    QElapsedTimer clock;
+    clock.start();
+    TrackResult result;
+
+    const QString source = VisualRotationComputer::chooseDecodeSource(
+        req.videoPath, req.proxyOverride, 320);
+    const bool usingProxy = (source != req.videoPath);
+
+    LumaReader reader;
+    QString err;
+    if (!reader.open(source, &err)) {
+        m_running.storeRelaxed(0);
+        emit trackFailed(QObject::tr("Tracking could not read the video: %1").arg(err));
+        return;
+    }
+    reader.seek(req.t0);
+
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = req.lenses;
+    cfg.seedDirCam = req.seedDirCam;
+    cfg.seedRadiusRad = req.seedRadiusRad;
+
+    int frames = 0;
+    double scoreSum = 0.0;
+    double lastTime = req.t0;
+
+    while (true) {
+        if (m_cancel.loadRelaxed() != 0) {
+            result.lossReason = QStringLiteral("cancelled");
+            break;
+        }
+        double t = 0.0;
+        const double minTime = (frames == 0) ? req.t0 : lastTime + 0.5 / qMax(1.0, req.fps);
+        if (!reader.next(minTime, &t)) break;
+        if (t > req.tEnd + 1e-6) { reader.release(); break; }
+
+        const QQuaternion qAct = orientationAt(req, t);
+        if (frames == 0) {
+            QString seedErr;
+            if (!tracker.begin(cfg, reader.y(), reader.width(), reader.height(),
+                               reader.stride(), qAct, t, &seedErr)) {
+                reader.release();
+                m_running.storeRelaxed(0);
+                emit trackFailed(seedErr);
+                return;
+            }
+            result.samples.append(tracker.lastSample());
+            scoreSum += 1.0;
+        } else {
+            const TileTracker::Step st = tracker.step(reader.y(), reader.width(),
+                                                      reader.height(), reader.stride(), qAct, t);
+            if (st == TileTracker::Step::Lost) {
+                result.lost = true;
+                result.lossTime = t;
+                result.lossReason = tracker.lossReason();
+                reader.release();
+                break;
+            }
+            if (st == TileTracker::Step::Ok) {
+                result.samples.append(tracker.lastSample());
+                scoreSum += tracker.lastScore();
+            }
+        }
+        lastTime = t;
+        ++frames;
+        reader.release();
+
+        if ((frames % 15) == 0) {
+            const double span = qMax(1e-6, req.tEnd - req.t0);
+            emit progressChanged(clampd((t - req.t0) / span, 0.0, 1.0),
+                                 QObject::tr("Tracking… %1%")
+                                     .arg((int)(100.0 * (t - req.t0) / span)));
+        }
+    }
+
+    result.meanScore = frames > 0 ? scoreSum / frames : 0.0;
+    result.msPerFrame = frames > 0 ? (double)clock.elapsed() / frames : 0.0;
+    qInfo("ObjectTracker: %d frames in %lld ms (%.1f ms/frame, %s), mean score %.3f%s",
+          frames, clock.elapsed(), result.msPerFrame,
+          usingProxy ? "proxy" : "original", result.meanScore,
+          result.lost ? qPrintable(QStringLiteral(", lost: ") + result.lossReason) : "");
+
+    m_running.storeRelaxed(0);
+    emit trackFinished(result);
+}

@@ -129,6 +129,14 @@ private:
     // Pick the file to decode for analysis: the camera's *_thm proxy when it
     // matches the original frame-for-frame, else the original.
     QString chooseDecodeSource(const QString &videoPath) const;
+public:
+    // Same choice, for other analysis jobs (the object tracker): return the
+    // _thm proxy when it matches the original frame-for-frame, else the
+    // original. `override` is the explicitly supplied proxy Android needs,
+    // where a content:// URI has no derivable siblings.
+    static QString chooseDecodeSource(const QString &videoPath, const QString &proxyOverride,
+                                      int minWidth);
+private:
 
     // Decode frames from video, returning timestamps and grayscale half-images
     bool decodeFrames(const QString &videoPath, int frameSkip,
