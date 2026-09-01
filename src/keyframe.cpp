@@ -260,7 +260,9 @@ void KeyframeModel::saveToFile(const QString &path) const
         });
     }
     QJsonObject root{
-        {"version", 5},
+        // 6: adds "tracks". Older builds ignore it, and since they now
+        // preserve keys they do not parse, they no longer delete it either.
+        {"version", 6},
         {"in", m_trimIn},        // export trim start marker
         {"out", m_trimOut},      // export trim end marker
         {"export", QJsonObject{
@@ -299,6 +301,9 @@ void KeyframeModel::saveToFile(const QString &path) const
         root.insert(QStringLiteral("gyroBias"), biasArr);
     }
 
+    if (!m_tracksJson.isEmpty())
+        root.insert(QStringLiteral("tracks"), m_tracksJson);
+
     // Anything a newer build wrote and this one does not parse, put back.
     for (auto it = m_unknownKeys.constBegin(); it != m_unknownKeys.constEnd(); ++it)
         if (!root.contains(it.key()))
@@ -319,6 +324,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     QMatrix3x3 gyroMatrix;    // default identity
     QVector3D gyroBias;       // default zero
     bool hasGyroCalibration = false;
+    QJsonArray tracks;
     QJsonObject unknown;
     int expWidth = m_exportWidth;
     int expHeight = m_exportHeight;
@@ -386,13 +392,15 @@ void KeyframeModel::loadFromFile(const QString &path)
             if (exp.contains("fileName") && !exp.value("fileName").toString().isEmpty())
                 expFileName = exp.value("fileName").toString();
 
+            tracks = root.value("tracks").toArray();
+
             // Keep what this build does not know about (see m_unknownKeys).
             static const QStringList known = {
                 QStringLiteral("version"),   QStringLiteral("in"),
                 QStringLiteral("out"),       QStringLiteral("export"),
                 QStringLiteral("keyframes"), QStringLiteral("imuDrift"),
                 QStringLiteral("syncOffset"), QStringLiteral("gyroMatrix"),
-                QStringLiteral("gyroBias"),
+                QStringLiteral("gyroBias"),   QStringLiteral("tracks"),
             };
             for (auto it = root.constBegin(); it != root.constEnd(); ++it)
                 if (!known.contains(it.key()))
@@ -433,6 +441,7 @@ void KeyframeModel::loadFromFile(const QString &path)
         && qFuzzyCompare(syncOffset, m_syncOffset)
         && hasGyroCalibration == m_hasGyroCalibration
         && unknown == m_unknownKeys
+        && tracks == m_tracksJson
         && exportUnchanged)
         return;
 
@@ -449,6 +458,7 @@ void KeyframeModel::loadFromFile(const QString &path)
     m_gyroBias = gyroBias;
     m_hasGyroCalibration = hasGyroCalibration;
     m_unknownKeys = unknown;
+    m_tracksJson = tracks;
     m_exportWidth = expWidth;
     m_exportHeight = expHeight;
     m_exportFps = expFps;
@@ -465,4 +475,13 @@ void KeyframeModel::loadFromFile(const QString &path)
     emit keyframesChanged();
     emit trimChanged();
     emit exportSettingsChanged();
+    emit tracksChanged();
+}
+
+void KeyframeModel::setTracksJson(const QJsonArray &tracks)
+{
+    if (tracks == m_tracksJson)
+        return;
+    m_tracksJson = tracks;
+    emit tracksChanged();
 }

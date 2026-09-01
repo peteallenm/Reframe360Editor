@@ -24,6 +24,7 @@
 #include "visualfusion.h"
 #include "keyframe.h"
 #include "projection.h"
+#include "track.h"
 #include <QRandomGenerator>
 #include <cstring>
 #include <QDir>
@@ -2280,6 +2281,256 @@ static void testLensMapRoundTrip()
                .arg(sides[1].worstDeg, 0, 'g', 3).arg(sides[1].worstTheta, 0, 'f', 1).arg(med(sides[1]), 0, 'g', 3));
 }
 
+// ---------------------------------------------------------------------------
+// The resolver: a track must put the object back where the user pointed at it,
+// whatever the camera did in between. Synthetic, so the answer is known
+// exactly -- a fixed world direction, a camera that yaws and shakes, and the
+// resolved keyframes must re-project that direction onto the picked spot.
+// ---------------------------------------------------------------------------
+static TrackLenses synthLenses()
+{
+    return TrackLenses::fromCalibration(0.5, 0.5, 0.5, 0.0, 0.0, 0.0, false,
+                                        0.5, 0.5, 0.5, 0.0, 0.0, 180.0, false);
+}
+
+static void testTrackResolve()
+{
+    const TrackLenses lenses = synthLenses();
+
+    // The armed view and where in the frame the object was picked.
+    Track tr;
+    tr.id = "synth";
+    tr.t0 = 0.0;
+    tr.yaw0 = 25.0; tr.pitch0 = -10.0; tr.roll0 = 0.0; tr.fov0 = 70.0;
+    tr.framingNdcX = 0.35; tr.framingNdcY = -0.20;
+    tr.framingAspect = 16.0 / 9.0;
+    tr.framingProjection = 0;
+    tr.fovFollow = false;               // size is a separate test
+    tr.sizeRad0 = proj::degToRad(4.0);
+
+    // The world direction that framing implies at the armed view.
+    const proj::ViewBasis armed = proj::ViewBasis::make(
+        tr.yaw0, tr.pitch0, tr.roll0, tr.fov0, tr.framingProjection, tr.framingAspect);
+    const proj::Vec3 wDir = proj::applyEuler(
+        proj::rayForNdc(tr.framingNdcX, tr.framingNdcY, armed), armed);
+    const QVector3D W((float)wDir.x, (float)wDir.y, (float)wDir.z);
+
+    // A camera that pans 60 deg/s with a 10 Hz, 2 deg shake on top.
+    auto imuAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(60.0 * t))
+             * QQuaternion::fromAxisAndAngle(1, 0, 0, (float)(2.0 * std::sin(2 * M_PI * 10.0 * t)));
+    };
+
+    // Project that fixed world direction into the sensor for each frame.
+    for (int i = 0; i < 150; ++i) {
+        const double t = i / 30.0;
+        const QVector3D cam = imuAt(t).conjugated().rotatedVector(W);
+        double theta, phi;
+        proj::dirToThetaPhi(proj::Vec3{cam.x(), cam.y(), cam.z()}, theta, phi);
+        const bool front = theta <= M_PI * 0.5;
+        double u, v;
+        proj::lensUv(front, theta, phi,
+                     proj::LensGeom::make(0.5, 0.5, 0.5, 0.0, 0.0, front ? 0.0 : 180.0, false),
+                     u, v);
+        TrackSample s;
+        s.t = t; s.u = u; s.v = v; s.lens = front ? 0 : 1;
+        s.halfW = 0.0; s.halfH = 0.0; s.conf = 1.0;
+        tr.samples.append(s);
+    }
+
+    const QVector<Keyframe> kfs = track::resolve(tr, lenses, imuAt, tr.endTime());
+
+    // 1. The first keyframe must reproduce the armed view exactly.
+    const bool armedOk = !kfs.isEmpty()
+                      && std::fabs(kfs.first().yaw - tr.yaw0) < 0.05
+                      && std::fabs(kfs.first().pitch - tr.pitch0) < 0.05;
+
+    // 2. Every keyframe must put the object back on the picked spot.
+    double worstNdc = 0.0;
+    for (const Keyframe &k : kfs) {
+        const proj::ViewBasis b = proj::ViewBasis::make(k.yaw, k.pitch, k.roll, k.fov,
+                                                        tr.framingProjection, tr.framingAspect);
+        const QVector3D w = imuAt(k.time).rotatedVector(
+            imuAt(k.time).conjugated().rotatedVector(W));    // == W, via the same path
+        double nx = 0.0, ny = 0.0;
+        if (!proj::ndcForDir(proj::unapplyEuler(proj::Vec3{w.x(), w.y(), w.z()}, b), b, nx, ny)) {
+            worstNdc = 9.9;
+            break;
+        }
+        worstNdc = qMax(worstNdc, qMax(std::fabs(nx - tr.framingNdcX),
+                                       std::fabs(ny - tr.framingNdcY)));
+    }
+
+    // 3. Decimation: a smooth pan must not need a keyframe per frame.
+    const bool decimated = kfs.size() < 40;
+
+    report("Track resolves to the picked framing under camera motion",
+           armedOk && worstNdc < 0.01 && decimated,
+           QStringLiteral("%1 keyframes from 150 samples, armed=%2, worst framing error %3 NDC")
+               .arg(kfs.size()).arg(armedOk).arg(worstNdc, 0, 'g', 3));
+}
+
+// The fov filter: a subject that doubles in size must widen the view smoothly,
+// and one that only jitters must not move it at all (the pumping test).
+static void testTrackFovFollow()
+{
+    const TrackLenses lenses = synthLenses();
+    auto imuAt = [](double) { return QQuaternion(); };
+
+    auto build = [&](bool grow, double jitterFrac) {
+        Track tr;
+        tr.t0 = 0.0; tr.yaw0 = 0.0; tr.pitch0 = 0.0; tr.roll0 = 0.0; tr.fov0 = 60.0;
+        tr.framingNdcX = 0.0; tr.framingNdcY = 0.0;
+        tr.framingProjection = 0; tr.framingAspect = 16.0 / 9.0;
+        tr.fovFollow = true;
+        const double halfBase = 0.02;
+        tr.sizeRad0 = 2.0 * halfBase * (M_PI * 0.5) / 0.5 * 0.5;   // matches lensUv scale
+        QRandomGenerator rng(99);
+        for (int i = 0; i < 180; ++i) {
+            const double t = i / 30.0;
+            const double growth = grow ? (1.0 + t / 6.0) : 1.0;         // x2 over 6 s
+            const double jitter = 1.0 + jitterFrac * (rng.generateDouble() * 2.0 - 1.0);
+            TrackSample s;
+            s.t = t; s.u = 0.5; s.v = 0.5; s.lens = 0;
+            s.halfW = s.halfH = halfBase * growth * jitter;
+            s.conf = 1.0;
+            tr.samples.append(s);
+        }
+        // sizeRad0 must be the angular size the FIRST sample implies, or the
+        // track starts already wanting a different fov.
+        const QVector3D c = VisualRotationComputer::pixelToBearing(0.5, 0.5, lenses.front);
+        const QVector3D r = VisualRotationComputer::pixelToBearing(0.5 + halfBase, 0.5, lenses.front);
+        const double dot = qBound(-1.0f, QVector3D::dotProduct(c.normalized(), r.normalized()), 1.0f);
+        tr.sizeRad0 = 2.0 * std::acos(dot);
+        return tr;
+    };
+
+    // Growing subject: the point is not that fov doubles (it cannot -- fov is
+    // an angle and the subject's screen fraction goes as tan(fov/2)), but that
+    // the subject keeps the SAME FRACTION of the frame. Measure that directly.
+    const Track grow = build(true, 0.0);
+    const QVector<Keyframe> gk = track::resolve(grow, lenses, imuAt, grow.endTime());
+    bool monotone = true;
+    for (int i = 1; i < gk.size(); ++i)
+        if (gk[i].fov < gk[i - 1].fov - 1e-6) monotone = false;
+    const double ratio = gk.isEmpty() ? 0.0 : gk.constLast().fov / gk.first().fov;
+
+    // Screen fraction = tan(sigma/2) / tan(fov/2), sampled at each keyframe.
+    double worstFrac = 0.0, frac0 = 0.0;
+    for (const Keyframe &k : gk) {
+        // The sample whose time this keyframe sits on.
+        const TrackSample *best = nullptr;
+        for (const TrackSample &sm : grow.samples)
+            if (!best || std::fabs(sm.t - k.time) < std::fabs(best->t - k.time)) best = &sm;
+        if (!best) continue;
+        const QVector3D c = VisualRotationComputer::pixelToBearing(best->u, best->v, lenses.front);
+        const QVector3D r = VisualRotationComputer::pixelToBearing(best->u + best->halfW,
+                                                                   best->v, lenses.front);
+        const double dot = qBound(-1.0f, QVector3D::dotProduct(c.normalized(), r.normalized()), 1.0f);
+        const double sigma = 2.0 * std::acos(dot);
+        const double frac = std::tan(sigma * 0.5) / std::tan(proj::degToRad(k.fov) * 0.5);
+        if (frac0 <= 0.0) frac0 = frac;
+        worstFrac = qMax(worstFrac, std::fabs(frac / frac0 - 1.0));
+    }
+
+    // Jittering subject: 4 % noise, no real size change -> fov must not move.
+    const Track jit = build(false, 0.04);
+    const QVector<Keyframe> jk = track::resolve(jit, lenses, imuAt, jit.endTime());
+    double fovSpread = 0.0;
+    for (const Keyframe &k : jk)
+        fovSpread = qMax(fovSpread, std::fabs(k.fov - jk.first().fov));
+
+    // Tolerance covers the deliberate lag: a 0.75 s zero-phase window plus a
+    // 6 % deadband cannot track a subject that doubles in six seconds exactly,
+    // and should not try -- chasing it precisely is what pumping looks like.
+    report("fov holds the subject's screen fraction, without pumping",
+           monotone && worstFrac < 0.30 && fovSpread < 0.5,
+           QStringLiteral("subject doubles: fov x%1 (monotone=%2), screen fraction within %3 %; "
+                          "4 % jitter moves fov by %4 deg")
+               .arg(ratio, 0, 'f', 2).arg(monotone).arg(worstFrac * 100.0, 0, 'f', 1)
+               .arg(fovSpread, 0, 'f', 3));
+}
+
+// A manual keyframe inside a tracked span truncates it, and the track's own
+// keyframes never survive past that point.
+static void testTrackCompose()
+{
+    const TrackLenses lenses = synthLenses();
+    auto imuAt = [](double) { return QQuaternion(); };
+
+    Track tr;
+    tr.t0 = 1.0; tr.fov0 = 60.0; tr.fovFollow = false;
+    tr.framingProjection = 0; tr.framingAspect = 16.0 / 9.0;
+    tr.sizeRad0 = proj::degToRad(4.0);
+    for (int i = 0; i < 150; ++i) {
+        TrackSample s;
+        s.t = 1.0 + i / 30.0; s.u = 0.5 + 0.001 * i; s.v = 0.5; s.lens = 0; s.conf = 1.0;
+        tr.samples.append(s);
+    }
+
+    QVector<Keyframe> manual;
+    manual.append(Keyframe{0.0, 0.0, 0.0, 0.0, 90.0});
+    manual.append(Keyframe{3.0, 45.0, 0.0, 0.0, 90.0});   // lands inside the track
+
+    const QVector<Keyframe> merged = track::compose(manual, {tr}, lenses, imuAt, 0.0, 6.0);
+
+    bool sorted = true, manualKept = false, noneAfterCut = true;
+    for (int i = 1; i < merged.size(); ++i)
+        if (merged[i].time < merged[i - 1].time) sorted = false;
+    for (const Keyframe &k : merged) {
+        if (qFuzzyCompare(k.time, 3.0) && qFuzzyCompare(k.yaw, 45.0)) manualKept = true;
+        if (k.time > 3.0 + 1e-6) noneAfterCut = false;
+    }
+    const bool grew = merged.size() > manual.size();
+
+    report("A manual keyframe truncates the track it lands in",
+           sorted && manualKept && noneAfterCut && grew,
+           QStringLiteral("%1 keyframes, sorted=%2, manual kept=%3, none after cut=%4")
+               .arg(merged.size()).arg(sorted).arg(manualKept).arg(noneAfterCut));
+}
+
+// Tracks must survive the sidecar round trip, including the packed samples.
+static void testTrackJson()
+{
+    Track tr;
+    tr.id = "t1"; tr.t0 = 2.5; tr.lost = true; tr.lossTime = 9.0;
+    tr.framingNdcX = -0.31; tr.framingNdcY = 0.12; tr.framingProjection = 2;
+    tr.yaw0 = 12.5; tr.pitch0 = -4.25; tr.roll0 = 1.0; tr.fov0 = 55.0;
+    tr.sizeRad0 = 0.0672;
+    QRandomGenerator rng(5);
+    for (int i = 0; i < 900; ++i) {
+        TrackSample s;
+        s.t = 2.5 + i / 30.0;
+        s.u = rng.generateDouble(); s.v = rng.generateDouble();
+        s.halfW = 0.01 + rng.generateDouble() * 0.02;
+        s.halfH = 0.01 + rng.generateDouble() * 0.02;
+        s.lens = i % 2; s.conf = rng.generateDouble();
+        tr.samples.append(s);
+    }
+
+    const QJsonArray arr = track::toJson({tr});
+    const QVector<Track> back = track::fromJson(arr);
+    const int jsonBytes = QJsonDocument(arr).toJson(QJsonDocument::Indented).size();
+
+    bool ok = back.size() == 1 && back[0].samples.size() == tr.samples.size()
+           && back[0].id == tr.id && back[0].lost == tr.lost
+           && back[0].framingProjection == tr.framingProjection;
+    double worstUv = 0.0, worstT = 0.0;
+    if (ok) {
+        for (int i = 0; i < tr.samples.size(); ++i) {
+            worstUv = qMax(worstUv, std::fabs(back[0].samples[i].u - tr.samples[i].u));
+            worstUv = qMax(worstUv, std::fabs(back[0].samples[i].v - tr.samples[i].v));
+            worstT  = qMax(worstT,  std::fabs(back[0].samples[i].t - tr.samples[i].t));
+            if (back[0].samples[i].lens != tr.samples[i].lens) ok = false;
+        }
+    }
+    // Quantisation budget: 1/65535 of a half frame is ~0.01 px on the proxy,
+    // 10 us on time. Both are far finer than the tracker's own precision.
+    report("Track survives the sidecar round trip", ok && worstUv < 2e-5 && worstT < 2e-5,
+           QStringLiteral("900 samples in %1 KB of JSON, worst uv %2, worst t %3 s")
+               .arg(jsonBytes / 1024).arg(worstUv, 0, 'g', 2).arg(worstT, 0, 'g', 2));
+}
+
 static void testSidecarUnknownKeys()
 {
     const QString path = QDir::temp().filePath(QStringLiteral("r360_sidecar_test.json"));
@@ -2710,6 +2961,12 @@ int main(int argc, char *argv[])
         qInfo() << "--- Test 0d: projection maths ---";
         testProjectionRefactor();
         testLensMapRoundTrip();
+
+        qInfo() << "--- Test 0e: object-track resolver ---";
+        testTrackResolve();
+        testTrackFovFollow();
+        testTrackCompose();
+        testTrackJson();
 
         qInfo() << "--- Test 1: IMU parser ---";
         testImuParser(video);

@@ -102,6 +102,7 @@ qt_add_executable(render360
     src/visualfusion.cpp
     src/gyrocalibration.cpp
     src/folderaccess.cpp
+    src/track.cpp
 )
 
 # Independent tracking/diagnostics test harness. Builds the IMU/visual/gyro
@@ -119,6 +120,7 @@ qt_add_executable(tracking_tests
     src/gyrocalibration.cpp
     src/visualfusion.cpp
     src/keyframe.cpp
+    src/track.cpp
     src/avinput.cpp
 )
 endif()

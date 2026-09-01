@@ -14,6 +14,7 @@
 #include <QObject>
 #include <QAbstractListModel>
 #include <QVector>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QMatrix3x3>
 #include <QVector3D>
@@ -156,6 +157,17 @@ signals:
     // Emitted after any last-used export output option changes.
     void exportSettingsChanged();
 
+    // Emitted when the stored object tracks change (loaded, added, removed).
+    void tracksChanged();
+
+public:
+    // Object tracks are held as opaque JSON: the model's job is to persist
+    // them beside the keyframes, and parsing them needs the lens geometry and
+    // the IMU chain, which live in App. Keeps keyframe.cpp free of track.h
+    // (which includes this header).
+    QJsonArray tracksJson() const { return m_tracksJson; }
+    void setTracksJson(const QJsonArray &tracks);
+
 private:
     void sortAndNotify();
     QVector<Keyframe> m_keyframes;
@@ -175,6 +187,7 @@ private:
     QMatrix3x3 m_gyroMatrix;   // default identity
     QVector3D m_gyroBias;      // default zero
     bool m_hasGyroCalibration = false;
+    QJsonArray m_tracksJson;   // see tracksJson()
     // Top-level sidecar keys this build does not understand, kept verbatim so
     // saving does not delete a newer build's data. The sidecar travels between
     // desktop and phone, which are not always the same version, and saveToFile
