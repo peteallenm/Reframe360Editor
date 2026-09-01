@@ -10,6 +10,7 @@
 
 #include "gpurenderer.h"
 
+#include <QElapsedTimer>
 #include <QFile>
 #include <QRegularExpression>
 #include <QOffscreenSurface>
