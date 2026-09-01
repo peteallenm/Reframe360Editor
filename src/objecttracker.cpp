@@ -14,6 +14,7 @@
 #include "visualrotation.h"
 
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QThread>
 #include <QtMath>
@@ -46,12 +47,37 @@ constexpr int    kBadRun            = 5;
 constexpr int    kRejectRun         = 6;     // consecutive gated frames -> lost
 constexpr double kMinValidFraction  = 0.80;  // of the tile inside a lens circle
 constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
+// Variance is not enough. A smooth gradient -- sky, a blurred wall, water --
+// has plenty of it and still correlates just as well ANYWHERE along the
+// gradient, so the score stays high while the track slides (the aperture
+// problem). What matters is whether the patch can be LOCALISED: its
+// correlation peak must stand clear of every rival in the tile.
+constexpr double kMaxSeedRival      = 0.80;  // best rival peak, at seed time
+constexpr double kMaxRunRival       = 0.92;  // ... and while running
+constexpr int    kAmbiguousRun      = 8;     // consecutive ambiguous frames
 constexpr double kMaxWorldSpeedDeg  = 40.0;  // object angular speed gate
 constexpr double kMaxScaleStepLog   = 0.223; // log(1.25) per frame
 constexpr double kSeamThetaDeg      = 90.0;
 constexpr double kSeamHysteresisDeg = 4.0;
 
 double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// The strongest rival to the winning match, ignoring its immediate
+// neighbourhood: one clear peak means the patch can be found again, many
+// near-equal peaks mean it cannot.
+double rivalPeak(const cv::Mat &scoreMap, const cv::Point &best, int exclude)
+{
+    double rival = -1.0;
+    for (int y = 0; y < scoreMap.rows; ++y) {
+        const float *row = scoreMap.ptr<float>(y);
+        for (int x = 0; x < scoreMap.cols; ++x) {
+            if (std::abs(x - best.x) <= exclude && std::abs(y - best.y) <= exclude)
+                continue;
+            if (row[x] > rival) rival = row[x];
+        }
+    }
+    return rival;
+}
 
 // Bilinear sample of a luma plane, GL texel centres.
 double sampleY(const uchar *Y, int w, int h, int stride, double u, double v)
@@ -251,7 +277,7 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
     m_dirWorld = camOrientation.rotatedVector(cfg.seedDirCam.normalized());
     m_scaleLog = 0.0;
     m_frames = 0;
-    m_badRun = m_rejectRun = m_hardRun = 0;
+    m_badRun = m_rejectRun = m_hardRun = m_ambiguousRun = 0;
     m_prevTime = t;
     m_lossReason.clear();
     m_omegaRate = 0.0;
@@ -282,6 +308,27 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
                                  "(detail %1, needs %2) -- try a more distinct part of it")
                          .arg(stddev[0], 0, 'f', 1).arg(kMinSeedStdDev);
         return false;
+    }
+
+    // Can it be found again? Match the template back into its own tile: a
+    // distinctive subject peaks once, sharply. Sky or water peaks nearly as
+    // well all along itself, and tracking it slides while reporting a
+    // perfectly healthy score.
+    {
+        cv::Mat selfMap;
+        cv::matchTemplate(tile, m_anchorHolder->anchor, selfMap, cv::TM_CCOEFF_NORMED);
+        double minV, maxV;
+        cv::Point minL, maxL;
+        cv::minMaxLoc(selfMap, &minV, &maxV, &minL, &maxL);
+        const double rival = rivalPeak(selfMap, maxL, kTemplate / 3);
+        if (rival > kMaxSeedRival) {
+            if (error)
+                *error = QObject::tr("that area looks much the same all over (rival match %1, "
+                                     "limit %2), so tracking would slide across it -- point at "
+                                     "something with a distinct edge or pattern")
+                             .arg(rival, 0, 'f', 2).arg(kMaxSeedRival);
+            return false;
+        }
     }
 
     m_last = TrackSample{};
@@ -342,7 +389,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
                         .rotatedVector(m_dirWorld).normalized();
 
     const double pTanBase = std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog);
-    double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0;
+    double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestRival = -1.0;
     double scores[3] = {-2.0, -2.0, -2.0};
     int bestK = 1;
 
@@ -363,6 +410,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
             bestScore = maxV;
             bestK = k;
             bestValid = validFrac;
+            bestRival = rivalPeak(scoreMap, maxL, kTemplate / 3);
             bestDx = (maxL.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
             bestDy = -(maxL.y + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
         }
@@ -375,6 +423,14 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     if (m_hardRun >= kHardRun) { m_lossReason = QStringLiteral("lost the subject"); return Step::Lost; }
     m_badRun = (bestScore < kScoreSoftFloor) ? m_badRun + 1 : 0;
     if (m_badRun >= kBadRun) { m_lossReason = QStringLiteral("match too weak"); return Step::Lost; }
+    // Several places now match about as well as the winner: the subject has
+    // become indistinguishable from its surroundings, and following the peak
+    // from here is following noise.
+    m_ambiguousRun = (bestRival > kMaxRunRival * bestScore) ? m_ambiguousRun + 1 : 0;
+    if (m_ambiguousRun >= kAmbiguousRun) {
+        m_lossReason = QStringLiteral("subject blends into its surroundings");
+        return Step::Lost;
+    }
 
     QVector3D up(0.0f, 1.0f, 0.0f);
     if (std::fabs(QVector3D::dotProduct(predicted, up)) > 0.996f)
@@ -420,6 +476,27 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     m_prevTime = t;
     ++m_frames;
     recordSample(qAct, t, bestScore);
+
+    // RENDER360_TRACK_DUMP=<dir>: write the tile as a PGM every few frames.
+    // Statistics cannot tell "the tile is stable and the match is wrong" from
+    // "the tile is sliding"; looking at them can.
+    static const QByteArray dumpDir = qgetenv("RENDER360_TRACK_DUMP");
+    if (!dumpDir.isEmpty() && (m_frames % 5) == 0) {
+        cv::Mat tile;
+        double vf = 0.0;
+        if (buildTile(y, w, h, stride, m_cfg.lenses, qAct, m_dirWorld,
+                      std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog),
+                      m_tileSize, m_preferRear, tile, &vf)) {
+            const QString path = QString::fromLatin1(dumpDir) +
+                QStringLiteral("/tile_%1.pgm").arg(m_frames, 4, 10, QLatin1Char('0'));
+            QFile f(path);
+            if (f.open(QIODevice::WriteOnly)) {
+                f.write(QStringLiteral("P5\n%1 %2\n255\n").arg(tile.cols).arg(tile.rows).toLatin1());
+                for (int r = 0; r < tile.rows; ++r)
+                    f.write(reinterpret_cast<const char *>(tile.ptr<uchar>(r)), tile.cols);
+            }
+        }
+    }
     return Step::Ok;
 }
 
@@ -470,6 +547,7 @@ void ObjectTracker::run(TrackRequest req)
     cfg.lenses = req.lenses;
     cfg.seedDirCam = req.seedDirCam;
     cfg.seedRadiusRad = req.seedRadiusRad;
+    cfg.maxWorldSpeedDeg = req.maxWorldSpeedDeg;
 
     int frames = 0;
     double scoreSum = 0.0;
@@ -486,6 +564,17 @@ void ObjectTracker::run(TrackRequest req)
         if (t > req.tEnd + 1e-6) { reader.release(); break; }
 
         const QQuaternion qAct = orientationAt(req, t);
+        static const QByteArray frameDump = qgetenv("RENDER360_FRAME_DUMP");
+        if (!frameDump.isEmpty() && frames == 0) {
+            QFile f(QString::fromLatin1(frameDump));
+            if (f.open(QIODevice::WriteOnly)) {
+                f.write(QStringLiteral("P5\n%1 %2\n255\n")
+                            .arg(reader.width()).arg(reader.height()).toLatin1());
+                for (int r = 0; r < reader.height(); ++r)
+                    f.write(reinterpret_cast<const char *>(reader.y() + (qsizetype)r * reader.stride()),
+                            reader.width());
+            }
+        }
         if (frames == 0) {
             QString seedErr;
             if (!tracker.begin(cfg, reader.y(), reader.width(), reader.height(),

@@ -27,6 +27,8 @@ class QThread;
 #include "calibration.h"
 #include "colorgrade.h"
 #include "keyframe.h"
+#include "track.h"
+#include "objecttracker.h"
 #include "exporter.h"
 #include "flowrenderer.h"
 #include "visualrotation.h"
@@ -183,6 +185,14 @@ class App : public QObject
     Q_PROPERTY(double autoSyncProgress READ autoSyncProgress NOTIFY autoSyncProgressChanged)
     Q_PROPERTY(QString autoSyncStatus READ autoSyncStatus NOTIFY autoSyncStatusChanged)
 
+    // Object tracking (same shape as the autoSync trio above).
+    Q_PROPERTY(bool trackRunning READ trackRunning NOTIFY trackRunningChanged)
+    Q_PROPERTY(double trackProgress READ trackProgress NOTIFY trackProgressChanged)
+    Q_PROPERTY(QString trackStatus READ trackStatus NOTIFY trackStatusChanged)
+    Q_PROPERTY(int trackCount READ trackCount NOTIFY tracksChanged)
+    // True while the viewer is waiting for the user to point at something.
+    Q_PROPERTY(bool trackArmed READ trackArmed WRITE setTrackArmed NOTIFY trackArmedChanged)
+
 public:
     explicit App(QObject *parent = nullptr);
     ~App();
@@ -331,6 +341,28 @@ public:
     Q_INVOKABLE void addKeyframeAtCurrent();
     Q_INVOKABLE void applyKeyframeInterpolation();
 
+    bool trackRunning() const { return m_trackRunning; }
+    double trackProgress() const { return m_trackProgress; }
+    QString trackStatus() const { return m_trackStatus; }
+    int trackCount() const { return m_tracks.size(); }
+    bool trackArmed() const { return m_trackArmed; }
+    void setTrackArmed(bool armed);
+
+    // Arm/pick: the viewer hands back where the user pointed, in NDC, plus the
+    // aspect of the surface they pointed at (the framing must be resolved
+    // against that, never against the live pane or the export size).
+    Q_INVOKABLE void startTrackAt(double ndcX, double ndcY, double aspect,
+                                  double sizeFraction = 0.15);
+    Q_INVOKABLE void cancelTracking();
+    Q_INVOKABLE void removeTrack(int index);
+    Q_INVOKABLE void clearTracks();
+    // Time span of a track, for the timeline: [start, end] or an empty list.
+    Q_INVOKABLE QVariantList trackSpan(int index) const;
+    // Where the tracked subject is on screen right now, as {ndcX, ndcY};
+    // empty when no track covers this time. Without this there is no way to
+    // see that a track is holding rather than quietly drifting.
+    Q_INVOKABLE QVariantList trackMarkerNdc(double aspect) const;
+
     bool autoSyncRunning() const { return m_autoSyncRunning; }
     double autoSyncProgress() const { return m_autoSyncProgress; }
     QString autoSyncStatus() const { return m_autoSyncStatus; }
@@ -429,6 +461,11 @@ signals:
     void autoSyncRunningChanged();
     void autoSyncProgressChanged();
     void autoSyncStatusChanged();
+    void trackRunningChanged();
+    void trackProgressChanged();
+    void trackStatusChanged();
+    void trackArmedChanged();
+    void tracksChanged();
 
 private:
     VideoDecoder *m_decoder;
@@ -509,6 +546,25 @@ private:
 
     // Auto-sync pipeline
     VisualRotationComputer *m_visualRotation = nullptr;
+    ObjectTracker *m_objectTracker = nullptr;
+    QVector<Track> m_tracks;
+    // The manual keyframes with every track's resolved keyframes folded in --
+    // the array preview and export both interpolate. Rebuilt lazily, and
+    // invalidated whenever anything the resolution depends on moves (the IMU
+    // chain, the calibration, the keyframes, the trim).
+    mutable QVector<Keyframe> m_effectiveKeyframes;
+    mutable bool m_effectiveDirty = true;
+    bool m_trackRunning = false;
+    bool m_trackArmed = false;
+    double m_trackProgress = 0.0;
+    QString m_trackStatus;
+    Track m_pendingTrack;          // being filled by the running pass
+    QString m_pendingTrackVideo;   // guards against a result for the old clip
+
+    const QVector<Keyframe> &effectiveKeyframes() const;
+    void invalidateTrackCache();
+    void syncTracksToSidecar();
+    TrackLenses trackLenses() const;
     SyncSolver *m_syncSolver = nullptr;
     GyroCalibrator *m_gyroCalibrator = nullptr;
     // Rebuild the optical drift correction on the current IMU chain (no-op

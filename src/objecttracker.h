@@ -85,6 +85,7 @@ private:
     int m_tileSize = 96;
     int m_badRun = 0;
     int m_hardRun = 0;
+    int m_ambiguousRun = 0;
     int m_rejectRun = 0;
     int m_frames = 0;
     double m_prevTime = 0.0;
@@ -116,6 +117,10 @@ struct TrackRequest {
     QVector<double> camTimes;
 
     double fps = 30.0;
+    // Object angular-speed gate. Generous by default because it is measured in
+    // the STABILISED frame, so it also absorbs whatever residual motion an
+    // imperfect sync or calibration leaves behind.
+    double maxWorldSpeedDeg = 40.0;
 };
 
 struct TrackResult {

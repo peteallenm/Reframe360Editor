@@ -2772,6 +2772,223 @@ static void testTileTrackerScale()
                          : QString()));
 }
 
+// ---------------------------------------------------------------------------
+// --track: run the real tracker over real footage and report what it did.
+// Synthetic tests prove the maths; this is the one that meets motion blur,
+// rolling shutter, compression and a subject that was never a tidy disc.
+//   tracking_tests --track --track-at=2.0 --track-secs=8 --track-ndc=0,0 clip.MP4
+// ---------------------------------------------------------------------------
+static double g_trackAt = 1.0;
+static double g_trackSecs = 8.0;
+static double g_trackNdcX = 0.0, g_trackNdcY = 0.0;
+static double g_trackSize = 0.15;
+static double g_trackGate = 40.0;
+static bool g_trackNoImu = false;   // --track-noimu: is the chain doing anything?
+// --track-conv=N: which camera->world map to use. The conventions in this
+// codebase are subtle (the chain stores A*F, visual bearings live in the
+// flipped frame), so pick the one that actually holds a static scene still.
+static int g_trackConv = 0;
+static QVector3D g_trackDir;          // --track-dir=x,y,z: seed a camera-frame bearing
+static bool g_trackUseDir = false;
+static double g_trackU = 0.5, g_trackV = 0.5;
+static int g_trackLens = 0;
+static bool g_trackUseUv = false;
+static QQuaternion camToWorld(const QQuaternion &chain)
+{
+    switch (g_trackConv) {
+    case 1: return chain * kFlipRollQ();
+    case 2: return chain.conjugated();
+    case 3: return (chain * kFlipRollQ()).conjugated();
+    case 4: return kFlipRollQ() * chain;
+    default: return chain;
+    }
+}
+
+// --track-dumpframe: write the decoded luma at t0 as a PGM, so a seed can be
+// chosen by looking at what the SENSOR saw rather than at the app's keyframed
+// view of it (they are not the same picture).
+static bool g_trackDumpFrame = false;
+
+static void trackRealClip(const QString &video)
+{
+    qInfo().noquote() << "\n===== object tracking:" << QFileInfo(video).fileName() << "=====";
+
+    ImuParser imu;
+    GyroscopeIntegrator gi;
+    const bool hasImu = !g_trackNoImu && imu.loadFile(video + ".imu") && !imu.samples().empty();
+    KeyframeModel kf;
+    kf.loadFromFile(video + QStringLiteral(".keyframes.json"));
+
+    // The chain has to be the one the APP builds, not a raw integration: the
+    // gyro calibration matrix and the camera-default scale factors change its
+    // rotation RATE, and a chain that turns at the wrong rate leaves the
+    // tracker's tile sliding exactly as if there were no stabilisation at all.
+    QMatrix3x3 gyroMatrix;
+    QVector3D gyroBias;
+    if (kf.hasGyroCalibration()) {
+        gyroMatrix = kf.gyroMatrix();
+        gyroBias = kf.gyroBias();
+    }
+    {
+        QSettings cam;
+        const double sxx = cam.value(QStringLiteral("camera/gyroScaleX"), imu.gyroScaleX()).toDouble();
+        const double syy = cam.value(QStringLiteral("camera/gyroScaleY"), imu.gyroScaleY()).toDouble();
+        const double szz = cam.value(QStringLiteral("camera/gyroScaleZ"), imu.gyroScaleZ()).toDouble();
+        if (cam.contains(QStringLiteral("camera/gyroScaleX")) && sxx > 5.0 && syy > 5.0 && szz > 5.0) {
+            QMatrix3x3 scaleDiag;
+            scaleDiag(0,0) = (float)(imu.gyroScaleX() / sxx);
+            scaleDiag(1,1) = (float)(imu.gyroScaleY() / syy);
+            scaleDiag(2,2) = (float)(imu.gyroScaleZ() / szz);
+            QMatrix3x3 combined;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) {
+                    float acc = 0.0f;
+                    for (int k = 0; k < 3; k++) acc += scaleDiag(r,k) * gyroMatrix(k,c);
+                    combined(r,c) = acc;
+                }
+            gyroMatrix = combined;
+        }
+    }
+    if (hasImu)
+        gi.integrate(imu.samples(), imu.imuSampleRate(), imu.initialQuaternion(),
+                     0.0f, 0.0f, gyroMatrix, gyroBias);
+    else
+        qInfo() << "  (no .imu sidecar: tracking without stabilisation)";
+    const double syncOffset = kf.hasSyncOffset() ? kf.syncOffset() : 0.17;
+    const double drift = kf.hasImuDrift() ? kf.imuDrift() : 0.0;
+
+    CalibrationProfile *cal = defaultCal();
+    TrackRequest req;
+    req.videoPath = video;
+    req.lenses = TrackLenses::fromCalibration(
+        cal->frontCenterX(), cal->frontCenterY(), cal->frontRadius(),
+        cal->frontK1(), cal->frontK2(), cal->frontRotation(), cal->frontHFlip(),
+        cal->rearCenterX(), cal->rearCenterY(), cal->rearRadius(),
+        cal->rearK1(), cal->rearK2(), cal->rearRotation(), cal->rearHFlip());
+    req.t0 = g_trackAt;
+    req.tEnd = g_trackAt + g_trackSecs;
+    req.fps = 30.0;
+    req.maxWorldSpeedDeg = g_trackGate;
+
+    // Seed straight through the chosen point of the FRONT lens, using the
+    // stabilised view the app would have had (yaw/pitch/roll all zero here).
+    const proj::ViewBasis basis = proj::ViewBasis::make(0, 0, 0, 90.0, 0, 16.0 / 9.0);
+    const proj::Vec3 look = proj::applyEuler(
+        proj::rayForNdc(g_trackNdcX, g_trackNdcY, basis), basis);
+    if (g_trackUseUv) {
+        req.seedDirCam = VisualRotationComputer::pixelToBearing(
+            g_trackU, g_trackV, g_trackLens == 1 ? req.lenses.rear : req.lenses.front).normalized();
+    } else {
+        req.seedDirCam = g_trackUseDir ? g_trackDir.normalized()
+                       : QVector3D((float)look.x, (float)look.y, (float)look.z).normalized();
+    }
+    req.seedRadiusRad = 0.5 * proj::degToRad(90.0) * g_trackSize;
+
+    for (double t = req.t0; t <= req.tEnd + 1.0 / 30.0; t += 1.0 / 30.0) {
+        QQuaternion q = kFlipRollQ();
+        if (hasImu)
+            q = camToWorld(gi.orientationAtTimeUnsmoothed(t * (1.0 + drift) + syncOffset));
+        req.camTimes.append(t);
+        req.camOrientations.append(q);
+    }
+
+    if (g_trackDumpFrame) {
+        // The tracker's own seed frame, straight out of the decoder.
+        req.tEnd = req.t0;      // one frame
+        req.seedRadiusRad = 0.02;
+    }
+
+    ObjectTracker tracker;
+    TrackResult result;
+    bool failed = false;
+    QString failure;
+    QEventLoop loop;
+    QObject::connect(&tracker, &ObjectTracker::trackFinished, &loop,
+                     [&](const TrackResult &r) { result = r; loop.quit(); });
+    QObject::connect(&tracker, &ObjectTracker::trackFailed, &loop,
+                     [&](const QString &m) { failed = true; failure = m; loop.quit(); });
+    tracker.track(req);
+    loop.exec();
+    delete cal;
+
+    if (failed) {
+        report("Track on real footage", false, failure);
+        return;
+    }
+
+    // What the track then implies for the view, which is what the user sees.
+    Track tr;
+    tr.t0 = req.t0;
+    tr.framingNdcX = g_trackNdcX;
+    tr.framingNdcY = g_trackNdcY;
+    tr.framingAspect = 16.0 / 9.0;
+    tr.framingProjection = 0;
+    tr.fov0 = 90.0;
+    tr.sizeRad0 = 2.0 * req.seedRadiusRad;
+    tr.samples = result.samples;
+    tr.lost = result.lost;
+    const QVector<Keyframe> kfs = track::resolve(
+        tr, req.lenses,
+        [&](double t) {
+            if (!hasImu) return kFlipRollQ();
+            return camToWorld(gi.orientationAtTimeUnsmoothed(t * (1.0 + drift) + syncOffset));
+        },
+        tr.endTime());
+
+    // How fast the subject moved in the WORLD frame, per frame. A subject that
+    // is actually static should sit near zero however the camera moved; a
+    // steady non-zero median is either real motion or the template sliding.
+    QVector<double> stepsDegPerSec;
+    for (int i = 1; i < result.samples.size(); ++i) {
+        const TrackSample &a = result.samples[i - 1], &b = result.samples[i];
+        auto worldOf = [&](const TrackSample &smp) {
+            const auto &lp = (smp.lens == 1) ? req.lenses.rear : req.lenses.front;
+            const QVector3D cam = VisualRotationComputer::pixelToBearing(smp.u, smp.v, lp);
+            QQuaternion q = kFlipRollQ();
+            if (hasImu)
+                q = camToWorld(gi.orientationAtTimeUnsmoothed(smp.t * (1.0 + drift) + syncOffset));
+            return q.rotatedVector(cam).normalized();
+        };
+        const double dt = qMax(1e-3, b.t - a.t);
+        const double dot = qBound(-1.0f, QVector3D::dotProduct(worldOf(a), worldOf(b)), 1.0f);
+        stepsDegPerSec.append(std::acos(dot) * 180.0 / M_PI / dt);
+    }
+    std::sort(stepsDegPerSec.begin(), stepsDegPerSec.end());
+    const double medStep = stepsDegPerSec.isEmpty() ? 0.0 : stepsDegPerSec[stepsDegPerSec.size() / 2];
+    const double p95Step = stepsDegPerSec.isEmpty() ? 0.0
+                          : stepsDegPerSec[(int)(stepsDegPerSec.size() * 0.95)];
+
+    double yawSpan = 0.0, pitchSpan = 0.0, fovMin = 999.0, fovMax = 0.0;
+    for (const Keyframe &k : kfs) {
+        yawSpan = qMax(yawSpan, std::fabs(k.yaw - kfs.first().yaw));
+        pitchSpan = qMax(pitchSpan, std::fabs(k.pitch - kfs.first().pitch));
+        fovMin = qMin(fovMin, k.fov);
+        fovMax = qMax(fovMax, k.fov);
+    }
+
+    qInfo().noquote() << QStringLiteral("  %1 samples over %2 s, mean score %3, %4 ms/frame")
+        .arg(result.samples.size())
+        .arg(result.samples.isEmpty() ? 0.0 : result.samples.constLast().t - req.t0, 0, 'f', 2)
+        .arg(result.meanScore, 0, 'f', 3).arg(result.msPerFrame, 0, 'f', 1);
+    qInfo().noquote() << QStringLiteral("  -> %1 keyframes; yaw moves %2 deg, pitch %3 deg, "
+                                        "fov %4..%5 deg")
+        .arg(kfs.size()).arg(yawSpan, 0, 'f', 1).arg(pitchSpan, 0, 'f', 1)
+        .arg(fovMin, 0, 'f', 1).arg(fovMax, 0, 'f', 1);
+    qInfo().noquote() << QStringLiteral("  world motion of the subject: median %1 deg/s, "
+                                        "p95 %2 deg/s")
+        .arg(medStep, 0, 'f', 1).arg(p95Step, 0, 'f', 1);
+    if (result.lost)
+        qInfo().noquote() << QStringLiteral("  lost at %1 s: %2")
+            .arg(result.lossTime, 0, 'f', 2).arg(result.lossReason);
+
+    // The bar for real footage: it must follow something for a useful while,
+    // with a match good enough to believe, and produce a usable curve.
+    report("Track on real footage", result.samples.size() >= 30 && result.meanScore > 0.4
+                                    && kfs.size() >= 2,
+           QStringLiteral("%1 samples, mean score %2, %3 keyframes")
+               .arg(result.samples.size()).arg(result.meanScore, 0, 'f', 3).arg(kfs.size()));
+}
+
 static void testSidecarUnknownKeys()
 {
     const QString path = QDir::temp().filePath(QStringLiteral("r360_sidecar_test.json"));
@@ -3070,6 +3287,7 @@ int main(int argc, char *argv[])
     QElapsedTimer total; total.start();
 
     bool quick = false;
+    bool trackMode = false;
     bool pairStats = false;
     bool lensSplit = false;
     bool seam = false;
@@ -3085,6 +3303,39 @@ int main(int argc, char *argv[])
     QStringList videos;
     for (int i = 1; i < argc; i++) {
         if (QString(argv[i]) == "--quick") { quick = true; continue; }
+        if (QString(argv[i]) == "--track") { trackMode = true; continue; }
+        if (QString(argv[i]).startsWith("--track-at=")) { g_trackAt = QString(argv[i]).mid(11).toDouble(); continue; }
+        if (QString(argv[i]).startsWith("--track-secs=")) { g_trackSecs = QString(argv[i]).mid(13).toDouble(); continue; }
+        if (QString(argv[i]).startsWith("--track-size=")) { g_trackSize = QString(argv[i]).mid(13).toDouble(); continue; }
+        if (QString(argv[i]).startsWith("--track-gate=")) { g_trackGate = QString(argv[i]).mid(13).toDouble(); continue; }
+        if (QString(argv[i]) == "--track-noimu") { g_trackNoImu = true; continue; }
+        if (QString(argv[i]) == "--track-dumpframe") { g_trackDumpFrame = true; continue; }
+        if (QString(argv[i]).startsWith("--track-uv=")) {
+            // Seed by half-frame sensor coordinates: u,v[,lens] as read off a
+            // dumped frame. The most direct way to point at a real subject.
+            const QStringList parts = QString(argv[i]).mid(11).split(',');
+            if (parts.size() >= 2) {
+                g_trackU = parts[0].toDouble();
+                g_trackV = parts[1].toDouble();
+                g_trackLens = parts.size() > 2 ? parts[2].toInt() : 0;
+                g_trackUseUv = true;
+            }
+            continue;
+        }
+        if (QString(argv[i]).startsWith("--track-dir=")) {
+            const QStringList parts = QString(argv[i]).mid(12).split(',');
+            if (parts.size() == 3) {
+                g_trackDir = QVector3D(parts[0].toFloat(), parts[1].toFloat(), parts[2].toFloat());
+                g_trackUseDir = true;
+            }
+            continue;
+        }
+        if (QString(argv[i]).startsWith("--track-conv=")) { g_trackConv = QString(argv[i]).mid(13).toInt(); continue; }
+        if (QString(argv[i]).startsWith("--track-ndc=")) {
+            const QStringList parts = QString(argv[i]).mid(12).split(',');
+            if (parts.size() == 2) { g_trackNdcX = parts[0].toDouble(); g_trackNdcY = parts[1].toDouble(); }
+            continue;
+        }
         if (QString(argv[i]) == "--pair-stats") { pairStats = true; continue; }
         if (QString(argv[i]) == "--lens-split") { lensSplit = true; continue; }
         if (QString(argv[i]) == "--seam-check") { seam = true; continue; }
@@ -3179,6 +3430,13 @@ int main(int argc, char *argv[])
         for (const auto &video : videos)
             lensSplitCompare(video);
         return 0;
+    }
+
+    if (trackMode) {
+        for (const auto &video : videos) trackRealClip(video);
+        qInfo().noquote() << "\n========== SUMMARY: PASS=" << g_pass << "FAIL=" << g_fail
+                          << "==========";
+        return g_fail == 0 ? 0 : 1;
     }
 
     if (pairStats) {

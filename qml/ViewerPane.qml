@@ -59,25 +59,102 @@ Item {
             id: dragArea
             anchors.fill: parent
             enabled: !!app.videoPath
-            cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+            cursorShape: app.trackArmed ? Qt.CrossCursor
+                                        : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
             acceptedButtons: Qt.LeftButton
 
             property point dragOrigin
+            // A tap has to be told apart from a drag: this one MouseArea owns
+            // every press, so "point at the subject" and "look around" are the
+            // same gesture until the finger moves.
+            property point pressPoint
+            property bool moved: false
+            readonly property int tapSlop: 8
 
             onPressed: (mouse) => {
                 dragOrigin = Qt.point(mouse.x, mouse.y)
+                pressPoint = Qt.point(mouse.x, mouse.y)
+                moved = false
             }
             onPositionChanged: (mouse) => {
                 if (!pressed) return
+                if (Math.abs(mouse.x - pressPoint.x) > tapSlop
+                    || Math.abs(mouse.y - pressPoint.y) > tapSlop)
+                    moved = true
                 var dx = mouse.x - dragOrigin.x
                 var dy = mouse.y - dragOrigin.y
                 if (dx === 0 && dy === 0) return
-                var sens = app.fov / Math.max(height, 1)
-                // Grab semantics: the picture follows the hand. Dragging DOWN
-                // must move the scene down, i.e. tilt the view up. The vertical
-                // sign was inverted (reported by the user); horizontal was right.
-                app.dragLook(dx * sens, dy * sens);
+                // While armed the drag does not look around -- the gesture is
+                // reserved for the pick, so a small wobble cannot re-aim the
+                // view under the finger.
+                if (!app.trackArmed) {
+                    var sens = app.fov / Math.max(height, 1)
+                    // Grab semantics: the picture follows the hand. Dragging DOWN
+                    // must move the scene down, i.e. tilt the view up. The vertical
+                    // sign was inverted (reported by the user); horizontal was right.
+                    app.dragLook(dx * sens, dy * sens);
+                }
                 dragOrigin = Qt.point(mouse.x, mouse.y)
+            }
+            onReleased: (mouse) => {
+                if (!app.trackArmed || moved) return
+                app.startTrackAt(mouse.x / Math.max(width, 1) * 2 - 1,
+                                 mouse.y / Math.max(height, 1) * 2 - 1,
+                                 width / Math.max(height, 1))
+            }
+        }
+
+        // Where the tracked subject is right now. Without it there is no way to
+        // tell a track that is holding from one that has quietly drifted.
+        Item {
+            id: trackMarker
+            visible: app.trackCount > 0 && ndc.length === 2
+            property var ndc: []
+            width: 34; height: 34
+            x: visible ? (ndc[0] * 0.5 + 0.5) * parent.width - width / 2 : 0
+            y: visible ? (ndc[1] * 0.5 + 0.5) * parent.height - height / 2 : 0
+
+            function refresh() {
+                ndc = app.trackMarkerNdc(lensViewer.width / Math.max(lensViewer.height, 1))
+            }
+            Connections {
+                target: app
+                function onCurrentTimeChanged() { trackMarker.refresh() }
+                function onTracksChanged() { trackMarker.refresh() }
+                function onYawChanged() { trackMarker.refresh() }
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                color: "transparent"
+                border.color: "#66d9ff"
+                border.width: 2
+                radius: width / 2
+                opacity: 0.85
+            }
+            Rectangle {
+                anchors.centerIn: parent
+                width: 3; height: 3; radius: 1.5
+                color: "#66d9ff"
+            }
+        }
+
+        // Armed: say what to do, because a crosshair alone does not explain it.
+        Rectangle {
+            visible: app.trackArmed
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: 16
+            width: hint.implicitWidth + 24
+            height: hint.implicitHeight + 14
+            radius: 6
+            color: "#cc1e88c7"
+            Label {
+                id: hint
+                anchors.centerIn: parent
+                text: qsTr("Tap what you want to follow")
+                color: "white"
+                font.pixelSize: 13
             }
         }
 

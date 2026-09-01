@@ -9,6 +9,8 @@
 // FOR A PARTICULAR PURPOSE.
 
 #include "app.h"
+#include "projection.h"
+#include "visualrotation.h"
 #include <QFileInfo>
 #include <QDir>
 #include <QStandardPaths>
@@ -161,6 +163,16 @@ App::App(QObject *parent)
     // Keep the per-video keyframe sidecar file in sync whenever the user adds,
     // edits or deletes keyframes.
     connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::saveKeyframes);
+    // Any edit to the keyframes changes where tracks are truncated, so the
+    // merged array has to be rebuilt.
+    connect(m_keyframes, &KeyframeModel::keyframesChanged, this, &App::invalidateTrackCache);
+    connect(m_keyframes, &KeyframeModel::trimChanged, this, &App::invalidateTrackCache);
+    connect(m_keyframes, &KeyframeModel::tracksChanged, this, [this]() {
+        m_tracks = track::fromJson(m_keyframes->tracksJson());
+        invalidateTrackCache();
+        emit tracksChanged();
+    });
+    connect(m_keyframes, &KeyframeModel::tracksChanged, this, &App::saveKeyframes);
 
     // The last-used export output options live in the same sidecar file, so
     // surface their changes to QML and persist them when the user picks new
@@ -306,6 +318,48 @@ App::App(QObject *parent)
     });
 
     m_visualRotation = new VisualRotationComputer(this);
+
+    m_objectTracker = new ObjectTracker(this);
+    connect(m_objectTracker, &ObjectTracker::progressChanged, this,
+            [this](double fraction, const QString &status) {
+                m_trackProgress = fraction;
+                m_trackStatus = status;
+                emit trackProgressChanged();
+                emit trackStatusChanged();
+            }, Qt::QueuedConnection);
+    connect(m_objectTracker, &ObjectTracker::trackFailed, this,
+            [this](const QString &message) {
+                m_trackRunning = false;
+                m_trackStatus = message;
+                emit trackRunningChanged();
+                emit trackStatusChanged();
+            }, Qt::QueuedConnection);
+    connect(m_objectTracker, &ObjectTracker::trackFinished, this,
+            [this](const TrackResult &result) {
+                m_trackRunning = false;
+                emit trackRunningChanged();
+                // A result for a clip the user has since closed is not ours.
+                if (m_pendingTrackVideo != m_videoPath || result.samples.size() < 2) {
+                    m_trackStatus = result.samples.size() < 2
+                        ? tr("Could not follow that — try a more distinct subject")
+                        : QString();
+                    emit trackStatusChanged();
+                    return;
+                }
+                Track finished = m_pendingTrack;
+                finished.samples = result.samples;
+                finished.lost = result.lost;
+                finished.lossTime = result.lossTime;
+                m_tracks.append(finished);
+                syncTracksToSidecar();          // emits tracksChanged -> saves
+                invalidateTrackCache();
+                m_trackStatus = result.lost
+                    ? tr("Tracked to %1 s, then lost it (%2)")
+                          .arg(result.lossTime, 0, 'f', 1).arg(result.lossReason)
+                    : tr("Tracked %1 s").arg(finished.endTime() - finished.t0, 0, 'f', 1);
+                emit trackStatusChanged();
+                emit tracksChanged();
+            }, Qt::QueuedConnection);
     m_syncSolver = new SyncSolver(this);
     m_gyroCalibrator = new GyroCalibrator(this);
     m_visualFusion = new VisualFusion();
@@ -1125,13 +1179,226 @@ void App::addKeyframeAtCurrent()
     m_keyframes->addKeyframe(m_currentTime, y, p, r, m_fov);
 }
 
+// --- object tracking ------------------------------------------------------
+
+TrackLenses App::trackLenses() const
+{
+    return TrackLenses::fromCalibration(
+        m_currentCalibration->frontCenterX(), m_currentCalibration->frontCenterY(),
+        m_currentCalibration->frontRadius(), m_currentCalibration->frontK1(), m_currentCalibration->frontK2(),
+        m_currentCalibration->frontRotation(), m_currentCalibration->frontHFlip(),
+        m_currentCalibration->rearCenterX(), m_currentCalibration->rearCenterY(),
+        m_currentCalibration->rearRadius(), m_currentCalibration->rearK1(), m_currentCalibration->rearK2(),
+        m_currentCalibration->rearRotation(), m_currentCalibration->rearHFlip());
+}
+
+const QVector<Keyframe> &App::effectiveKeyframes() const
+{
+    if (!m_effectiveDirty)
+        return m_effectiveKeyframes;
+    if (m_tracks.isEmpty()) {
+        m_effectiveKeyframes = m_keyframes->keyframes();
+    } else {
+        m_effectiveKeyframes = track::compose(
+            m_keyframes->keyframes(), m_tracks, trackLenses(),
+            [this](double t) { return imuOrientationAt(t); },
+            m_keyframes->trimOut(), duration());
+    }
+    m_effectiveDirty = false;
+    return m_effectiveKeyframes;
+}
+
+// Anything the resolution depends on has moved. Tracks are stored as sensor
+// measurements, so a re-sync or a re-calibration legitimately changes the view
+// they imply -- but only if the cache is dropped. Miss one of these and the
+// preview shows a track resolved against a stale chain while the next export
+// rebuilds against the fresh one.
+void App::invalidateTrackCache()
+{
+    m_effectiveDirty = true;
+    applyKeyframeInterpolation();
+}
+
+void App::syncTracksToSidecar()
+{
+    m_keyframes->setTracksJson(track::toJson(m_tracks));
+}
+
+void App::setTrackArmed(bool armed)
+{
+    if (m_trackArmed == armed)
+        return;
+    m_trackArmed = armed;
+    if (armed) {
+        m_trackStatus = tr("Point at what you want to follow");
+        emit trackStatusChanged();
+    }
+    emit trackArmedChanged();
+}
+
+void App::startTrackAt(double ndcX, double ndcY, double aspect, double sizeFraction)
+{
+    setTrackArmed(false);
+    if (m_videoPath.isEmpty() || m_trackRunning)
+        return;
+
+    // Where the user pointed, as a direction in the stabilised frame the view
+    // angles act in, then back into the camera frame the tracker measures in.
+    const proj::ViewBasis basis = proj::ViewBasis::make(
+        m_yaw, m_pitch, m_roll, m_fov, m_projection, aspect > 0.01 ? aspect : 16.0 / 9.0);
+    const proj::Vec3 look = proj::applyEuler(proj::rayForNdc(ndcX, ndcY, basis), basis);
+    const QVector3D worldDir((float)look.x, (float)look.y, (float)look.z);
+    const QQuaternion qDisplay = imuOrientationAt(m_currentTime);
+
+    TrackRequest req;
+    req.videoPath = m_videoPath;
+    req.proxyOverride = m_proxyOverride.isEmpty() ? previewThumbnailPath() : m_proxyOverride;
+    req.lenses = trackLenses();
+    req.t0 = m_currentTime;
+    req.seedDirCam = qDisplay.conjugated().rotatedVector(worldDir).normalized();
+    req.seedRadiusRad = qBound(0.005, 0.5 * proj::degToRad(m_fov) * sizeFraction, 0.5);
+    // Only used as a minimum spacing between frames and to sample the
+    // orientation chain (which is slerped anyway), so the camera's nominal
+    // 29.97 is close enough; the tracker consumes whatever frames it decodes.
+    req.fps = 30.0;
+
+    // Stop at the first manual keyframe after this point, else the trim-out,
+    // else the end of the clip.
+    double tEnd = m_keyframes->trimOut() > 0.0 ? m_keyframes->trimOut() : duration();
+    for (const Keyframe &k : m_keyframes->keyframes())
+        if (k.time > req.t0 + 1e-6) { tEnd = qMin(tEnd, k.time); break; }
+    for (const Track &t : m_tracks)
+        if (t.t0 > req.t0 + 1e-6) tEnd = qMin(tEnd, t.t0);
+    req.tEnd = tEnd;
+    if (req.tEnd <= req.t0 + 0.05) {
+        m_trackStatus = tr("No room to track before the next keyframe");
+        emit trackStatusChanged();
+        return;
+    }
+
+    // The camera's own orientation, sampled here so the worker never reads the
+    // integrator. Unsmoothed: the tile wants ALL camera motion removed, where
+    // imuOrientationAt deliberately leaves intentional pan in.
+    const double step = 1.0 / qMax(1.0, req.fps);
+    for (double t = req.t0; t <= req.tEnd + step; t += step) {
+        const double tImu = t * (1.0 + m_imuDrift) + m_imuSyncOffset;
+        // orientationAtTimeUnsmoothed already returns A*F -- the chain stores
+        // the flip (see composeStabilisation). Multiplying by kFlipRollQ()
+        // again would cancel it, and the tile would sample the image rotated
+        // 180 deg about the optical axis.
+        QQuaternion q = kFlipRollQ();
+        if (m_gyroIntegrator && !m_gyroIntegrator->activeOrientations().isEmpty())
+            q = m_gyroIntegrator->orientationAtTimeUnsmoothed(tImu);
+        req.camTimes.append(t);
+        req.camOrientations.append(q);
+    }
+
+    // What the resolver will need to turn those measurements into a view.
+    m_pendingTrack = Track();
+    m_pendingTrack.id = QStringLiteral("t%1").arg(QDateTime::currentMSecsSinceEpoch());
+    m_pendingTrack.t0 = req.t0;
+    m_pendingTrack.framingNdcX = ndcX;
+    m_pendingTrack.framingNdcY = ndcY;
+    m_pendingTrack.framingAspect = aspect > 0.01 ? aspect : 16.0 / 9.0;
+    m_pendingTrack.framingProjection = m_projection;
+    m_pendingTrack.yaw0 = m_yaw;
+    m_pendingTrack.pitch0 = m_pitch;
+    m_pendingTrack.roll0 = m_roll;
+    m_pendingTrack.fov0 = m_fov;
+    m_pendingTrack.sizeRad0 = 2.0 * req.seedRadiusRad;
+    m_pendingTrackVideo = m_videoPath;
+
+    m_trackRunning = true;
+    m_trackProgress = 0.0;
+    m_trackStatus = tr("Tracking…");
+    emit trackRunningChanged();
+    emit trackProgressChanged();
+    emit trackStatusChanged();
+    m_objectTracker->track(req);
+}
+
+void App::cancelTracking()
+{
+    if (m_objectTracker)
+        m_objectTracker->cancel();
+}
+
+void App::removeTrack(int index)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    m_tracks.removeAt(index);
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
+}
+
+void App::clearTracks()
+{
+    if (m_tracks.isEmpty())
+        return;
+    m_tracks.clear();
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
+}
+
+QVariantList App::trackMarkerNdc(double aspect) const
+{
+    QVariantList out;
+    const double t = m_currentTime;
+    const TrackLenses lenses = trackLenses();
+
+    for (const Track &tr : m_tracks) {
+        if (t < tr.t0 - 1e-6 || t > tr.endTime() + 1e-6 || tr.samples.size() < 2)
+            continue;
+        // Nearest sample: the marker is a sanity check, not a measurement, so
+        // interpolating between two 33 ms samples buys nothing.
+        const TrackSample *best = nullptr;
+        for (const TrackSample &s : tr.samples)
+            if (!best || std::fabs(s.t - t) < std::fabs(best->t - t))
+                best = &s;
+        if (!best || std::fabs(best->t - t) > 0.25)
+            continue;
+
+        const auto &lp = (best->lens == 1) ? lenses.rear : lenses.front;
+        const QVector3D cam = VisualRotationComputer::pixelToBearing(best->u, best->v, lp);
+        const QVector3D world = imuOrientationAt(best->t).rotatedVector(cam);
+        const proj::ViewBasis basis = proj::ViewBasis::make(
+            m_yaw, m_pitch, m_roll, m_fov, m_projection,
+            aspect > 0.01 ? aspect : 16.0 / 9.0);
+        double nx = 0.0, ny = 0.0;
+        if (!proj::ndcForDir(proj::unapplyEuler(
+                proj::Vec3{world.x(), world.y(), world.z()}, basis), basis, nx, ny))
+            continue;                       // behind the camera in this view
+        if (std::fabs(nx) > 1.5 || std::fabs(ny) > 1.5)
+            continue;                       // off screen
+        out << nx << ny;
+        return out;
+    }
+    return out;
+}
+
+QVariantList App::trackSpan(int index) const
+{
+    QVariantList out;
+    if (index < 0 || index >= m_tracks.size())
+        return out;
+    out << m_tracks[index].t0 << m_tracks[index].endTime() << m_tracks[index].lost;
+    return out;
+}
+
 void App::applyKeyframeInterpolation()
 {
-    if (!m_keyframes->hasKeyframes())
+    // The merged array, not m_keyframes: a track with no manual keyframes
+    // still drives the view, and testing hasKeyframes() here would leave the
+    // preview un-tracked while the export tracked.
+    const QVector<Keyframe> &kfs = effectiveKeyframes();
+    if (kfs.isEmpty())
         return;
 
     double y, p, r, f;
-    m_keyframes->interpolate(m_currentTime, y, p, r, f);
+    KeyframeModel::interpolate(kfs, m_currentTime, y, p, r, f);
     p = qBound(-kMaxPitch, p, kMaxPitch);
 
     m_viewQuat = QQuaternion::fromAxisAndAngle(0, 1, 0, y)
@@ -1461,7 +1728,9 @@ ExportSnapshot App::buildExportSnapshot() const
         s.base.curves = m_colorGrade->curvesActive();
         s.base.curveLut = m_colorGrade->curveLut();
     }
-    s.keyframes = m_keyframes->keyframes();
+    // Tracks are already folded in here, so ExportSnapshot::stateAt needs no
+    // knowledge of them -- and cannot disagree with the preview.
+    s.keyframes = effectiveKeyframes();
     s.imuStabilize = m_imuStabilize;
     if (m_gyroIntegrator) {
         s.imuOrientations = m_gyroIntegrator->activeOrientations();

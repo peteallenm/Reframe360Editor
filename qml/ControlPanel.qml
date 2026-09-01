@@ -257,6 +257,69 @@ Item {
                         }
                     }
 
+                    // Tracking belongs on the View tab: it is per-shot framing
+                    // you set while watching, and it drives the sliders above.
+                    GroupBox {
+                        title: qsTr("Follow an Object")
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            width: parent.width
+                            spacing: 8
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Button {
+                                    text: app.trackRunning ? qsTr("Stop")
+                                          : (app.trackArmed ? qsTr("Cancel") : qsTr("Track object…"))
+                                    enabled: app.videoPath !== ""
+                                    onClicked: {
+                                        if (app.trackRunning) app.cancelTracking()
+                                        else app.trackArmed = !app.trackArmed
+                                    }
+                                    ToolTip.text: qsTr("Point at something and it stays in the same part of the frame, at roughly the same size, until your next keyframe")
+                                    ToolTip.visible: hovered
+                                }
+
+                                Label {
+                                    id: trackLabel
+                                    text: app.trackRunning
+                                          ? qsTr("Tracking… %1%").arg((app.trackProgress * 100).toFixed(0))
+                                          : (app.trackStatus.length ? app.trackStatus
+                                             : (app.trackCount > 0
+                                                ? qsTr("%1 tracked").arg(app.trackCount)
+                                                : qsTr("No tracks")))
+                                    font.pixelSize: 11
+                                    color: app.trackRunning ? "#aaa" : (app.trackCount > 0 ? "#8f8" : "#888")
+                                    Layout.fillWidth: true
+                                    Layout.preferredWidth: 0
+                                    Layout.minimumWidth: 0
+                                    elide: Text.ElideRight
+                                    HoverHandler { id: trackHover }
+                                    ToolTip.text: trackLabel.text
+                                    ToolTip.visible: trackHover.hovered && trackLabel.truncated
+                                }
+                            }
+
+                            Button {
+                                text: qsTr("Clear tracks")
+                                enabled: app.trackCount > 0 && !app.trackRunning
+                                onClicked: app.clearTracks()
+                                Layout.fillWidth: true
+                            }
+
+                            Label {
+                                Layout.fillWidth: true
+                                wrapMode: Text.Wrap
+                                font.pixelSize: 11
+                                color: "#888"
+                                text: qsTr("A track ends at your next keyframe, or where it loses the subject. Add a keyframe to take over from there.")
+                            }
+                        }
+                    }
+
                     GroupBox {
                         title: qsTr("Projection")
                         Layout.fillWidth: true
