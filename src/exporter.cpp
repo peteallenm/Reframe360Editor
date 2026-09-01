@@ -26,6 +26,9 @@ extern "C" {
 #include <QtGlobal>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -474,11 +477,23 @@ bool DecodeReader::open(const QString &path, QString *error)
     // holds roughly thread_count frames in flight at ~25 MB each, which is
     // free on a desktop but worth capping on a phone that Android will kill
     // at ~1.5 GB.
+    // Half the cores, not all of them. Decode runs on its own thread (see
+    // FramePump) and only has to stay ahead of the GPU stage, which needs
+    // ~60 ms per frame; two threads already unwrap a 2880x5760 frame in ~35 ms.
+    // Handing the decoder every core measurably starves the thread driving the
+    // GPU -- on a 4-core desktop the same pass took 3.91 s at two threads and
+    // 6.89 s at one, while four threads was 3.95 s and made the flow-stitch
+    // and encode stages slower. RENDER360_DECODE_THREADS overrides it.
+    const int cores = qMax(1, QThread::idealThreadCount());
 #ifdef Q_OS_ANDROID
-    m_dec->thread_count = qMin(4, QThread::idealThreadCount());
+    // Also a memory ceiling: frame threading holds ~thread_count frames of
+    // ~25 MB, on top of the pump's queue, and Android kills at about 1.5 GB.
+    const int wanted = qBound(1, cores / 2, 3);
 #else
-    m_dec->thread_count = 0;      // one per core
+    const int wanted = qBound(1, cores / 2, 4);
 #endif
+    const int override_ = qEnvironmentVariableIntValue("RENDER360_DECODE_THREADS");
+    m_dec->thread_count = override_ > 0 ? override_ : wanted;
     m_dec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     if (avcodec_open2(m_dec, codec, nullptr) < 0) {
         if (error) *error = QObject::tr("Failed to open video decoder");
@@ -503,6 +518,101 @@ void DecodeReader::close()
     m_stream = nullptr;
     m_streamIdx = -1;
 }
+
+// ---------------------------------------------------------------------------
+// Decode ahead of the render loop.
+//
+// A pass is decode -> (flow) -> render -> encode on a single thread, so the
+// GPU idled while a 25 MB frame was unwrapped and the decoder idled while the
+// GPU worked. Decode touches no GL state and hands over a fully copied frame
+// (readFrameAt memcpys the planes), so it can run on its own thread with a
+// short queue in between: the pass then costs roughly max(decode, the rest)
+// instead of their sum. The queue is deliberately shallow -- each 2880x5760
+// frame is ~25 MB and Android kills the app at around 1.5 GB.
+class FramePump
+{
+public:
+    FramePump(DecodeReader &reader, double start, double fps, int frames)
+        : m_reader(reader), m_start(start), m_fps(fps), m_frames(frames)
+    {
+        m_thread = std::thread([this] { produce(); });
+    }
+    ~FramePump() { stop(); }
+
+    FramePump(const FramePump &) = delete;
+    FramePump &operator=(const FramePump &) = delete;
+
+    // Blocks until a frame is ready. False once the stream, or the requested
+    // frame count, is exhausted.
+    bool pop(DecodedFrame *out)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_filled.wait(lock, [this] { return !m_queue.empty() || m_done; });
+        if (m_queue.empty())
+            return false;
+        *out = std::move(m_queue.front());
+        m_queue.pop_front();
+        lock.unlock();
+        m_drained.notify_one();
+        return true;
+    }
+
+    // Idempotent, and run from the destructor: an error return from the render
+    // loop must not leave the decode thread running against a reader that is
+    // about to be rewound for the next pass.
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_drained.notify_all();
+        m_filled.notify_all();
+        if (m_thread.joinable())
+            m_thread.join();
+    }
+
+private:
+    void produce()
+    {
+        for (int i = 0; i < m_frames; ++i) {
+            DecodedFrame f;
+            if (!m_reader.readFrameAt(m_start + (double)i / m_fps, &f))
+                break;                              // EOF or decode error
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_drained.wait(lock, [this] { return m_queue.size() < kDepth || m_stop; });
+            if (m_stop)
+                break;
+            m_queue.push_back(std::move(f));
+            lock.unlock();
+            m_filled.notify_one();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done = true;
+        }
+        m_filled.notify_all();
+    }
+
+#ifdef Q_OS_ANDROID
+    static constexpr size_t kDepth = 2;
+#else
+    static constexpr size_t kDepth = 3;
+#endif
+
+    DecodeReader &m_reader;
+    const double m_start;
+    const double m_fps;
+    const int m_frames;
+
+    std::deque<DecodedFrame> m_queue;
+    std::mutex m_mutex;
+    std::condition_variable m_filled;
+    std::condition_variable m_drained;
+    bool m_done = false;
+    bool m_stop = false;
+    std::thread m_thread;
+};
 
 bool DecodeReader::readFrameAt(double targetSec, DecodedFrame *out)
 {
@@ -1036,14 +1146,19 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         qint64 nsDecode = 0, nsRender = 0, nsEncode = 0, nsFlow = 0;
         QElapsedTimer clock;
         clock.start();
+        // Decode runs one thread ahead; joined by the destructor on every exit
+        // path, before the caller rewinds the reader for the next pass.
+        FramePump pump(reader, start, fpsd, totalFrames);
         for (int i = 0; i < totalFrames && !eof; ++i) {
             const double t = start + (double)i / fpsd;
             DecodedFrame frame;
             const qint64 tA = clock.nsecsElapsed();
-            if (!reader.readFrameAt(t, &frame)) {
+            if (!pump.pop(&frame)) {
                 eof = true;
                 break;
             }
+            // Now a stall, not the cost of decoding: zero means the decoder
+            // stayed ahead of the GPU.
             nsDecode += clock.nsecsElapsed() - tA;
             // Look up the state at the frame's actual presentation timestamp,
             // not the idealized start + i/fps grid: the IMU sync must align to
@@ -1088,7 +1203,7 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         if (timing && written > 0) {
             const double total = clock.nsecsElapsed() / 1e9;
             qInfo("Export timing %dx%d: %d frames in %.2f s (%.2f fps) -- "
-                  "decode %.2f s (%.0f%%), flow stitch %.2f s (%.0f%%), "
+                  "decode wait %.2f s (%.0f%%), flow stitch %.2f s (%.0f%%), "
                   "render %.2f s (%.0f%%), encode %.2f s (%.0f%%)",
                   rw, rh, written, total, written / total,
                   nsDecode / 1e9, 100.0 * nsDecode / (total * 1e9),
