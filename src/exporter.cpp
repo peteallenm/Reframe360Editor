@@ -9,6 +9,7 @@
 // FOR A PARTICULAR PURPOSE.
 
 #include "exporter.h"
+#include "projection.h"
 extern "C" {
 #include <libavutil/spherical.h>
 }
@@ -58,34 +59,15 @@ extern "C" {
 // Math helpers — a faithful C++ port of project.frag
 // ---------------------------------------------------------------------------
 
-static constexpr double kPi = 3.14159265358979323846;
-
-static double degToRad(double d) { return d * kPi / 180.0; }
+// The ray/lens maths lives in projection.h so the object tracker and the
+// on-screen reticle can use the very same expressions this renderer does.
+using proj::Vec3;
+using proj::kPi;
+using proj::degToRad;
+using proj::normalize3;
+using proj::quatRotate;
 
 static double clampUnit(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
-
-struct Vec3 { double x, y, z; };
-
-static Vec3 normalize3(Vec3 v)
-{
-    double l = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (l < 1e-12) return Vec3{0.0, 0.0, 0.0};
-    return Vec3{v.x / l, v.y / l, v.z / l};
-}
-
-// Quaternion rotation (equivalent to QQuaternion::rotatedVector, inline for
-// speed since it runs per output pixel).
-static Vec3 quatRotate(double qw, double qx, double qy, double qz, Vec3 v)
-{
-    const double tx = 2.0 * (qy * v.z - qz * v.y);
-    const double ty = 2.0 * (qz * v.x - qx * v.z);
-    const double tz = 2.0 * (qx * v.y - qy * v.x);
-    return Vec3{
-        v.x + qw * tx + (qy * tz - qz * ty),
-        v.y + qw * ty + (qz * tx - qx * tz),
-        v.z + qw * tz + (qx * ty - qy * tx),
-    };
-}
 
 // Bilinear sample with GL texture semantics (texel i sits at (i+0.5)/size,
 // clamp-to-edge), so the output matches the linear-filtered GPU sampling.
@@ -166,90 +148,27 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
     const int us = frame.uStride;
     const int vs = frame.vStride;
 
-    const double aspect = (double)outW / (double)outH;
-    const double fovPersp = std::tan(degToRad(s.fov * 0.5));
-    const double fovStereo = 2.0 * std::tan(degToRad(s.fov * 0.25));
-    const double verticalStretch = (16.0 / 9.0) / (4.0 / 3.0); // 4/3
-
-    // eulerRotation(yaw, pitch, roll) = rotY * rotX * rotZ (see shader)
-    const double cy = std::cos(degToRad(s.yaw)), sy = std::sin(degToRad(s.yaw));
-    const double cp = std::cos(degToRad(s.pitch)), sp = std::sin(degToRad(s.pitch));
-    const double cr = std::cos(degToRad(s.roll)), sr = std::sin(degToRad(s.roll));
+    // The per-frame constants the ray maths needs (fov tangents and the
+    // yaw/pitch/roll trig), hoisted exactly as before -- now in one struct so
+    // the tracker can build the same basis.
+    const proj::ViewBasis basis = proj::ViewBasis::make(
+        s.yaw, s.pitch, s.roll, s.fov, s.projection, (double)outW / (double)outH);
 
     const QQuaternion imuC = s.imuOrientation.conjugated();
     const double iw = imuC.scalar(), ix = imuC.x(), iy = imuC.y(), iz = imuC.z();
 
-    auto rayFor = [&](double u, double v) {
-        switch (s.projection) {
-        case 1: {  // Equirectangular: maps the full 360x180 sphere
-            double lon = (u - 0.5) * 2.0 * kPi;
-            double lat = (0.5 - v) * kPi;
-            return Vec3{std::cos(lat) * std::sin(lon), std::sin(lat),
-                        -std::cos(lat) * std::cos(lon)};
-        }
-        case 2: {  // Stereographic
-            double ndcX = u * 2.0 - 1.0;
-            double ndcY = v * 2.0 - 1.0;
-            double px = ndcX * fovStereo * aspect;
-            double py = -ndcY * fovStereo;
-            double rho = std::sqrt(px * px + py * py);
-            double nx = (rho > 1e-6) ? px / rho : 0.0;
-            double ny = (rho > 1e-6) ? py / rho : 0.0;
-            double ang = 2.0 * std::atan(rho * 0.5);
-            return Vec3{nx * std::sin(ang), ny * std::sin(ang), -std::cos(ang)};
-        }
-        case 3: {  // SportsView
-            double ndcX = u * 2.0 - 1.0;
-            double ndcY = v * 2.0 - 1.0;
-            return normalize3(Vec3{ndcX * fovPersp * aspect,
-                                   -ndcY * fovPersp * verticalStretch, -1.0});
-        }
-        default: {  // Perspective (rectilinear)
-            double ndcX = u * 2.0 - 1.0;
-            double ndcY = v * 2.0 - 1.0;
-            return normalize3(Vec3{ndcX * fovPersp * aspect, -ndcY * fovPersp, -1.0});
-        }
-        }
-    };
-
-    // Apply rotZ, then rotX, then rotY (matrix order rotY * rotX * rotZ).
-    auto applyEuler = [&](Vec3 v) {
-        double zx = cr * v.x - sr * v.y;
-        double zy = sr * v.x + cr * v.y;
-        double xz = v.z;
-        double xx = zx;
-        // rotX columns in the shader are (1,0,0),(0,cp,sp),(0,-sp,cp):
-        // y' = cp*y - sp*z, z' = sp*y + cp*z. (Was the transpose -- pitch
-        // rendered inverted whenever the GPU path was unavailable.)
-        double xy = cp * zy - sp * xz;
-        double xzz = sp * zy + cp * xz;
-        return Vec3{cy * xx + sy * xzz, xy, -sy * xx + cy * xzz};
-    };
-
-    const double frontK1 = s.frontK1, frontK2 = s.frontK2;
-    const double rearK1 = s.rearK1, rearK2 = s.rearK2;
-    const double frontRot = degToRad(s.frontRotation);
-    const double rearRot = degToRad(s.rearRotation);
-    const double frontCr = std::cos(frontRot), frontSr = std::sin(frontRot);
-    const double rearCr = std::cos(rearRot), rearSr = std::sin(rearRot);
+    const proj::LensGeom frontGeom = proj::LensGeom::make(
+        s.frontCenterX, s.frontCenterY, s.frontRadius,
+        s.frontK1, s.frontK2, s.frontRotation, s.frontHFlip);
+    const proj::LensGeom rearGeom = proj::LensGeom::make(
+        s.rearCenterX, s.rearCenterY, s.rearRadius,
+        s.rearK1, s.rearK2, s.rearRotation, s.rearHFlip);
 
     auto sampleLens = [&](bool front, double theta, double phi,
                           double &rOut, double &gOut, double &bOut) {
-        double r = front ? theta / (kPi * 0.5) : (kPi - theta) / (kPi * 0.5);
-        double r2 = r * r;
-        double rd = r * (1.0 + (front ? frontK1 : rearK1) * r2
-                             + (front ? frontK2 : rearK2) * r2 * r2);
-        double c = std::cos(phi), sn = std::sin(phi);
-        double cc = front ? frontCr : rearCr;
-        double ss = front ? frontSr : rearSr;
-        double offx = (c * cc - sn * ss) * rd * (front ? s.frontRadius : s.rearRadius);
-        double offy = (c * ss + sn * cc) * rd * (front ? s.frontRadius : s.rearRadius);
-        if (front ? s.frontHFlip : s.rearHFlip)
-            offx = -offx;
-
-        double cu = (front ? s.frontCenterX : s.rearCenterX) + offx;
-        double cv = (front ? s.frontCenterY : s.rearCenterY) + offy;
-        double tv = front ? cv * 0.5 : cv * 0.5 + 0.5;
+        double cu, cv;
+        proj::lensUv(front, theta, phi, front ? frontGeom : rearGeom, cu, cv);
+        const double tv = proj::stackedV(front, cv);
 
         double yy = sampleBilinear(Y, yw, yh, ys, cu, tv) / 255.0;
         double uu = sampleBilinear(U, uw, uh, us, cu, tv) / 255.0;
@@ -264,12 +183,12 @@ static QImage renderFrame(const DecodedFrame &frame, const ExportFrameState &s,
                 double u = (px + 0.5) / outW;
                 double v = (py + 0.5) / outH;
 
-                Vec3 ray = rayFor(u, v);
-                ray = applyEuler(ray);                              // user look
+                Vec3 ray = proj::rayForUv(u, v, basis);
+                ray = proj::applyEuler(ray, basis);                 // user look
                 ray = quatRotate(iw, ix, iy, iz, ray);              // IMU counter-rotation
 
-                double theta = std::acos(qBound(-1.0, -ray.z, 1.0));
-                double phi = std::atan2(ray.y, ray.x);
+                double theta, phi;
+                proj::dirToThetaPhi(ray, theta, phi);
 
                 double rf, gf, bf, rr, gr, br;
                 sampleLens(true, theta, phi, rf, gf, bf);

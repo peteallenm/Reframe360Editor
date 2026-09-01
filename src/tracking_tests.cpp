@@ -23,6 +23,9 @@
 #include "gyrocalibration.h"
 #include "visualfusion.h"
 #include "keyframe.h"
+#include "projection.h"
+#include <QRandomGenerator>
+#include <cstring>
 #include <QDir>
 #include <QFile>
 #include <QTextStream>
@@ -2045,6 +2048,238 @@ static void testGyroIntegrator(const QString &video)
 // version, and saveToFile rebuilds the document from members -- so without
 // preservation the older build silently deletes whatever the newer one wrote.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// projection.h holds the ray/lens maths that used to be lambdas inside
+// exporter.cpp's renderFrame(). The port was meant to be a MOVE, so the bar is
+// bitwise equality, not a tolerance. Below is a pinned verbatim copy of the
+// pre-refactor bodies; if someone "tidies" projection.h into something
+// algebraically equivalent but differently associated, this fails.
+// ---------------------------------------------------------------------------
+namespace pinned {
+
+struct Vec3 { double x, y, z; };
+static const double kPi = 3.14159265358979323846;
+static double degToRad(double d) { return d * kPi / 180.0; }
+
+static Vec3 normalize3(Vec3 v)
+{
+    double l = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (l < 1e-12) return Vec3{0.0, 0.0, 0.0};
+    return Vec3{v.x / l, v.y / l, v.z / l};
+}
+
+// Verbatim: exporter.cpp rayFor lambda, pre-refactor.
+static Vec3 rayFor(double u, double v, int projection,
+                   double fovPersp, double fovStereo, double aspect,
+                   double verticalStretch)
+{
+    switch (projection) {
+    case 1: {
+        double lon = (u - 0.5) * 2.0 * kPi;
+        double lat = (0.5 - v) * kPi;
+        return Vec3{std::cos(lat) * std::sin(lon), std::sin(lat),
+                    -std::cos(lat) * std::cos(lon)};
+    }
+    case 2: {
+        double ndcX = u * 2.0 - 1.0;
+        double ndcY = v * 2.0 - 1.0;
+        double px = ndcX * fovStereo * aspect;
+        double py = -ndcY * fovStereo;
+        double rho = std::sqrt(px * px + py * py);
+        double nx = (rho > 1e-6) ? px / rho : 0.0;
+        double ny = (rho > 1e-6) ? py / rho : 0.0;
+        double ang = 2.0 * std::atan(rho * 0.5);
+        return Vec3{nx * std::sin(ang), ny * std::sin(ang), -std::cos(ang)};
+    }
+    case 3: {
+        double ndcX = u * 2.0 - 1.0;
+        double ndcY = v * 2.0 - 1.0;
+        return normalize3(Vec3{ndcX * fovPersp * aspect,
+                               -ndcY * fovPersp * verticalStretch, -1.0});
+    }
+    default: {
+        double ndcX = u * 2.0 - 1.0;
+        double ndcY = v * 2.0 - 1.0;
+        return normalize3(Vec3{ndcX * fovPersp * aspect, -ndcY * fovPersp, -1.0});
+    }
+    }
+}
+
+// Verbatim: exporter.cpp applyEuler lambda, pre-refactor.
+static Vec3 applyEuler(Vec3 v, double cy, double sy, double cp, double sp,
+                       double cr, double sr)
+{
+    double zx = cr * v.x - sr * v.y;
+    double zy = sr * v.x + cr * v.y;
+    double xz = v.z;
+    double xx = zx;
+    double xy = cp * zy - sp * xz;
+    double xzz = sp * zy + cp * xz;
+    return Vec3{cy * xx + sy * xzz, xy, -sy * xx + cy * xzz};
+}
+
+// Verbatim: the uv half of exporter.cpp's sampleLens lambda, pre-refactor.
+static void lensUv(bool front, double theta, double phi,
+                   double k1, double k2, double cc, double ss, double radius,
+                   bool hflip, double centerX, double centerY,
+                   double &cu, double &cv)
+{
+    double r = front ? theta / (kPi * 0.5) : (kPi - theta) / (kPi * 0.5);
+    double r2 = r * r;
+    double rd = r * (1.0 + k1 * r2 + k2 * r2 * r2);
+    double c = std::cos(phi), sn = std::sin(phi);
+    double offx = (c * cc - sn * ss) * rd * radius;
+    double offy = (c * ss + sn * cc) * rd * radius;
+    if (hflip)
+        offx = -offx;
+    cu = centerX + offx;
+    cv = centerY + offy;
+}
+
+} // namespace pinned
+
+static void testProjectionRefactor()
+{
+    QRandomGenerator rng(12345);
+    int rayBad = 0, eulerBad = 0, lensBad = 0;
+    const int N = 100000;
+
+    for (int i = 0; i < N; ++i) {
+        const int projection = (int)(rng.generateDouble() * 4.0) % 4;
+        const double fov    = 10.0 + rng.generateDouble() * 160.0;
+        const double aspect = 0.5 + rng.generateDouble() * 2.5;
+        const double yaw    = rng.generateDouble() * 720.0 - 360.0;
+        const double pitch  = rng.generateDouble() * 179.0 - 89.5;
+        const double roll   = rng.generateDouble() * 720.0 - 360.0;
+        const double u = rng.generateDouble(), v = rng.generateDouble();
+
+        const proj::ViewBasis b = proj::ViewBasis::make(yaw, pitch, roll, fov,
+                                                        projection, aspect);
+        const double fovPersp  = std::tan(pinned::degToRad(fov * 0.5));
+        const double fovStereo = 2.0 * std::tan(pinned::degToRad(fov * 0.25));
+        const double vStretch  = (16.0 / 9.0) / (4.0 / 3.0);
+        const double cy = std::cos(pinned::degToRad(yaw)),   sy = std::sin(pinned::degToRad(yaw));
+        const double cp = std::cos(pinned::degToRad(pitch)), sp = std::sin(pinned::degToRad(pitch));
+        const double cr = std::cos(pinned::degToRad(roll)),  sr = std::sin(pinned::degToRad(roll));
+
+        const pinned::Vec3 pr = pinned::rayFor(u, v, projection, fovPersp,
+                                               fovStereo, aspect, vStretch);
+        const proj::Vec3   nr = proj::rayForUv(u, v, b);
+        if (std::memcmp(&pr, &nr, sizeof(pr)) != 0) ++rayBad;
+
+        const pinned::Vec3 pe = pinned::applyEuler(pr, cy, sy, cp, sp, cr, sr);
+        const proj::Vec3   ne = proj::applyEuler(nr, b);
+        if (std::memcmp(&pe, &ne, sizeof(pe)) != 0) ++eulerBad;
+
+        // Lens map, both halves.
+        const bool front = (i % 2) == 0;
+        const double k1 = rng.generateDouble() * 0.4 - 0.2;
+        const double k2 = rng.generateDouble() * 0.2 - 0.1;
+        const double rotDeg = rng.generateDouble() * 360.0 - 180.0;
+        const double radius = 0.4 + rng.generateDouble() * 0.2;
+        const double ccx = 0.45 + rng.generateDouble() * 0.1;
+        const double ccy = 0.45 + rng.generateDouble() * 0.1;
+        const bool hflip = (rng.generate() & 1) != 0;
+        const double theta = rng.generateDouble() * M_PI;
+        const double phi   = rng.generateDouble() * 2.0 * M_PI - M_PI;
+
+        double pcu, pcv;
+        pinned::lensUv(front, theta, phi, k1, k2,
+                       std::cos(pinned::degToRad(rotDeg)),
+                       std::sin(pinned::degToRad(rotDeg)),
+                       radius, hflip, ccx, ccy, pcu, pcv);
+        double ncu, ncv;
+        proj::lensUv(front, theta, phi,
+                     proj::LensGeom::make(ccx, ccy, radius, k1, k2, rotDeg, hflip),
+                     ncu, ncv);
+        if (std::memcmp(&pcu, &ncu, sizeof(double)) != 0
+            || std::memcmp(&pcv, &ncv, sizeof(double)) != 0) ++lensBad;
+    }
+
+    report("projection.h is bitwise identical to the old renderFrame lambdas",
+           rayBad == 0 && eulerBad == 0 && lensBad == 0,
+           QStringLiteral("%1 samples, mismatches ray=%2 euler=%3 lens=%4")
+               .arg(N).arg(rayBad).arg(eulerBad).arg(lensBad));
+}
+
+// ---------------------------------------------------------------------------
+// The forward lens map (projection.h, from the renderer) and the inverse
+// (VisualRotationComputer::pixelToBearing, from the solver) have never been
+// tested against each other, and object tracking rests on them agreeing:
+// it back-projects a tracked pixel and the renderer must aim at the same spot.
+// mirrorAzimuth MUST be false -- that flag is a solver-only convention.
+// ---------------------------------------------------------------------------
+static void testLensMapRoundTrip()
+{
+    CalibrationProfile *cal = defaultCal();
+    QRandomGenerator rng(6789);
+
+    struct Side { bool front; double worstDeg; int checked; double worstTheta; QVector<double> errs; };
+    Side sides[2] = {{true, 0.0, 0, 0.0, {}}, {false, 0.0, 0, 0.0, {}}};
+
+    for (int i = 0; i < 20000; ++i) {
+        Side &side = sides[i % 2];
+        const bool front = side.front;
+
+        // A direction inside this lens's field, kept off the very rim where
+        // the distortion polynomial is not invertible in practice.
+        const double theta = front ? rng.generateDouble() * (M_PI * 0.47)
+                                   : M_PI - rng.generateDouble() * (M_PI * 0.47);
+        const double phi = rng.generateDouble() * 2.0 * M_PI - M_PI;
+
+        const proj::LensGeom g = front
+            ? proj::LensGeom::make(cal->frontCenterX(), cal->frontCenterY(), cal->frontRadius(),
+                                   cal->frontK1(), cal->frontK2(), cal->frontRotation(),
+                                   cal->frontHFlip())
+            : proj::LensGeom::make(cal->rearCenterX(), cal->rearCenterY(), cal->rearRadius(),
+                                   cal->rearK1(), cal->rearK2(), cal->rearRotation(),
+                                   cal->rearHFlip());
+        double u, v;
+        proj::lensUv(front, theta, phi, g, u, v);
+        if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0)
+            continue;                       // outside the recorded frame
+
+        VisualRotationComputer::LensParams lp;
+        lp.cx = front ? cal->frontCenterX() : cal->rearCenterX();
+        lp.cy = front ? cal->frontCenterY() : cal->rearCenterY();
+        lp.radius = front ? cal->frontRadius() : cal->rearRadius();
+        lp.k1 = front ? cal->frontK1() : cal->rearK1();
+        lp.k2 = front ? cal->frontK2() : cal->rearK2();
+        lp.rotation = front ? cal->frontRotation() : cal->rearRotation();
+        lp.hflip = front ? cal->frontHFlip() : cal->rearHFlip();
+        lp.isRear = !front;
+        lp.mirrorAzimuth = false;
+
+        const QVector3D backF = VisualRotationComputer::pixelToBearing(u, v, lp);
+        // Compare in double, and via atan2(|a x b|, a.b) rather than acos(a.b).
+        // pixelToBearing returns a float vector, and acos near dot=1 amplifies
+        // float epsilon by a square root -- that alone reads as 0.028 deg of
+        // error that is not there.
+        const double bx = backF.x(), by = backF.y(), bz = backF.z();
+        const double bn = std::sqrt(bx * bx + by * by + bz * bz);
+        const double ax = std::sin(theta) * std::cos(phi);
+        const double ay = std::sin(theta) * std::sin(phi);
+        const double az = -std::cos(theta);
+        const double dot = (ax * bx + ay * by + az * bz) / (bn > 0 ? bn : 1.0);
+        const double cx_ = ay * bz - az * by, cy_ = az * bx - ax * bz, cz_ = ax * by - ay * bx;
+        const double crossN = std::sqrt(cx_ * cx_ + cy_ * cy_ + cz_ * cz_) / (bn > 0 ? bn : 1.0);
+        const double errDeg = std::atan2(crossN, dot) * 180.0 / M_PI;
+        if (errDeg > side.worstDeg) { side.worstDeg = errDeg; side.worstTheta = theta * 180.0 / M_PI; }
+        side.errs.append(errDeg);
+        side.checked++;
+    }
+
+    const bool ok = sides[0].checked > 100 && sides[1].checked > 100
+                 && sides[0].worstDeg < 1e-4 && sides[1].worstDeg < 1e-4;
+    delete cal;
+    for (Side &sd : sides) std::sort(sd.errs.begin(), sd.errs.end());
+    auto med = [](Side &sd) { return sd.errs.isEmpty() ? 0.0 : sd.errs[sd.errs.size()/2]; };
+    report("Forward lens map inverts to pixelToBearing", ok,
+           QStringLiteral("front worst %1 deg @theta=%2 (median %3), rear worst %4 deg @theta=%5 (median %6)")
+               .arg(sides[0].worstDeg, 0, 'g', 3).arg(sides[0].worstTheta, 0, 'f', 1).arg(med(sides[0]), 0, 'g', 3)
+               .arg(sides[1].worstDeg, 0, 'g', 3).arg(sides[1].worstTheta, 0, 'f', 1).arg(med(sides[1]), 0, 'g', 3));
+}
+
 static void testSidecarUnknownKeys()
 {
     const QString path = QDir::temp().filePath(QStringLiteral("r360_sidecar_test.json"));
@@ -2471,6 +2706,10 @@ int main(int argc, char *argv[])
 
         qInfo() << "--- Test 0c: sidecar forward-compatibility ---";
         testSidecarUnknownKeys();
+
+        qInfo() << "--- Test 0d: projection maths ---";
+        testProjectionRefactor();
+        testLensMapRoundTrip();
 
         qInfo() << "--- Test 1: IMU parser ---";
         testImuParser(video);
