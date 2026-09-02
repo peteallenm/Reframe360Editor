@@ -12,6 +12,7 @@
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QTimer>
 #include <cmath>
 #include <cstdio>
 
@@ -3081,6 +3082,55 @@ static void trackRealClip(const QString &video)
         loop2.exec();
         report("A second track does not crash", secondDone || secondFailed,
                secondDone ? QStringLiteral("completed") : QStringLiteral("failed cleanly"));
+        QObject::disconnect(&tracker, nullptr, &loop2, nullptr);
+    }
+
+    // Regression: starting a pass while one is genuinely RUNNING, then
+    // cancelling and starting another. The refusal used to be silent, which
+    // left the panel showing "Stop" over a pass that never began; and the
+    // restart used to wait only 5 s before deleting the worker outright,
+    // which frees a running QThread's private data underneath it -- the same
+    // use-after-free, just needing slower storage to show itself.
+    {
+        TrackRequest longRun = req;
+        longRun.tEnd = req.t0 + qMax(4.0, g_trackSecs);
+        bool refused = false, firstEnded = false;
+        QString refusal;
+        QEventLoop loop3;
+        QObject::connect(&tracker, &ObjectTracker::trackFailed, &loop3,
+                         [&](const QString &m) { refused = true; refusal = m; });
+        QObject::connect(&tracker, &ObjectTracker::trackFinished, &loop3,
+                         [&](const TrackResult &) { firstEnded = true; });
+        tracker.track(longRun);                 // starts a worker
+        tracker.track(longRun);                 // must be refused, not crash
+
+        // Drain the cancelled run COMPLETELY before arming the restart. Its
+        // trackFinished is queued, and letting that land in the restart's
+        // event loop reports the cancelled pass as the restart -- which it
+        // did: a "passing" restart that had decoded no frames at all.
+        tracker.cancel();
+        while (!firstEnded)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        QObject::disconnect(&tracker, nullptr, &loop3, nullptr);
+
+        TrackResult restart;
+        bool restarted = false;
+        QEventLoop loop4;
+        QObject::connect(&tracker, &ObjectTracker::trackFinished, &loop4,
+                         [&](const TrackResult &r) { restart = r; restarted = true; loop4.quit(); });
+        QObject::connect(&tracker, &ObjectTracker::trackFailed, &loop4,
+                         [&](const QString &) { loop4.quit(); });
+        TrackRequest third = req;
+        third.tEnd = req.t0 + qMin(1.0, g_trackSecs);
+        tracker.track(third);
+        loop4.exec();
+        QObject::disconnect(&tracker, nullptr, &loop4, nullptr);
+
+        report("Overlapping start is refused, and a restart still works",
+               refused && restarted && restart.samples.size() > 2,
+               QStringLiteral("refusal: %1; restart produced %2 samples")
+                   .arg(refused ? refusal : QStringLiteral("(none -- silent)"))
+                   .arg(restart.samples.size()));
     }
 
     // What the track then implies for the view, which is what the user sees.

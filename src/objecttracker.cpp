@@ -663,22 +663,46 @@ ObjectTracker::~ObjectTracker()
 {
     cancel();
     if (m_thread) {
-        m_thread->wait(5000);          // never detach: a worker outliving the
-        delete m_thread;               // app is a shutdown crash
-        m_thread = nullptr;
+        // Wait without a deadline. The worker calls run() on THIS object, so
+        // returning while it is still going leaves it holding a destroyed
+        // tracker -- there is no safe timeout here, only a wait. The loop
+        // tests the cancel flag once per frame, so this is bounded by one
+        // frame's decode in every case that is not already wedged.
+        m_thread->wait();
+        delete m_thread;               // never detach: a worker outliving the
+        m_thread = nullptr;            // app is a shutdown crash
     }
 }
 
 void ObjectTracker::track(const TrackRequest &req)
 {
-    if (m_running.loadRelaxed() != 0)
+    if (m_running.loadRelaxed() != 0) {
+        // Refuse, but SAY so. Returning silently left App's m_trackRunning
+        // stuck true, so the button read "Stop" over a pass that was never
+        // started and the panel never came back.
+        emit trackFailed(QObject::tr("A track is already running"));
         return;
+    }
     // Own the thread outright. It used to delete itself on finished() while
     // m_thread went on pointing at it, so the SECOND track called wait() on
     // freed memory and took the app down with it.
     if (m_thread) {
-        m_thread->wait(5000);
-        delete m_thread;
+        // m_running is cleared by the worker BEFORE run() returns, so the
+        // thread can still be winding down here. Ask it to stop and wait
+        // properly: deleting a QThread that is still running frees its private
+        // data underneath the running code, which is the very use-after-free
+        // this ownership was introduced to prevent -- a 5 s timeout followed
+        // by an unconditional delete just moved the crash to slow storage.
+        m_cancel.storeRelaxed(1);
+        if (m_thread->wait(30000)) {
+            delete m_thread;
+        } else {
+            // It will not stop. Hand it to Qt to free once it genuinely
+            // finishes and let go of the pointer: a leaked thread is
+            // survivable, a freed running one is not.
+            connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
+            qWarning("ObjectTracker: previous pass would not stop; leaving it to finish");
+        }
         m_thread = nullptr;
     }
     m_cancel.storeRelaxed(0);
