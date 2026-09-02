@@ -55,7 +55,7 @@ public:
         TrackLenses lenses;
         QVector3D seedDirCam;         // object bearing at the seed frame
         double seedRadiusRad = 0.02;
-        double maxWorldSpeedDeg = 40.0;
+        double maxWorldSpeedDeg = 150.0;
     };
     enum class Step { Ok, Rejected, Lost };
 
@@ -72,6 +72,7 @@ public:
     QString lossReason() const { return m_lossReason; }
     double lastScore() const { return m_lastScore; }
     double scaleRatio() const;
+    int reseedCount() const { return m_reseeds; }
 
 private:
     struct Impl;
@@ -86,6 +87,8 @@ private:
     int m_badRun = 0;
     int m_hardRun = 0;
     int m_ambiguousRun = 0;
+    int m_reseeds = 0;
+    double m_lastReseedTime = -1e9;
     int m_rejectRun = 0;
     int m_frames = 0;
     double m_prevTime = 0.0;
@@ -117,10 +120,11 @@ struct TrackRequest {
     QVector<double> camTimes;
 
     double fps = 30.0;
-    // Object angular-speed gate. Generous by default because it is measured in
-    // the STABILISED frame, so it also absorbs whatever residual motion an
-    // imperfect sync or calibration leaves behind.
-    double maxWorldSpeedDeg = 40.0;
+    // Object angular-speed gate: a guard against teleports, not a speed limit
+    // on the subject. Measured world-frame motion on real handheld footage
+    // runs to ~30 deg/s median with a p95 near 110, so anything under about
+    // 150 rejects ordinary frames -- which is what kept ending good tracks.
+    double maxWorldSpeedDeg = 150.0;
 };
 
 struct TrackResult {

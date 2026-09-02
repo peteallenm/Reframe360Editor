@@ -39,12 +39,25 @@ namespace {
 // (tracking_tests --track-stats) before anyone calls them final.
 constexpr int    kTemplate          = 48;    // template edge, px
 constexpr double kScaleStep         = 1.09;  // the +/- scale probed each frame
-constexpr double kScoreHardFloor    = 0.30;  // this bad for kHardRun frames
-constexpr int    kHardRun           = 2;     // ... two, so a single motion-blurred
-                                             // frame cannot end a good track
-constexpr double kScoreSoftFloor    = 0.45;  // this bad for kBadRun frames ends it
-constexpr int    kBadRun            = 5;
-constexpr int    kRejectRun         = 6;     // consecutive gated frames -> lost
+// Score floors, measured rather than guessed: on this camera's footage a
+// healthy track sits around 0.5-0.7, so the old 0.45 soft floor was sitting
+// right on top of normal operation and ending tracks that were working.
+constexpr double kScoreHardFloor    = 0.18;  // this bad for kHardRun frames
+constexpr int    kHardRun           = 3;     // ... so a burst of motion blur
+                                             // cannot end a good track
+constexpr double kScoreSoftFloor    = 0.30;  // this bad for kBadRun frames ends it
+constexpr int    kBadRun            = 8;
+constexpr int    kRejectRun         = 15;    // gated frames before giving up:
+                                             // coast through a bad patch, since
+                                             // the prediction is usually right
+// How fast the running template adopts the subject's current appearance.
+constexpr double kRunningBlend      = 0.08;
+constexpr double kRunningUpdateMin  = 0.45;  // only learn from a good match
+// Re-acquisition. A subject that turns, or is briefly occluded, stops matching
+// the patch that was picked while the tracker is still pointing at it; taking
+// a fresh template there is what carries a track through that.
+constexpr int    kMaxReseeds        = 12;
+constexpr double kReseedMinGap      = 0.30;  // seconds between re-seeds
 constexpr double kMinValidFraction  = 0.80;  // of the tile inside a lens circle
 constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
 // Variance is not enough. A smooth gradient -- sky, a blurred wall, water --
@@ -55,7 +68,10 @@ constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
 constexpr double kMaxSeedRival      = 0.80;  // best rival peak, at seed time
 constexpr double kMaxRunRival       = 0.92;  // ... and while running
 constexpr int    kAmbiguousRun      = 8;     // consecutive ambiguous frames
-constexpr double kMaxWorldSpeedDeg  = 40.0;  // object angular speed gate
+// A sanity gate against teleports, not a speed limit on the subject. Measured
+// world-frame motion on real handheld footage runs to 30 deg/s median with a
+// p95 near 110, so 40 was rejecting ordinary frames.
+constexpr double kMaxWorldSpeedDeg  = 150.0;
 constexpr double kMaxScaleStepLog   = 0.223; // log(1.25) per frame
 constexpr double kSeamThetaDeg      = 90.0;
 constexpr double kSeamHysteresisDeg = 4.0;
@@ -114,16 +130,19 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
     const double half = S * 0.5;
     int valid = 0;
 
-    // One lens for the whole tile: blending them here would ghost a near
-    // subject (the parallax the stitcher exists to fix) and NCC wants a clean
-    // patch. Hysteresis stops it flapping at the seam.
-    const double centreTheta = std::acos(clampd(-qInv.rotatedVector(fwd).z(), -1.0, 1.0))
-                             * 180.0 / M_PI;
-    const bool useRear = preferRear ? (centreTheta > kSeamThetaDeg - kSeamHysteresisDeg)
-                                    : (centreTheta > kSeamThetaDeg + kSeamHysteresisDeg);
-    const auto &lp = useRear ? lenses.rear : lenses.front;
-    const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
-                                                     lp.rotation, lp.hflip);
+    // Lens chosen PER PIXEL, by which one actually sees that direction -- not
+    // per tile. A tile centred on the seam is covered by neither lens alone,
+    // and treating that as "left the lens" ended tracks exactly when a subject
+    // crossed between the two. Each pixel still comes from exactly one lens,
+    // so there is no blending and no parallax ghosting; the patch's appearance
+    // does shift as it crosses, which the running template absorbs.
+    const proj::LensGeom geomFront = proj::LensGeom::make(
+        lenses.front.cx, lenses.front.cy, lenses.front.radius,
+        lenses.front.k1, lenses.front.k2, lenses.front.rotation, lenses.front.hflip);
+    const proj::LensGeom geomRear = proj::LensGeom::make(
+        lenses.rear.cx, lenses.rear.cy, lenses.rear.radius,
+        lenses.rear.k1, lenses.rear.k2, lenses.rear.rotation, lenses.rear.hflip);
+    Q_UNUSED(preferRear);
     double sum = 0.0;
 
     for (int j = 0; j < S; ++j) {
@@ -135,13 +154,11 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
             const QVector3D rayCam = qInv.rotatedVector(rayWorld);
             double theta, phi;
             proj::dirToThetaPhi(toV(rayCam), theta, phi);
-            const bool inField = useRear ? (theta > M_PI * 0.5 - 0.02)
-                                         : (theta < M_PI * 0.5 + 0.02);
-            if (!inField) { row[i] = 0; continue; }
+            const bool front = theta <= M_PI * 0.5;
             double u, v;
-            proj::lensUv(!useRear, theta, phi, geom, u, v);
+            proj::lensUv(front, theta, phi, front ? geomFront : geomRear, u, v);
             if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) { row[i] = 0; continue; }
-            const double val = sampleY(Y, w, h, stride, u, proj::stackedV(!useRear, v));
+            const double val = sampleY(Y, w, h, stride, u, proj::stackedV(front, v));
             row[i] = (uchar)clampd(val, 0.0, 255.0);
             sum += val;
             ++valid;
@@ -265,7 +282,13 @@ private:
 
 // --- TileTracker ----------------------------------------------------------
 
-struct TileTracker::AnchorHolder { cv::Mat anchor; };
+// Two templates. The anchor is what the user pointed at and never changes, so
+// it cannot drift; the running one follows the subject's appearance as it
+// turns, is lit differently or changes shape, which is the only way to hold a
+// person for more than a second or two. Position comes from whichever matches
+// better this frame, so a stale anchor cannot veto a good running match and a
+// drifting running template cannot outvote the anchor.
+struct TileTracker::AnchorHolder { cv::Mat anchor; cv::Mat running; };
 
 double TileTracker::scaleRatio() const { return std::exp(m_scaleLog); }
 
@@ -278,6 +301,8 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
     m_scaleLog = 0.0;
     m_frames = 0;
     m_badRun = m_rejectRun = m_hardRun = m_ambiguousRun = 0;
+    m_reseeds = 0;
+    m_lastReseedTime = -1e9;
     m_prevTime = t;
     m_lossReason.clear();
     m_omegaRate = 0.0;
@@ -299,6 +324,7 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
     }
     const int o = (m_tileSize - kTemplate) / 2;
     m_anchorHolder->anchor = tile(cv::Rect(o, o, kTemplate, kTemplate)).clone();
+    m_anchorHolder->running = m_anchorHolder->anchor.clone();
 
     cv::Scalar mean, stddev;
     cv::meanStdDev(m_anchorHolder->anchor, mean, stddev);
@@ -390,7 +416,10 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
 
     const double pTanBase = std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog);
     double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestRival = -1.0;
+    double anchorScore = -2.0;
     double scores[3] = {-2.0, -2.0, -2.0};
+    cv::Point bestLoc;
+    cv::Mat bestTile;
     int bestK = 1;
 
     for (int k = 0; k < 3; ++k) {
@@ -400,35 +429,90 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
         if (!buildTile(y, w, h, stride, m_cfg.lenses, qAct, predicted, pTan,
                        m_tileSize, m_preferRear, tile, &validFrac))
             continue;
-        cv::Mat scoreMap;
-        cv::matchTemplate(tile, m_anchorHolder->anchor, scoreMap, cv::TM_CCOEFF_NORMED);
         double minV, maxV;
         cv::Point minL, maxL;
+        cv::Mat scoreMap;
+        cv::matchTemplate(tile, m_anchorHolder->anchor, scoreMap, cv::TM_CCOEFF_NORMED);
         cv::minMaxLoc(scoreMap, &minV, &maxV, &minL, &maxL);
-        scores[k] = maxV;
-        if (maxV > bestScore) {
-            bestScore = maxV;
+        double useScore = maxV;
+        cv::Point useLoc = maxL;
+        const cv::Mat *useMap = &scoreMap;
+        anchorScore = qMax(anchorScore, maxV);
+
+        cv::Mat runMap;
+        cv::matchTemplate(tile, m_anchorHolder->running, runMap, cv::TM_CCOEFF_NORMED);
+        double rMin, rMax;
+        cv::Point rMinL, rMaxL;
+        cv::minMaxLoc(runMap, &rMin, &rMax, &rMinL, &rMaxL);
+        if (rMax > useScore) { useScore = rMax; useLoc = rMaxL; useMap = &runMap; }
+
+        scores[k] = useScore;
+        if (useScore > bestScore) {
+            bestScore = useScore;
             bestK = k;
             bestValid = validFrac;
-            bestRival = rivalPeak(scoreMap, maxL, kTemplate / 3);
-            bestDx = (maxL.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
-            bestDy = -(maxL.y + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
+            bestRival = rivalPeak(*useMap, useLoc, kTemplate / 3);
+            bestLoc = useLoc;
+            bestTile = tile;
+            bestDx = (useLoc.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
+            bestDy = -(useLoc.y + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
         }
     }
     m_lastScore = bestScore;
 
     if (bestScore < -1.0) { m_lossReason = QStringLiteral("out of field"); return Step::Lost; }
     if (bestValid < kMinValidFraction) { m_lossReason = QStringLiteral("left the lens"); return Step::Lost; }
+
     m_hardRun = (bestScore < kScoreHardFloor) ? m_hardRun + 1 : 0;
-    if (m_hardRun >= kHardRun) { m_lossReason = QStringLiteral("lost the subject"); return Step::Lost; }
     m_badRun = (bestScore < kScoreSoftFloor) ? m_badRun + 1 : 0;
-    if (m_badRun >= kBadRun) { m_lossReason = QStringLiteral("match too weak"); return Step::Lost; }
-    // Several places now match about as well as the winner: the subject has
-    // become indistinguishable from its surroundings, and following the peak
-    // from here is following noise.
     m_ambiguousRun = (bestRival > kMaxRunRival * bestScore) ? m_ambiguousRun + 1 : 0;
-    if (m_ambiguousRun >= kAmbiguousRun) {
-        m_lossReason = QStringLiteral("subject blends into its surroundings");
+
+    const bool wouldLose = m_hardRun >= kHardRun || m_badRun >= kBadRun
+                        || m_ambiguousRun >= kAmbiguousRun;
+    if (wouldLose) {
+        // Before giving up: re-seed from where we still believe the subject
+        // is. A child turning round stops looking like the patch that was
+        // picked, and the tracker is usually still ON it -- what has failed is
+        // the template, not the position. Adopting the current appearance
+        // there keeps the track alive through the turn.
+        //
+        // Guarded so this cannot quietly become "track the background": the
+        // new patch must be distinctive in its own right, re-seeds are rate
+        // limited, and they are counted so the caller can say how often it
+        // happened.
+        const bool canReseed = m_reseeds < kMaxReseeds
+                            && (t - m_lastReseedTime) > kReseedMinGap
+                            && !bestTile.empty()
+                            && bestLoc.x >= 0 && bestLoc.y >= 0
+                            && bestLoc.x + kTemplate <= bestTile.cols
+                            && bestLoc.y + kTemplate <= bestTile.rows;
+        if (canReseed) {
+            cv::Mat candidate = bestTile(cv::Rect(bestLoc.x, bestLoc.y,
+                                                  kTemplate, kTemplate)).clone();
+            cv::Scalar cMean, cStd;
+            cv::meanStdDev(candidate, cMean, cStd);
+            bool distinct = cStd[0] >= kMinSeedStdDev;
+            if (distinct) {
+                cv::Mat selfMap;
+                cv::matchTemplate(bestTile, candidate, selfMap, cv::TM_CCOEFF_NORMED);
+                double sMin, sMax;
+                cv::Point sMinL, sMaxL;
+                cv::minMaxLoc(selfMap, &sMin, &sMax, &sMinL, &sMaxL);
+                distinct = rivalPeak(selfMap, sMaxL, kTemplate / 3) <= kMaxSeedRival;
+            }
+            if (distinct) {
+                m_anchorHolder->anchor = candidate;
+                m_anchorHolder->running = candidate.clone();
+                m_hardRun = m_badRun = m_ambiguousRun = 0;
+                m_reseeds++;
+                m_lastReseedTime = t;
+                m_prevTime = t;
+                return Step::Rejected;      // coast this frame on the new template
+            }
+        }
+        if (m_hardRun >= kHardRun) m_lossReason = QStringLiteral("lost the subject");
+        else if (m_badRun >= kBadRun) m_lossReason = QStringLiteral("match too weak");
+        else m_lossReason = QStringLiteral("subject blends into its surroundings");
         return Step::Lost;
     }
 
@@ -472,6 +556,16 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
         m_omegaRate = 0.5 * m_omegaRate + 0.5 * qMin(stepDeg / dt, m_cfg.maxWorldSpeedDeg);
     }
 
+    // Learn the subject's current appearance, slowly, and only from a match
+    // worth learning from. The anchor stays untouched as the ground truth.
+    if (bestScore > kRunningUpdateMin && !bestTile.empty()
+        && bestLoc.x >= 0 && bestLoc.y >= 0
+        && bestLoc.x + kTemplate <= bestTile.cols && bestLoc.y + kTemplate <= bestTile.rows) {
+        cv::Mat patch = bestTile(cv::Rect(bestLoc.x, bestLoc.y, kTemplate, kTemplate));
+        cv::addWeighted(m_anchorHolder->running, 1.0 - kRunningBlend,
+                        patch, kRunningBlend, 0.0, m_anchorHolder->running);
+    }
+
     m_dirWorld = measured;
     m_prevTime = t;
     ++m_frames;
@@ -507,7 +601,8 @@ ObjectTracker::~ObjectTracker()
     cancel();
     if (m_thread) {
         m_thread->wait(5000);          // never detach: a worker outliving the
-        m_thread = nullptr;            // app is a shutdown crash
+        delete m_thread;               // app is a shutdown crash
+        m_thread = nullptr;
     }
 }
 
@@ -515,11 +610,17 @@ void ObjectTracker::track(const TrackRequest &req)
 {
     if (m_running.loadRelaxed() != 0)
         return;
-    if (m_thread) { m_thread->wait(5000); m_thread = nullptr; }
+    // Own the thread outright. It used to delete itself on finished() while
+    // m_thread went on pointing at it, so the SECOND track called wait() on
+    // freed memory and took the app down with it.
+    if (m_thread) {
+        m_thread->wait(5000);
+        delete m_thread;
+        m_thread = nullptr;
+    }
     m_cancel.storeRelaxed(0);
     m_running.storeRelaxed(1);
     m_thread = QThread::create([this, req]() { run(req); });
-    connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
     m_thread->start();
 }
 
@@ -552,6 +653,7 @@ void ObjectTracker::run(TrackRequest req)
     int frames = 0;
     double scoreSum = 0.0;
     double lastTime = req.t0;
+    QString endReason = QStringLiteral("?");
 
     while (true) {
         if (m_cancel.loadRelaxed() != 0) {
@@ -560,8 +662,8 @@ void ObjectTracker::run(TrackRequest req)
         }
         double t = 0.0;
         const double minTime = (frames == 0) ? req.t0 : lastTime + 0.5 / qMax(1.0, req.fps);
-        if (!reader.next(minTime, &t)) break;
-        if (t > req.tEnd + 1e-6) { reader.release(); break; }
+        if (!reader.next(minTime, &t)) { endReason = QStringLiteral("end of stream"); break; }
+        if (t > req.tEnd + 1e-6) { reader.release(); endReason = QStringLiteral("reached the end time"); break; }
 
         const QQuaternion qAct = orientationAt(req, t);
         static const QByteArray frameDump = qgetenv("RENDER360_FRAME_DUMP");
@@ -615,6 +717,8 @@ void ObjectTracker::run(TrackRequest req)
 
     result.meanScore = frames > 0 ? scoreSum / frames : 0.0;
     result.msPerFrame = frames > 0 ? (double)clock.elapsed() / frames : 0.0;
+    qInfo().noquote() << "ObjectTracker: stopped because:" << (result.lost ? result.lossReason : endReason)
+                      << "at t =" << lastTime;
     qInfo("ObjectTracker: %d frames in %lld ms (%.1f ms/frame, %s), mean score %.3f%s",
           frames, clock.elapsed(), result.msPerFrame,
           usingProxy ? "proxy" : "original", result.meanScore,

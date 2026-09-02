@@ -2782,7 +2782,7 @@ static double g_trackAt = 1.0;
 static double g_trackSecs = 8.0;
 static double g_trackNdcX = 0.0, g_trackNdcY = 0.0;
 static double g_trackSize = 0.15;
-static double g_trackGate = 40.0;
+static double g_trackGate = 150.0;
 static bool g_trackNoImu = false;   // --track-noimu: is the chain doing anything?
 // --track-conv=N: which camera->world map to use. The conventions in this
 // codebase are subtle (the chain stores A*F, visual bearings live in the
@@ -2910,10 +2910,33 @@ static void trackRealClip(const QString &video)
     tracker.track(req);
     loop.exec();
     delete cal;
+    // Drop these before the regression run below, or its result overwrites the
+    // one being reported (it did: a 1 s second run masqueraded as the result
+    // of an 8 s first one).
+    QObject::disconnect(&tracker, nullptr, &loop, nullptr);
 
     if (failed) {
         report("Track on real footage", false, failure);
         return;
+    }
+
+    // Regression: a second track on the SAME tracker used to crash, because
+    // the worker thread deleted itself on finished() while the tracker went on
+    // holding the pointer. Runs here rather than as a unit test because it
+    // takes a real decode to reach the failing path.
+    {
+        TrackRequest second = req;
+        second.tEnd = req.t0 + qMin(1.0, g_trackSecs);
+        bool secondDone = false, secondFailed = false;
+        QEventLoop loop2;
+        QObject::connect(&tracker, &ObjectTracker::trackFinished, &loop2,
+                         [&](const TrackResult &) { secondDone = true; loop2.quit(); });
+        QObject::connect(&tracker, &ObjectTracker::trackFailed, &loop2,
+                         [&](const QString &) { secondFailed = true; loop2.quit(); });
+        tracker.track(second);
+        loop2.exec();
+        report("A second track does not crash", secondDone || secondFailed,
+               secondDone ? QStringLiteral("completed") : QStringLiteral("failed cleanly"));
     }
 
     // What the track then implies for the view, which is what the user sees.
