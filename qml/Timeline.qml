@@ -129,6 +129,7 @@ Pane {
         }
 
         Item {
+            id: markerRow
             Layout.fillWidth: true
             Layout.fillHeight: true
 
@@ -254,38 +255,62 @@ Pane {
                 model: trackSpanList
 
                 Item {
+                    id: trackBar
                     required property var modelData
                     required property int index
-                    readonly property real x0: (parent.width - 8)
-                                               * (modelData.start / Math.max(app.duration, 0.001))
-                    readonly property real x1: (parent.width - 8)
-                                               * (modelData.end / Math.max(app.duration, 0.001))
-                    x: x0
+
+                    // The ends follow the pointer from here while a bracket is
+                    // being dragged; the model is only told on release.
+                    // Committing per pixel would re-resolve every track and
+                    // rewrite the sidecar on every mouse move.
+                    // These start as bindings on the model. A drag assigns to
+                    // them, which breaks the binding; releasing restores it, so
+                    // the model is the truth again the moment the drag ends --
+                    // including when the app REFUSES the trim, where nothing
+                    // else would have snapped the bracket back.
+                    property real liveStart: modelData.start
+                    property real liveEnd: modelData.end
+                    function followModel() {
+                        liveStart = Qt.binding(() => modelData.start)
+                        liveEnd = Qt.binding(() => modelData.end)
+                    }
+
+                    readonly property real pxPerSec: (markerRow.width - 8)
+                                                     / Math.max(app.duration, 0.001)
+                    // Shortest span a trim may leave; matches kMinTrackSpan in
+                    // app.cpp, below which a track resolves to a single
+                    // keyframe and stops following anything.
+                    readonly property real minGapPx: pxPerSec * 0.2
+                    readonly property real inX: pxPerSec * (liveStart - modelData.fullStart)
+                    readonly property real outX: pxPerSec * (liveEnd - modelData.fullStart)
+
+                    // The item covers everything that was MEASURED. The solid
+                    // bar inside covers what is in use, so the gap between them
+                    // shows what has been trimmed and that there is still track
+                    // there to drag back out.
+                    x: pxPerSec * modelData.fullStart
                     y: parent.height - 22
-                    width: Math.max(x1 - x0, 2) + 8
+                    width: Math.max(pxPerSec * (modelData.fullEnd - modelData.fullStart), 2) + 8
                     height: 10
 
-                    // The span itself.
+                    // What was tracked but is trimmed away.
                     Rectangle {
-                        x: 4
-                        y: 3
+                        x: 4; y: 4
                         width: Math.max(parent.width - 8, 2)
+                        height: 2
+                        color: "#f0a030"
+                        opacity: 0.25
+                        visible: modelData.trimmed
+                    }
+                    // The span actually driving the view.
+                    Rectangle {
+                        x: 4 + trackBar.inX
+                        y: 3
+                        width: Math.max(trackBar.outX - trackBar.inX, 2)
                         height: 4
                         radius: 2
                         color: "#f0a030"
                         opacity: 0.75
-                    }
-                    // Start bracket.
-                    Rectangle {
-                        x: 2; y: 0; width: 3; height: 10; radius: 1
-                        color: "#f0a030"
-                    }
-                    // End bracket: red when the tracker lost the subject there,
-                    // so a track that ran out is visibly different from one
-                    // that gave up.
-                    Rectangle {
-                        x: parent.width - 5; y: 0; width: 3; height: 10; radius: 1
-                        color: modelData.lost ? "#e05050" : "#f0a030"
                     }
 
                     MouseArea {
@@ -298,7 +323,7 @@ Pane {
                                 trackMenu.targetIndex = index
                                 trackMenu.popup()
                             } else {
-                                app.currentTime = modelData.start
+                                app.currentTime = trackBar.liveStart
                             }
                         }
                         // Touch has no right button (same reason as the
@@ -308,14 +333,92 @@ Pane {
                             trackMenu.popup()
                         }
                         ToolTip.text: modelData.lost
-                            ? qsTr("Track %1: %2 s to %3 s, then lost the subject")
-                                  .arg(index + 1).arg(modelData.start.toFixed(1))
-                                  .arg(modelData.end.toFixed(1))
-                            : qsTr("Track %1: %2 s to %3 s")
-                                  .arg(index + 1).arg(modelData.start.toFixed(1))
-                                  .arg(modelData.end.toFixed(1))
+                            ? qsTr("Track %1: %2 s to %3 s, then lost the subject — drag either bracket to trim")
+                                  .arg(index + 1).arg(trackBar.liveStart.toFixed(1))
+                                  .arg(trackBar.liveEnd.toFixed(1))
+                            : qsTr("Track %1: %2 s to %3 s — drag either bracket to trim")
+                                  .arg(index + 1).arg(trackBar.liveStart.toFixed(1))
+                                  .arg(trackBar.liveEnd.toFixed(1))
                         ToolTip.visible: containsMouse
                         hoverEnabled: true
+                    }
+
+                    // The brackets are the handles. Declared after the bar's
+                    // own MouseArea, and above it, so a press on a bracket
+                    // trims rather than seeking.
+                    Rectangle {
+                        id: startGrip
+                        y: 0; width: 3; height: 10; radius: 1
+                        color: "#f0a030"
+                        z: 2
+                        onXChanged: {
+                            if (startDrag.drag.active)
+                                trackBar.liveStart = Math.max(trackBar.modelData.fullStart,
+                                    trackBar.modelData.fullStart + (x - 2) / trackBar.pxPerSec)
+                        }
+                        Binding {
+                            target: startGrip
+                            property: "x"
+                            when: !startDrag.drag.active
+                            value: 2 + trackBar.inX
+                        }
+                        MouseArea {
+                            id: startDrag
+                            anchors.fill: parent
+                            // A 17 px target for a 3 px bracket: this gets
+                            // dragged with a fingertip on the phone.
+                            anchors.margins: -7
+                            drag.target: parent
+                            drag.axis: Drag.XAxis
+                            drag.minimumX: 2
+                            drag.maximumX: Math.max(2, 2 + trackBar.outX - trackBar.minGapPx)
+                            cursorShape: Qt.SizeHorCursor
+                            preventStealing: true
+                            onReleased: {
+                                app.setTrackTrim(trackBar.index, trackBar.liveStart,
+                                                 trackBar.liveEnd)
+                                trackBar.followModel()
+                            }
+                            onCanceled: trackBar.followModel()
+                        }
+                    }
+                    // End bracket: red when the tracker lost the subject there,
+                    // so a track that ran out is visibly different from one
+                    // that gave up -- or from one you trimmed yourself.
+                    Rectangle {
+                        id: endGrip
+                        y: 0; width: 3; height: 10; radius: 1
+                        color: modelData.lost ? "#e05050" : "#f0a030"
+                        z: 2
+                        onXChanged: {
+                            if (endDrag.drag.active)
+                                trackBar.liveEnd = Math.min(trackBar.modelData.fullEnd,
+                                    trackBar.modelData.fullStart + (x - 3) / trackBar.pxPerSec)
+                        }
+                        Binding {
+                            target: endGrip
+                            property: "x"
+                            when: !endDrag.drag.active
+                            value: 3 + trackBar.outX
+                        }
+                        MouseArea {
+                            id: endDrag
+                            anchors.fill: parent
+                            anchors.margins: -7
+                            drag.target: parent
+                            drag.axis: Drag.XAxis
+                            drag.minimumX: Math.min(trackBar.width - 5,
+                                                    3 + trackBar.inX + trackBar.minGapPx)
+                            drag.maximumX: trackBar.width - 5
+                            cursorShape: Qt.SizeHorCursor
+                            preventStealing: true
+                            onReleased: {
+                                app.setTrackTrim(trackBar.index, trackBar.liveStart,
+                                                 trackBar.liveEnd)
+                                trackBar.followModel()
+                            }
+                            onCanceled: trackBar.followModel()
+                        }
                     }
                 }
             }
@@ -410,6 +513,17 @@ Pane {
                 if (trackMenu.targetIndex >= 0 && trackMenu.targetIndex < spans.length)
                     app.currentTime = spans[trackMenu.targetIndex].start
             }
+        }
+        MenuItem {
+            text: qsTr("Use the whole track again")
+            // Trimming never discards samples, so this always restores the
+            // full measured span. Disabled when there is nothing to restore.
+            enabled: {
+                const spans = app.trackSpans()
+                return trackMenu.targetIndex >= 0 && trackMenu.targetIndex < spans.length
+                       && spans[trackMenu.targetIndex].trimmed
+            }
+            onTriggered: if (trackMenu.targetIndex >= 0) app.resetTrackTrim(trackMenu.targetIndex)
         }
     }
 

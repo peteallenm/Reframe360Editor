@@ -2491,6 +2491,141 @@ static void testTrackCompose()
                .arg(merged.size()).arg(sorted).arg(manualKept).arg(noneAfterCut));
 }
 
+// Trimming a track's ends must change only which part drives the view -- the
+// measurements themselves have to survive, because dragging a bracket back out
+// is expected to restore the track exactly rather than re-run a decode pass.
+static void testTrackTrim()
+{
+    const TrackLenses lenses = synthLenses();
+    auto imuAt = [](double) { return QQuaternion(); };
+
+    Track tr;
+    tr.id = "trim"; tr.t0 = 1.0; tr.fov0 = 60.0; tr.fovFollow = false;
+    tr.framingProjection = 0; tr.framingAspect = 16.0 / 9.0;
+    tr.sizeRad0 = proj::degToRad(4.0);
+    tr.lost = true; tr.lossTime = 6.0;               // runs out at the far end
+    for (int i = 0; i < 151; ++i) {                  // 1.0 .. 6.0 s at 30 fps
+        TrackSample s;
+        s.t = 1.0 + i / 30.0; s.u = 0.5 + 0.0008 * i; s.v = 0.5; s.lens = 0; s.conf = 1.0;
+        tr.samples.append(s);
+    }
+    const int fullSamples = tr.samples.size();
+
+    const QVector<Keyframe> whole = track::resolve(tr, lenses, imuAt, tr.endTime());
+
+    // 1. Trim both ends: the resolved keyframes must fall inside the new span,
+    //    and nothing may be dropped from `samples`.
+    Track cut = tr;
+    cut.trimIn = 2.0;
+    cut.trimOut = 4.5;
+    const QVector<Keyframe> inside = track::resolve(cut, lenses, imuAt, cut.activeEnd());
+    bool bounded = !inside.isEmpty();
+    for (const Keyframe &k : inside)
+        if (k.time < 2.0 - 1e-6 || k.time > 4.5 + 1e-6) bounded = false;
+    const bool samplesKept = cut.samples.size() == fullSamples;
+    // Compare the time each set of keyframes covers, not how many there are:
+    // this synthetic motion is a straight line, so the decimator collapses
+    // both to their two endpoints and a count comparison proves nothing.
+    const double wholeSpan = whole.isEmpty() ? 0.0
+                           : whole.constLast().time - whole.first().time;
+    const double cutSpan = inside.isEmpty() ? 0.0
+                         : inside.constLast().time - inside.first().time;
+    const bool spanShrank = cutSpan < wholeSpan - 1e-6 && cutSpan > 0.0;
+    report("Trimming a track narrows what it drives, keeping every sample",
+           bounded && samplesKept && spanShrank,
+           QStringLiteral("%1 keyframes over %2..%3 s (was %4 over %5..%6 s), %7 samples kept")
+               .arg(inside.size())
+               .arg(inside.isEmpty() ? 0.0 : inside.first().time, 0, 'f', 2)
+               .arg(inside.isEmpty() ? 0.0 : inside.constLast().time, 0, 'f', 2)
+               .arg(whole.size())
+               .arg(whole.isEmpty() ? 0.0 : whole.first().time, 0, 'f', 2)
+               .arg(whole.isEmpty() ? 0.0 : whole.constLast().time, 0, 'f', 2)
+               .arg(cut.samples.size()));
+
+    // 2. A trimmed start must not move the subject in frame. The framing is
+    //    the pick, not the first surviving sample: if trimming re-anchored it,
+    //    the subject would jump the moment you dragged the bracket.
+    double worstDeg = 0.0;
+    for (const Keyframe &k : inside) {
+        // Where the resolved view puts the picked NDC spot...
+        const proj::ViewBasis vb = proj::ViewBasis::make(
+            k.yaw, k.pitch, k.roll, k.fov, cut.framingProjection, cut.framingAspect);
+        const proj::Vec3 aimed = proj::applyEuler(
+            proj::rayForNdc(cut.framingNdcX, cut.framingNdcY, vb), vb);
+        // ...against where the object actually was at that time.
+        int nearest = 0;
+        for (int i = 1; i < cut.samples.size(); ++i)
+            if (std::fabs(cut.samples[i].t - k.time) < std::fabs(cut.samples[nearest].t - k.time))
+                nearest = i;
+        const TrackSample &s = cut.samples[nearest];
+        if (std::fabs(s.t - k.time) > 1e-6) continue;
+        const QVector3D cam = VisualRotationComputer::pixelToBearing(
+            s.u, s.v, (s.lens == 1) ? lenses.rear : lenses.front);
+        const QVector3D a((float)aimed.x, (float)aimed.y, (float)aimed.z);
+        const QVector3D b = imuAt(s.t).rotatedVector(cam);
+        worstDeg = qMax(worstDeg, (double)QVector3D::crossProduct(a.normalized(),
+                                                                 b.normalized()).length());
+    }
+    worstDeg = std::asin(qBound(0.0, worstDeg, 1.0)) * 180.0 / M_PI;
+    report("A trimmed start still frames the subject where it was picked",
+           worstDeg < 0.05, QStringLiteral("worst framing error %1 deg").arg(worstDeg, 0, 'f', 4));
+
+    // 3. Clearing the trims restores the full span exactly -- this is what
+    //    makes dragging a bracket back out safe.
+    Track restored = cut;
+    restored.trimIn = -1.0;
+    restored.trimOut = -1.0;
+    const QVector<Keyframe> again = track::resolve(restored, lenses, imuAt, restored.endTime());
+    bool identical = again.size() == whole.size();
+    if (identical)
+        for (int i = 0; i < again.size(); ++i)
+            if (!qFuzzyCompare(again[i].time + 1.0, whole[i].time + 1.0)
+                || std::fabs(again[i].yaw - whole[i].yaw) > 1e-9
+                || std::fabs(again[i].pitch - whole[i].pitch) > 1e-9)
+                identical = false;
+    report("Untrimming restores the original track exactly", identical,
+           QStringLiteral("%1 keyframes, was %2").arg(again.size()).arg(whole.size()));
+
+    // 4. A track trimmed at the end no longer "ran out": compose must not add
+    //    the hold-and-ease that a genuine loss earns, or the view would keep
+    //    coasting past the point the edit just cut it off at.
+    QVector<Keyframe> manual;
+    manual.append(Keyframe{8.0, 90.0, 0.0, 0.0, 90.0});
+    const QVector<Keyframe> heldLoss = track::compose(manual, {tr}, lenses, imuAt, 0.0, 10.0);
+    const QVector<Keyframe> heldCut = track::compose(manual, {cut}, lenses, imuAt, 0.0, 10.0);
+    bool lossHolds = false, cutHolds = false;
+    for (const Keyframe &k : heldLoss)
+        if (std::fabs(k.time - 7.5) < 1e-6) lossHolds = true;      // 8.0 - 0.5
+    for (const Keyframe &k : heldCut)
+        if (std::fabs(k.time - 7.5) < 1e-6) cutHolds = true;
+    report("A trimmed end is a deliberate stop, not a loss to coast through",
+           lossHolds && !cutHolds && tr.endsAtLoss() && !cut.endsAtLoss(),
+           QStringLiteral("loss holds=%1, trimmed holds=%2").arg(lossHolds).arg(cutHolds));
+
+    // 5. Trims must round-trip, and an untrimmed track must not acquire them.
+    const QVector<Track> backCut = track::fromJson(track::toJson({cut}));
+    const QJsonObject plain = track::toJson({tr}).at(0).toObject();
+    const bool trimRoundTrip = backCut.size() == 1
+        && qFuzzyCompare(backCut[0].trimIn + 1.0, cut.trimIn + 1.0)
+        && qFuzzyCompare(backCut[0].trimOut + 1.0, cut.trimOut + 1.0)
+        && !plain.contains(QStringLiteral("trimIn"))
+        && !plain.contains(QStringLiteral("trimOut"));
+    // The no-op-load early return in keyframe.cpp compares tracks; if trims are
+    // not part of that comparison, reopening a clip silently keeps the old ones.
+    // Compared against a twin that differs ONLY in its trims -- comparing the
+    // round-tripped track instead would fail on sample quantisation, which is
+    // what the packing test covers and has nothing to do with trims.
+    Track twin = cut;
+    twin.trimIn = -1.0;
+    twin.trimOut = -1.0;
+    const Track copy = cut;
+    const bool comparedByEquality = (copy == cut) && !(twin == cut);
+    report("Trims survive the sidecar and count as a difference",
+           trimRoundTrip && comparedByEquality,
+           QStringLiteral("round trip=%1, equality sees them=%2")
+               .arg(trimRoundTrip).arg(comparedByEquality));
+}
+
 // Tracks must survive the sidecar round trip, including the packed samples.
 static void testTrackJson()
 {
@@ -3700,6 +3835,7 @@ int main(int argc, char *argv[])
         testTrackResolve();
         testTrackFovFollow();
         testTrackCompose();
+        testTrackTrim();
         testTrackJson();
 
         qInfo() << "--- Test 1: IMU parser ---";

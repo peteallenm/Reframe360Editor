@@ -158,6 +158,12 @@ bool Track::operator==(const Track &o) const
     if (id != o.id || lost != o.lost || samples.size() != o.samples.size())
         return false;
     if (!qFuzzyCompare(t0 + 1.0, o.t0 + 1.0)) return false;
+    // Trims are part of what a track IS: without them here, keyframe.cpp's
+    // no-op-load early return treats a reload as "nothing changed" and quietly
+    // keeps the trims from whichever clip was open before.
+    if (!qFuzzyCompare(trimIn + 1.0, o.trimIn + 1.0)
+        || !qFuzzyCompare(trimOut + 1.0, o.trimOut + 1.0))
+        return false;
     if (!qFuzzyCompare(framingNdcX + 1.0, o.framingNdcX + 1.0)
         || !qFuzzyCompare(framingNdcY + 1.0, o.framingNdcY + 1.0)
         || framingProjection != o.framingProjection)
@@ -213,8 +219,9 @@ QVector<Keyframe> resolve(const Track &tr, const TrackLenses &lenses,
     const double tanHalfFov0 = std::tan(proj::degToRad(tr.fov0) * 0.5);
     const double k = tanHalfSize0 / qMax(1e-9, tanHalfFov0);   // screen fraction to hold
 
+    const double tStart = tr.activeStart();
     for (const TrackSample &s : tr.samples) {
-        if (s.t < tr.t0 - 1e-9 || s.t > tEnd + 1e-9) continue;
+        if (s.t < tStart - 1e-9 || s.t > tEnd + 1e-9) continue;
         const auto &lp = (s.lens == 1) ? lenses.rear : lenses.front;
         const QVector3D cam = VisualRotationComputer::pixelToBearing(s.u, s.v, lp);
         // The shader samples q_imu^-1 * world, so world = q_imu * camera.
@@ -303,8 +310,11 @@ QVector<Keyframe> compose(const QVector<Keyframe> &manual, const QVector<Track> 
     if (tracks.isEmpty()) return manual;
 
     QVector<Track> sorted = tracks;
+    // Order by where each track actually starts, not where it was armed:
+    // trimming one track's start past another's would otherwise leave them
+    // bounding each other in the wrong order.
     std::sort(sorted.begin(), sorted.end(),
-              [](const Track &a, const Track &b) { return a.t0 < b.t0; });
+              [](const Track &a, const Track &b) { return a.activeStart() < b.activeStart(); });
 
     const double clipEnd = (trimOut > 0.0) ? trimOut
                                            : (duration > 0.0 ? duration : 1e9);
@@ -317,13 +327,14 @@ QVector<Keyframe> compose(const QVector<Keyframe> &manual, const QVector<Track> 
         // wins, so the first one after t0 ends the track -- truncation happens
         // HERE and never in storage, so deleting that keyframe revives the
         // rest of the track.
+        const double tStart = tr.activeStart();
         double tEnd = clipEnd;
         for (const Keyframe &k : manual)
-            if (k.time > tr.t0 + 1e-6) { tEnd = qMin(tEnd, k.time); break; }
+            if (k.time > tStart + 1e-6) { tEnd = qMin(tEnd, k.time); break; }
         if (ti + 1 < sorted.size())
-            tEnd = qMin(tEnd, sorted[ti + 1].t0);
-        tEnd = qMin(tEnd, tr.endTime());
-        if (tEnd <= tr.t0) continue;
+            tEnd = qMin(tEnd, sorted[ti + 1].activeStart());
+        tEnd = qMin(tEnd, tr.activeEnd());
+        if (tEnd <= tStart) continue;
 
         QVector<Keyframe> res = resolve(tr, lenses, imuAt, tEnd);
         if (res.isEmpty()) continue;
@@ -332,7 +343,10 @@ QVector<Keyframe> compose(const QVector<Keyframe> &manual, const QVector<Track> 
         // the next manual keyframe rather than stepping to it. A duplicate of
         // the final keyframe half a second before that keyframe is all the
         // existing linear interpolation needs to do both.
-        if (tr.lost) {
+        // Only hold-and-ease when the track still runs to where the tracker
+        // gave up. A user-trimmed end is a deliberate stop, and holding the
+        // last direction past it would fight the very edit they just made.
+        if (tr.endsAtLoss() && tEnd >= tr.activeEnd() - 1e-6) {
             double nextManual = -1.0;
             for (const Keyframe &k : manual)
                 if (k.time > res.constLast().time + 1e-6) { nextManual = k.time; break; }
@@ -419,7 +433,7 @@ QJsonArray toJson(const QVector<Track> &tracks)
 {
     QJsonArray arr;
     for (const Track &t : tracks) {
-        arr.append(QJsonObject{
+        QJsonObject o{
             {"id", t.id},
             {"t0", t.t0},
             {"lost", t.lost},
@@ -437,7 +451,12 @@ QJsonArray toJson(const QVector<Track> &tracks)
             {"samplesFormat", QStringLiteral("packed14v1")},
             {"sampleCount", t.samples.size()},
             {"samples", QString::fromLatin1(packSamples(t.samples, t.t0).toBase64())},
-        });
+        };
+        // Written only when set, so an untrimmed track round-trips to exactly
+        // the sidecar it came from and the diff stays readable.
+        if (t.trimIn >= 0.0) o.insert(QStringLiteral("trimIn"), t.trimIn);
+        if (t.trimOut >= 0.0) o.insert(QStringLiteral("trimOut"), t.trimOut);
+        arr.append(o);
     }
     return arr;
 }
@@ -473,6 +492,10 @@ QVector<Track> fromJson(const QJsonArray &arr)
         t.fovRange = ff.value("range").toDouble(2.0);
         t.samples = unpackSamples(QByteArray::fromBase64(
             o.value("samples").toString().toLatin1()), t.t0);
+        // Absent means untrimmed. activeStart/activeEnd clamp these to the
+        // measured span, so a hand-edited sidecar cannot widen a track.
+        t.trimIn = o.value("trimIn").toDouble(-1.0);
+        t.trimOut = o.value("trimOut").toDouble(-1.0);
         out.append(t);
     }
     return out;

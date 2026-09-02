@@ -31,6 +31,7 @@
 #include "keyframe.h"
 #include "visualrotation.h"
 
+#include <QtGlobal>
 #include <QJsonArray>
 #include <QQuaternion>
 #include <QString>
@@ -77,7 +78,25 @@ struct Track {
 
     QVector<TrackSample> samples;     // sorted by t
 
+    // How much of the measured span actually drives the view. Trimming is
+    // recorded here and NEVER applied to `samples`: dragging a handle back out
+    // has to restore what was there, and those measurements cost a decode pass
+    // to make. Negative means untrimmed -- t0 and the last sample stand.
+    double trimIn = -1.0;
+    double trimOut = -1.0;
+
     double endTime() const { return samples.isEmpty() ? t0 : samples.constLast().t; }
+    // The part of the track in use. Both are clamped to the measured span, so
+    // a stale trim from an edited sidecar can never widen a track past what
+    // was actually tracked.
+    double activeStart() const
+    { return trimIn >= 0.0 ? qBound(t0, trimIn, qMax(t0, endTime())) : t0; }
+    double activeEnd() const
+    { return trimOut >= 0.0 ? qBound(t0, trimOut, qMax(t0, endTime())) : endTime(); }
+    // True only while the track still runs to where the tracker gave up. Trim
+    // the end back and it no longer "ran out" -- it stops because you said so,
+    // and neither the timeline nor the hold-and-ease should claim otherwise.
+    bool endsAtLoss() const { return lost && activeEnd() >= endTime() - 1e-6; }
     bool operator==(const Track &o) const;
     bool operator!=(const Track &o) const { return !(*this == o); }
 };

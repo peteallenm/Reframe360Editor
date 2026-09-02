@@ -32,6 +32,9 @@ extern "C" {
 // Pitch is kept away from the vertical poles (~ +/-90 deg) where the yaw/roll
 // Euler decomposition becomes degenerate and the sliders would swap yaw/roll.
 static const double kMaxPitch = 89.5;
+// Shortest a trimmed track may be. Below about this it resolves to one
+// keyframe, which holds a fixed view rather than following anything.
+static const double kMinTrackSpan = 0.2;
 
 
 // Keyframes are persisted per-video as a JSON sidecar next to the source file
@@ -1467,9 +1470,15 @@ QVariantList App::trackSpans() const
     QVariantList out;
     for (const Track &tr : m_tracks) {
         QVariantMap m;
-        m.insert(QStringLiteral("start"), tr.t0);
-        m.insert(QStringLiteral("end"), tr.endTime());
-        m.insert(QStringLiteral("lost"), tr.lost);
+        // start/end are what the track DRIVES; fullStart/fullEnd are what was
+        // measured. The timeline needs both: one to draw, the other to know
+        // how far a trim handle may be dragged back out again.
+        m.insert(QStringLiteral("start"), tr.activeStart());
+        m.insert(QStringLiteral("end"), tr.activeEnd());
+        m.insert(QStringLiteral("fullStart"), tr.t0);
+        m.insert(QStringLiteral("fullEnd"), tr.endTime());
+        m.insert(QStringLiteral("trimmed"), tr.trimIn >= 0.0 || tr.trimOut >= 0.0);
+        m.insert(QStringLiteral("lost"), tr.endsAtLoss());
         out.append(m);
     }
     return out;
@@ -1480,8 +1489,57 @@ QVariantList App::trackSpan(int index) const
     QVariantList out;
     if (index < 0 || index >= m_tracks.size())
         return out;
-    out << m_tracks[index].t0 << m_tracks[index].endTime() << m_tracks[index].lost;
+    out << m_tracks[index].activeStart() << m_tracks[index].activeEnd()
+        << m_tracks[index].endsAtLoss();
     return out;
+}
+
+void App::setTrackTrim(int index, double tIn, double tOut)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    Track &tr = m_tracks[index];
+    const double lo = tr.t0, hi = qMax(tr.t0, tr.endTime());
+
+    tIn = qBound(lo, tIn, hi);
+    tOut = qBound(lo, tOut, hi);
+    // A track shorter than this resolves to a single keyframe, which holds one
+    // view forever instead of following anything -- refuse rather than let a
+    // handle be dragged into a track that silently stops tracking.
+    if (tOut - tIn < kMinTrackSpan)
+        return;
+
+    // Store the sentinel when a handle is back at the measured end, so an
+    // untrimmed track stays untrimmed in the sidecar rather than acquiring a
+    // pair of no-op numbers that then drift as the track is re-tracked.
+    const double newIn = (tIn <= lo + 1e-6) ? -1.0 : tIn;
+    const double newOut = (tOut >= hi - 1e-6) ? -1.0 : tOut;
+    if (qFuzzyCompare(newIn + 1.0, tr.trimIn + 1.0)
+        && qFuzzyCompare(newOut + 1.0, tr.trimOut + 1.0))
+        return;
+
+    tr.trimIn = newIn;
+    tr.trimOut = newOut;
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
+    // The view at the playhead may be governed by the part just trimmed away.
+    applyKeyframeInterpolation();
+}
+
+void App::resetTrackTrim(int index)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    Track &tr = m_tracks[index];
+    if (tr.trimIn < 0.0 && tr.trimOut < 0.0)
+        return;
+    tr.trimIn = -1.0;
+    tr.trimOut = -1.0;
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
+    applyKeyframeInterpolation();
 }
 
 void App::applyKeyframeInterpolation()

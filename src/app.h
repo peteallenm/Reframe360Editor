@@ -373,6 +373,11 @@ public:
     Q_INVOKABLE void cancelTracking();
     Q_INVOKABLE void removeTrack(int index);
     Q_INVOKABLE void clearTracks();
+    // Drop the beginning or the end of a track without discarding what was
+    // measured: the samples stay, only the part that drives the view narrows,
+    // so a handle dragged back out restores the track exactly.
+    Q_INVOKABLE void setTrackTrim(int index, double tIn, double tOut);
+    Q_INVOKABLE void resetTrackTrim(int index);
     // Time span of a track, for the timeline: [start, end] or an empty list.
     Q_INVOKABLE QVariantList trackSpan(int index) const;
     // Every track as {start, end, lost}, for the timeline to draw. A list of
