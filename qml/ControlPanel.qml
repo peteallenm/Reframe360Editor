@@ -288,8 +288,11 @@ Item {
 
                                 Label {
                                     id: trackLabel
+                                    // The tracker's own status carries the
+                                    // seconds; do not recompute a percentage.
                                     text: app.trackRunning
-                                          ? qsTr("Tracking… %1%").arg((app.trackProgress * 100).toFixed(0))
+                                          ? (app.trackStatus.length ? app.trackStatus
+                                                                    : qsTr("Tracking…"))
                                           : (app.trackStatus.length ? app.trackStatus
                                              : (app.trackCount > 0
                                                 ? qsTr("%1 tracked").arg(app.trackCount)

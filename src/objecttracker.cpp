@@ -854,10 +854,13 @@ void ObjectTracker::run(TrackRequest req)
         reader.release();
 
         if ((frames % 15) == 0) {
+            // Seconds tracked, not a percentage: how far it has got through
+            // the subject's movement is what you actually want to know, and a
+            // percentage of a span you did not choose says little.
             const double span = qMax(1e-6, req.tEnd - req.t0);
             emit progressChanged(clampd((t - req.t0) / span, 0.0, 1.0),
-                                 QObject::tr("Tracking… %1%")
-                                     .arg((int)(100.0 * (t - req.t0) / span)));
+                                 QObject::tr("Tracking… %1 s of %2 s")
+                                     .arg(t - req.t0, 0, 'f', 1).arg(span, 0, 'f', 1));
         }
     }
 
