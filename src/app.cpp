@@ -9,6 +9,8 @@
 // FOR A PARTICULAR PURPOSE.
 
 #include "app.h"
+#include <QCoreApplication>
+#include <QEventLoop>
 #include "projection.h"
 #include "visualrotation.h"
 #include <QFileInfo>
@@ -434,8 +436,38 @@ void App::openClip(const QString &video, const QString &imu,
     setVideoPath(video);
 }
 
+void App::setLoadStage(double fraction, const QString &text)
+{
+    m_loadProgress = qBound(0.0, fraction, 1.0);
+    m_loadStatus = text;
+    emit loadProgressChanged();
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+
+// Opening a clip is a chain of slow, synchronous steps -- open the container,
+// parse the .imu, integrate the chain -- and on the phone a big file over SAF
+// can take many seconds. Reporting each stage turns a frozen window into
+// something legible.
 void App::setVideoPath(const QString &path)
 {
+    m_loading = true;
+    m_loadProgress = 0.0;
+    m_loadStatus = tr("Opening…");
+    emit loadingChanged();
+    emit loadProgressChanged();
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    // Whatever happens below -- including an early return on a bad file --
+    // the overlay must come down.
+    struct LoadGuard {
+        App *app;
+        ~LoadGuard() {
+            app->m_loading = false;
+            app->m_loadProgress = 1.0;
+            emit app->loadingChanged();
+            emit app->loadProgressChanged();
+        }
+    } loadGuard{this};
+
     // Overrides only apply to the openClip() call that supplied them; a plain
     // setVideoPath (the CLI, or a second open) must fall back to deriving the
     // sidecars from the video path again.
@@ -482,6 +514,7 @@ void App::setVideoPath(const QString &path)
         // video has no sidecar yet). The guard prevents the export-settings
         // change handler from immediately rewriting the file it just read.
         m_restoringSidecar = true;
+        setLoadStage(0.10, tr("Reading saved edits…"));
         m_keyframes->loadFromFile(m_keyframesOverride.isEmpty()
                                   ? keyframesPathFor(path) : m_keyframesOverride);
         m_restoringSidecar = false;
@@ -504,9 +537,11 @@ void App::setVideoPath(const QString &path)
         if (!androidProxy.isEmpty()) {
             m_usePreview = true;
             emit usePreviewThumbnailChanged();
+            setLoadStage(0.25, tr("Opening video…"));
             m_decoder->loadVideo(androidProxy);
         } else
 #endif
+        setLoadStage(0.25, tr("Opening video…"));
         m_decoder->loadVideo(path);
 
         // loadVideo() resets the decoder clock to 0 without emitting
@@ -537,6 +572,7 @@ void App::setVideoPath(const QString &path)
             }
         }
         if (!m_imuOverride.isEmpty() || QFileInfo::exists(imuPath)) {
+            setLoadStage(0.60, tr("Reading motion data…"));
             m_imuParser->loadFile(imuPath);
 
             // IMU<->video drift: a value tuned for this video and stored in
@@ -560,9 +596,11 @@ void App::setVideoPath(const QString &path)
                 }
             }
 
+            setLoadStage(0.80, tr("Working out the camera's motion…"));
             integrateImu();
         }
 
+        setLoadStage(0.98, tr("Almost there…"));
         emit videoLoaded();
     }
 }

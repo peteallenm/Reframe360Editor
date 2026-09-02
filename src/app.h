@@ -194,6 +194,12 @@ class App : public QObject
     Q_PROPERTY(bool trackArmed READ trackArmed WRITE setTrackArmed NOTIFY trackArmedChanged)
     Q_PROPERTY(int trackPointCount READ trackPointCount NOTIFY trackPointsChanged)
 
+    // Opening a clip is slow enough to look like a hang -- a 2 GB file over
+    // SAF on the phone especially -- so it reports where it has got to.
+    Q_PROPERTY(bool loading READ loading NOTIFY loadingChanged)
+    Q_PROPERTY(double loadProgress READ loadProgress NOTIFY loadProgressChanged)
+    Q_PROPERTY(QString loadStatus READ loadStatus NOTIFY loadProgressChanged)
+
 public:
     explicit App(QObject *parent = nullptr);
     ~App();
@@ -348,6 +354,9 @@ public:
     int trackCount() const { return m_tracks.size(); }
     bool trackArmed() const { return m_trackArmed; }
     int trackPointCount() const { return m_pendingDirs.size(); }
+    bool loading() const { return m_loading; }
+    double loadProgress() const { return m_loadProgress; }
+    QString loadStatus() const { return m_loadStatus; }
     void setTrackArmed(bool armed);
 
     // Arm/pick: the viewer hands back where the user pointed, in NDC, plus the
@@ -478,6 +487,8 @@ signals:
     void trackStatusChanged();
     void trackArmedChanged();
     void trackPointsChanged();
+    void loadingChanged();
+    void loadProgressChanged();
     void tracksChanged();
 
 private:
@@ -576,6 +587,14 @@ private:
     QVariantList m_pendingNdc;           // ... and where they were tapped
     double m_pendingRadius = 0.05;
     double m_pendingTime = 0.0;
+    bool m_loading = false;
+    double m_loadProgress = 0.0;
+    QString m_loadStatus;
+    // Report a stage and let the UI repaint. The load runs on the GUI thread,
+    // so without pumping events here the bar would only appear once the work
+    // it is reporting on had finished. User input stays excluded, so nothing
+    // can be clicked mid-load.
+    void setLoadStage(double fraction, const QString &text);
     QString m_pendingTrackVideo;   // guards against a result for the old clip
 
     const QVector<Keyframe> &effectiveKeyframes() const;

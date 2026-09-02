@@ -625,7 +625,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
 // coordinate plus the subject's extent, which is what the resolver
 // back-projects. Free-standing because with several patches the subject's
 // direction belongs to none of them.
-static TrackSample sampleFor(const QVector3D &dirWorld, const QQuaternion &qAct,
+static TrackSample sampleFor(double t, const QVector3D &dirWorld, const QQuaternion &qAct,
                              const TrackLenses &lenses, double radiusRad, double score)
 {
     const QVector3D cam = qAct.conjugated().rotatedVector(dirWorld.normalized());
@@ -636,7 +636,8 @@ static TrackSample sampleFor(const QVector3D &dirWorld, const QQuaternion &qAct,
     const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
                                                      lp.rotation, lp.hflip);
     TrackSample smp;
-    smp.t = 0.0;
+    smp.t = t;                    // never 0: the track's span, and every time
+                                  // the resolver evaluates, comes from this
     smp.lens = front ? 0 : 1;
     proj::lensUv(front, theta, phi, geom, smp.u, smp.v);
 
@@ -773,7 +774,7 @@ void ObjectTracker::run(TrackRequest req)
                 if (p.alive)
                     p.offset = QQuaternion::rotationTo(subjectDir, p.tracker.worldDir());
 
-            result.samples.append(sampleFor(subjectDir, qAct, req.lenses,
+            result.samples.append(sampleFor(t, subjectDir, qAct, req.lenses,
                                             req.seedRadiusRad, 1.0));
             scoreSum += 1.0;
             lastTime = t;
@@ -842,7 +843,7 @@ void ObjectTracker::run(TrackRequest req)
                 }
             }
 
-            result.samples.append(sampleFor(subjectDir, qAct, req.lenses,
+            result.samples.append(sampleFor(t, subjectDir, qAct, req.lenses,
                                             req.seedRadiusRad * points[best].tracker.scaleRatio(),
                                             points[best].score));
             scoreSum += points[best].score;

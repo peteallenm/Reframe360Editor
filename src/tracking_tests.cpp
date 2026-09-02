@@ -3045,6 +3045,25 @@ static void trackRealClip(const QString &video)
         return;
     }
 
+    // Regression: every sample must carry the time it was taken at. They were
+    // all left at 0 once the tracker went multi-patch, which made a track's
+    // span negative ("tracked -4.1 s"), drew its timeline bar backwards, and
+    // handed the resolver a pile of samples that all claimed to be at t=0.
+    {
+        bool timesOk = result.samples.size() > 2;
+        double prev = -1.0;
+        for (const TrackSample &smp : result.samples) {
+            if (smp.t <= prev || smp.t < req.t0 - 1e-6 || smp.t > req.tEnd + 0.5) timesOk = false;
+            prev = smp.t;
+        }
+        report("Samples carry increasing timestamps", timesOk,
+               QStringLiteral("%1 samples, first %2 s, last %3 s (asked for %4..%5)")
+                   .arg(result.samples.size())
+                   .arg(result.samples.isEmpty() ? 0.0 : result.samples.first().t, 0, 'f', 2)
+                   .arg(result.samples.isEmpty() ? 0.0 : result.samples.constLast().t, 0, 'f', 2)
+                   .arg(req.t0, 0, 'f', 2).arg(req.tEnd, 0, 'f', 2));
+    }
+
     // Regression: a second track on the SAME tracker used to crash, because
     // the worker thread deleted itself on finished() while the tracker went on
     // holding the pointer. Runs here rather than as a unit test because it

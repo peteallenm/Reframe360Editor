@@ -418,6 +418,50 @@ ApplicationWindow {
         id: aboutDialog
     }
 
+    // Opening a clip is synchronous and can take many seconds (a big file over
+    // SAF on the phone especially). Without this the window simply freezes,
+    // which reads as a crash.
+    Rectangle {
+        anchors.fill: parent
+        visible: app.loading
+        color: "#cc101010"
+        z: 100
+
+        // Swallow clicks so nothing can be pressed while loading.
+        MouseArea { anchors.fill: parent }
+
+        ColumnLayout {
+            anchors.centerIn: parent
+            width: Math.min(parent.width * 0.7, 420)
+            spacing: 14
+
+            Label {
+                Layout.fillWidth: true
+                text: app.loadStatus.length ? app.loadStatus : qsTr("Opening…")
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: 16
+                color: "white"
+                elide: Text.ElideMiddle
+            }
+
+            ProgressBar {
+                Layout.fillWidth: true
+                from: 0
+                to: 1
+                value: app.loadProgress
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: window.currentClipName.length ? window.currentClipName : ""
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: 12
+                color: "#aaa"
+                elide: Text.ElideMiddle
+            }
+        }
+    }
+
     // Export configuration dialog (resolution, codec, bitrate/CRF, FFmpeg
     // vidstab post-processing). Replaces the old bare save-as dialog.
     ExportDialog {
