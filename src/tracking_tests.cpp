@@ -2684,6 +2684,43 @@ static void testTileTrackerGroundTruth()
                .arg(seeded ? QString() : QStringLiteral(", seed failed: ") + err));
 }
 
+// The guard that stops a doomed track before it starts: a patch with nothing
+// to lock onto must be refused, with a reason the user can act on. Tested on a
+// synthetic flat field rather than on clip content, so it cannot quietly stop
+// working when the footage changes.
+static void testTileTrackerRefusesFeatureless()
+{
+    const TrackLenses lenses = synthLenses();
+    QVector<uchar> buf(synth::kW * synth::kH);
+    buf.fill(118);
+    for (int i = 0; i < buf.size(); i += 7) buf[i] = (uchar)(112 + (i % 11));  // faint noise
+
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedDirCam = QVector3D(0.0f, 0.0f, -1.0f);
+    cfg.seedRadiusRad = proj::degToRad(7.0);
+    QString err;
+    const bool seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                      synth::kW, QQuaternion(), 0.0, &err);
+
+    // And a textured one at the same spot must still be accepted, or the guard
+    // is just refusing everything.
+    QVector<uchar> good(synth::kW * synth::kH);
+    synth::render(good, QVector3D(0.0f, 0.0f, -1.0f), proj::degToRad(7.0),
+                  QQuaternion(), lenses);
+    TileTracker tracker2;
+    QString err2;
+    const bool seededGood = tracker2.begin(cfg, good.constData(), synth::kW, synth::kH,
+                                           synth::kW, QQuaternion(), 0.0, &err2);
+
+    report("Featureless patches are refused, textured ones accepted",
+           !seeded && seededGood,
+           QStringLiteral("flat: %1; textured: %2")
+               .arg(seeded ? QStringLiteral("ACCEPTED") : err)
+               .arg(seededGood ? QStringLiteral("accepted") : QStringLiteral("REFUSED: ") + err2));
+}
+
 static void testTileTrackerLoss()
 {
     const TrackLenses lenses = synthLenses();
@@ -2793,6 +2830,10 @@ static bool g_trackUseDir = false;
 static double g_trackU = 0.5, g_trackV = 0.5;
 static int g_trackLens = 0;
 static bool g_trackUseUv = false;
+// --track-view=yaw,pitch,fov: seed at the centre of the view the USER was
+// looking at, which is how a seed is actually chosen in the app.
+static double g_viewYaw = 0.0, g_viewPitch = 0.0, g_viewFov = 90.0;
+static bool g_trackUseView = false;
 static QQuaternion camToWorld(const QQuaternion &chain)
 {
     switch (g_trackConv) {
@@ -2875,7 +2916,21 @@ static void trackRealClip(const QString &video)
     const proj::ViewBasis basis = proj::ViewBasis::make(0, 0, 0, 90.0, 0, 16.0 / 9.0);
     const proj::Vec3 look = proj::applyEuler(
         proj::rayForNdc(g_trackNdcX, g_trackNdcY, basis), basis);
-    if (g_trackUseUv) {
+    if (g_trackUseView) {
+        // The view direction in the stabilised frame, then back into the
+        // camera frame the tracker measures in -- exactly what App does with a
+        // tap at the centre of the viewer.
+        const proj::ViewBasis vb = proj::ViewBasis::make(g_viewYaw, g_viewPitch, 0.0,
+                                                          g_viewFov, 0, 16.0 / 9.0);
+        const proj::Vec3 d = proj::applyEuler(
+            proj::rayForNdc(g_trackNdcX, g_trackNdcY, vb), vb);
+        QQuaternion q = kFlipRollQ();
+        if (hasImu)
+            q = camToWorld(gi.orientationAtTimeUnsmoothed(req.t0 * (1.0 + drift) + syncOffset));
+        req.seedDirCam = q.conjugated().rotatedVector(
+            QVector3D((float)d.x, (float)d.y, (float)d.z)).normalized();
+        req.seedRadiusRad = 0.5 * proj::degToRad(g_viewFov) * g_trackSize;
+    } else if (g_trackUseUv) {
         req.seedDirCam = VisualRotationComputer::pixelToBearing(
             g_trackU, g_trackV, g_trackLens == 1 ? req.lenses.rear : req.lenses.front).normalized();
     } else {
@@ -3333,6 +3388,16 @@ int main(int argc, char *argv[])
         if (QString(argv[i]).startsWith("--track-gate=")) { g_trackGate = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]) == "--track-noimu") { g_trackNoImu = true; continue; }
         if (QString(argv[i]) == "--track-dumpframe") { g_trackDumpFrame = true; continue; }
+        if (QString(argv[i]).startsWith("--track-view=")) {
+            const QStringList parts = QString(argv[i]).mid(13).split(',');
+            if (parts.size() >= 3) {
+                g_viewYaw = parts[0].toDouble();
+                g_viewPitch = parts[1].toDouble();
+                g_viewFov = parts[2].toDouble();
+                g_trackUseView = true;
+            }
+            continue;
+        }
         if (QString(argv[i]).startsWith("--track-uv=")) {
             // Seed by half-frame sensor coordinates: u,v[,lens] as read off a
             // dumped frame. The most direct way to point at a real subject.
@@ -3486,6 +3551,7 @@ int main(int argc, char *argv[])
 
         qInfo() << "--- Test 0f: object tracker (synthetic footage) ---";
         testTileTrackerGroundTruth();
+        testTileTrackerRefusesFeatureless();
         testTileTrackerLoss();
         testTileTrackerScale();
 

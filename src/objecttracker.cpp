@@ -65,9 +65,11 @@ constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
 // gradient, so the score stays high while the track slides (the aperture
 // problem). What matters is whether the patch can be LOCALISED: its
 // correlation peak must stand clear of every rival in the tile.
-constexpr double kMaxSeedRival      = 0.80;  // best rival peak, at seed time
-constexpr double kMaxRunRival       = 0.92;  // ... and while running
-constexpr int    kAmbiguousRun      = 8;     // consecutive ambiguous frames
+constexpr double kMinSeedPsr        = 4.0;   // peak-to-sidelobe, at seed time
+constexpr double kMinRunPsr         = 2.0;   // ... and while running
+constexpr int    kAmbiguousRun      = 12;    // consecutive ambiguous frames
+constexpr double kAnchorStillGood   = 0.45;  // anchor match that vetoes an
+                                             // ambiguity loss outright
 // A sanity gate against teleports, not a speed limit on the subject. Measured
 // world-frame motion on real handheld footage runs to 30 deg/s median with a
 // p95 near 110, so 40 was rejecting ordinary frames.
@@ -78,21 +80,34 @@ constexpr double kSeamHysteresisDeg = 4.0;
 
 double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// The strongest rival to the winning match, ignoring its immediate
-// neighbourhood: one clear peak means the patch can be found again, many
-// near-equal peaks mean it cannot.
-double rivalPeak(const cv::Mat &scoreMap, const cv::Point &best, int exclude)
+// How far the winning match stands above the rest of the score map, in
+// standard deviations (the peak-to-sidelobe ratio). A confident lock scores
+// well above 4; a patch that matches everywhere equally scores near zero.
+//
+// This replaces a "best rival peak" test, which was measuring the wrong thing:
+// with a 48 px template the excluded neighbourhood was only 16 px, so a
+// "rival" 17 px away still shared two thirds of its pixels with the true
+// match and scored almost as highly. That test therefore fired on a PERFECT
+// lock -- the user's 0.897-mean track was ended by it -- while a genuinely
+// ambiguous patch scores badly on this one whatever the peak height.
+double peakSidelobeRatio(const cv::Mat &scoreMap, const cv::Point &best, int exclude)
 {
-    double rival = -1.0;
+    double sum = 0.0, sumSq = 0.0;
+    int n = 0;
     for (int y = 0; y < scoreMap.rows; ++y) {
         const float *row = scoreMap.ptr<float>(y);
         for (int x = 0; x < scoreMap.cols; ++x) {
             if (std::abs(x - best.x) <= exclude && std::abs(y - best.y) <= exclude)
                 continue;
-            if (row[x] > rival) rival = row[x];
+            sum += row[x];
+            sumSq += (double)row[x] * row[x];
+            ++n;
         }
     }
-    return rival;
+    if (n < 16) return 99.0;                    // too small to judge; do not gate
+    const double mean = sum / n;
+    const double var = qMax(1e-9, sumSq / n - mean * mean);
+    return (scoreMap.at<float>(best) - mean) / std::sqrt(var);
 }
 
 // Bilinear sample of a luma plane, GL texel centres.
@@ -346,13 +361,13 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
         double minV, maxV;
         cv::Point minL, maxL;
         cv::minMaxLoc(selfMap, &minV, &maxV, &minL, &maxL);
-        const double rival = rivalPeak(selfMap, maxL, kTemplate / 3);
-        if (rival > kMaxSeedRival) {
+        const double psr = peakSidelobeRatio(selfMap, maxL, kTemplate / 2);
+        if (psr < kMinSeedPsr) {
             if (error)
-                *error = QObject::tr("that area looks much the same all over (rival match %1, "
-                                     "limit %2), so tracking would slide across it -- point at "
+                *error = QObject::tr("that area looks much the same all over (distinctness %1, "
+                                     "needs %2), so tracking would slide across it -- point at "
                                      "something with a distinct edge or pattern")
-                             .arg(rival, 0, 'f', 2).arg(kMaxSeedRival);
+                             .arg(psr, 0, 'f', 1).arg(kMinSeedPsr);
             return false;
         }
     }
@@ -415,7 +430,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
                         .rotatedVector(m_dirWorld).normalized();
 
     const double pTanBase = std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog);
-    double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestRival = -1.0;
+    double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestPsr = 99.0;
     double anchorScore = -2.0;
     double scores[3] = {-2.0, -2.0, -2.0};
     cv::Point bestLoc;
@@ -451,7 +466,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
             bestScore = useScore;
             bestK = k;
             bestValid = validFrac;
-            bestRival = rivalPeak(*useMap, useLoc, kTemplate / 3);
+            bestPsr = peakSidelobeRatio(*useMap, useLoc, kTemplate / 2);
             bestLoc = useLoc;
             bestTile = tile;
             bestDx = (useLoc.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
@@ -465,7 +480,10 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
 
     m_hardRun = (bestScore < kScoreHardFloor) ? m_hardRun + 1 : 0;
     m_badRun = (bestScore < kScoreSoftFloor) ? m_badRun + 1 : 0;
-    m_ambiguousRun = (bestRival > kMaxRunRival * bestScore) ? m_ambiguousRun + 1 : 0;
+    // If the ORIGINAL patch still matches well, we are locked on by definition
+    // and no amount of background similarity should end the track.
+    const bool anchorHolds = anchorScore > kAnchorStillGood;
+    m_ambiguousRun = (!anchorHolds && bestPsr < kMinRunPsr) ? m_ambiguousRun + 1 : 0;
 
     const bool wouldLose = m_hardRun >= kHardRun || m_badRun >= kBadRun
                         || m_ambiguousRun >= kAmbiguousRun;
@@ -498,7 +516,7 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
                 double sMin, sMax;
                 cv::Point sMinL, sMaxL;
                 cv::minMaxLoc(selfMap, &sMin, &sMax, &sMinL, &sMaxL);
-                distinct = rivalPeak(selfMap, sMaxL, kTemplate / 3) <= kMaxSeedRival;
+                distinct = peakSidelobeRatio(selfMap, sMaxL, kTemplate / 2) >= kMinSeedPsr;
             }
             if (distinct) {
                 m_anchorHolder->anchor = candidate;
