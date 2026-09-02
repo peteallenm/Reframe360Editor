@@ -273,10 +273,13 @@ Item {
 
                                 Button {
                                     text: app.trackRunning ? qsTr("Stop")
-                                          : (app.trackArmed ? qsTr("Cancel") : qsTr("Track object…"))
+                                          : (app.trackPointCount > 0
+                                             ? qsTr("Track (%1)").arg(app.trackPointCount)
+                                             : (app.trackArmed ? qsTr("Cancel") : qsTr("Track object…")))
                                     enabled: app.videoPath !== ""
                                     onClicked: {
                                         if (app.trackRunning) app.cancelTracking()
+                                        else if (app.trackPointCount > 0) app.beginTracking()
                                         else app.trackArmed = !app.trackArmed
                                     }
                                     ToolTip.text: qsTr("Point at something and it stays in the same part of the frame, at roughly the same size, until your next keyframe")
@@ -304,6 +307,14 @@ Item {
                             }
 
                             Button {
+                                text: qsTr("Clear marks")
+                                visible: app.trackPointCount > 0
+                                enabled: !app.trackRunning
+                                onClicked: { app.clearTrackPoints(); app.trackArmed = false }
+                                Layout.fillWidth: true
+                            }
+
+                            Button {
                                 text: qsTr("Clear tracks")
                                 enabled: app.trackCount > 0 && !app.trackRunning
                                 onClicked: app.clearTracks()
@@ -315,7 +326,7 @@ Item {
                                 wrapMode: Text.Wrap
                                 font.pixelSize: 11
                                 color: "#888"
-                                text: qsTr("A track ends at your next keyframe, or where it loses the subject. Add a keyframe to take over from there.")
+                                text: qsTr("Mark more than one part of the subject (head and shirt, say) and it follows whichever is matching best, picking up the others when it can. A track ends at your next keyframe, or where it loses the subject.")
                             }
                         }
                     }

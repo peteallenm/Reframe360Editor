@@ -67,6 +67,11 @@ public:
     Step step(const uchar *y, int w, int h, int stride,
               const QQuaternion &camOrientation, double t);
 
+    // Put the tracker back on a supplied direction (used to retry a patch that
+    // failed, from where the surviving patches say it should be).
+    void setWorldDir(const QVector3D &dir) { m_dirWorld = dir.normalized(); m_omegaRate = 0.0; }
+    void clearRuns() { m_badRun = m_rejectRun = m_hardRun = m_ambiguousRun = 0; }
+
     const TrackSample &lastSample() const { return m_last; }
     QVector3D worldDir() const { return m_dirWorld; }
     QString lossReason() const { return m_lossReason; }
@@ -109,8 +114,12 @@ struct TrackRequest {
 
     double t0 = 0.0;              // arm time
     double tEnd = 0.0;            // stop here (next keyframe / trim-out / end)
-    QVector3D seedDirCam;         // object bearing at t0, camera frame
-    double seedRadiusRad = 0.02;  // its angular radius
+    // One or more bearings on the SAME subject, camera frame at t0 -- e.g. a
+    // head and a shirt. Each is followed independently and the best-matching
+    // one drives the view, so a patch that fails does not end the track; a
+    // failed one is retried from where the others say it should be.
+    QVector<QVector3D> seedDirsCam;
+    double seedRadiusRad = 0.02;  // angular radius of each patch
 
     // The camera's own orientation, pre-sampled on the GUI thread so the
     // worker never reads the integrator. Unsmoothed and full-bandwidth: the
@@ -135,6 +144,9 @@ struct TrackResult {
     // Diagnostics, printed by --track-stats and useful when a track goes wrong.
     double meanScore = 0.0;
     double msPerFrame = 0.0;
+    int pointsSeeded = 0;         // how many of the requested patches took
+    int pointsSurviving = 0;      // ... and how many were still alive at the end
+    int revivals = 0;             // times a failed patch was picked back up
 };
 
 class ObjectTracker : public QObject

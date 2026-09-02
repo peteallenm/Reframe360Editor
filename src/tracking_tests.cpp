@@ -2721,6 +2721,57 @@ static void testTileTrackerRefusesFeatureless()
                .arg(seededGood ? QStringLiteral("accepted") : QStringLiteral("REFUSED: ") + err2));
 }
 
+// A dark subject on a light background. This is the case that broke when the
+// tile marked invalid pixels by writing 0 into it: black subject pixels were
+// read back as "missing" and replaced with the tile mean, so the subject
+// dissolved and the track died on its first step.
+static void testTileTrackerDarkSubject()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth(0.0f, 0.0f, -1.0f);
+    const double radius = proj::degToRad(7.0);
+    auto camAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(15.0 * t));
+    };
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = radius;
+    QString err;
+    bool seeded = false, lost = false;
+    int tracked = 0;
+
+    for (int i = 0; i < 60; ++i) {
+        const double t = i / 30.0;
+        const QQuaternion q = camAt(t);
+        // Light field, near-black subject with a little internal detail.
+        buf.fill(205);
+        if (!synth::render(buf, truth, radius, q, lenses)) continue;
+        // Re-paint the rendered blob dark: keep its shape, drop its level.
+        for (int k = 0; k < buf.size(); ++k)
+            if (buf[k] < 200) buf[k] = (uchar)(buf[k] > 120 ? 12 : 0);
+
+        if (!seeded) {
+            cfg.seedDirCam = q.conjugated().rotatedVector(truth);
+            seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                   synth::kW, q, t, &err);
+            continue;
+        }
+        const TileTracker::Step st = tracker.step(buf.constData(), synth::kW, synth::kH,
+                                                  synth::kW, q, t);
+        if (st == TileTracker::Step::Lost) { lost = true; break; }
+        if (st == TileTracker::Step::Ok) ++tracked;
+    }
+
+    report("A dark subject on a light background is trackable",
+           seeded && !lost && tracked > 40,
+           QStringLiteral("seeded=%1, %2 frames tracked%3")
+               .arg(seeded).arg(tracked)
+               .arg(seeded ? QString() : QStringLiteral(", seed said: ") + err));
+}
+
 static void testTileTrackerLoss()
 {
     const TrackLenses lenses = synthLenses();
@@ -2850,6 +2901,25 @@ static QQuaternion camToWorld(const QQuaternion &chain)
 // view of it (they are not the same picture).
 static bool g_trackDumpFrame = false;
 
+// --track-points=N spreads N patches over the subject, the way a user would
+// mark a head and a shirt, so the multi-patch path can be measured.
+static int g_trackPoints = 1;
+static QVector<QVector3D> seedList(const QVector3D &centre)
+{
+    QVector<QVector3D> out;
+    out.append(centre.normalized());
+    if (g_trackPoints <= 1) return out;
+    QVector3D up(0, 1, 0);
+    if (std::fabs(QVector3D::dotProduct(centre.normalized(), up)) > 0.99f) up = QVector3D(0, 0, 1);
+    const QVector3D right = QVector3D::crossProduct(up, centre.normalized()).normalized();
+    const QVector3D vert = QVector3D::crossProduct(centre.normalized(), right).normalized();
+    const float off = (float)std::tan(0.6 * 0.5 * proj::degToRad(g_viewFov) * g_trackSize);
+    const QVector3D dirs[4] = { vert, -vert, right, -right };
+    for (int i = 0; i < g_trackPoints - 1 && i < 4; ++i)
+        out.append((centre.normalized() + dirs[i] * off).normalized());
+    return out;
+}
+
 static void trackRealClip(const QString &video)
 {
     qInfo().noquote() << "\n===== object tracking:" << QFileInfo(video).fileName() << "=====";
@@ -2927,15 +2997,15 @@ static void trackRealClip(const QString &video)
         QQuaternion q = kFlipRollQ();
         if (hasImu)
             q = camToWorld(gi.orientationAtTimeUnsmoothed(req.t0 * (1.0 + drift) + syncOffset));
-        req.seedDirCam = q.conjugated().rotatedVector(
-            QVector3D((float)d.x, (float)d.y, (float)d.z)).normalized();
+        req.seedDirsCam = seedList(q.conjugated().rotatedVector(
+            QVector3D((float)d.x, (float)d.y, (float)d.z)).normalized());
         req.seedRadiusRad = 0.5 * proj::degToRad(g_viewFov) * g_trackSize;
     } else if (g_trackUseUv) {
-        req.seedDirCam = VisualRotationComputer::pixelToBearing(
-            g_trackU, g_trackV, g_trackLens == 1 ? req.lenses.rear : req.lenses.front).normalized();
+        req.seedDirsCam = seedList(VisualRotationComputer::pixelToBearing(
+            g_trackU, g_trackV, g_trackLens == 1 ? req.lenses.rear : req.lenses.front).normalized());
     } else {
-        req.seedDirCam = g_trackUseDir ? g_trackDir.normalized()
-                       : QVector3D((float)look.x, (float)look.y, (float)look.z).normalized();
+        req.seedDirsCam = seedList(g_trackUseDir ? g_trackDir.normalized()
+                       : QVector3D((float)look.x, (float)look.y, (float)look.z).normalized());
     }
     req.seedRadiusRad = 0.5 * proj::degToRad(90.0) * g_trackSize;
 
@@ -3388,6 +3458,7 @@ int main(int argc, char *argv[])
         if (QString(argv[i]).startsWith("--track-gate=")) { g_trackGate = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]) == "--track-noimu") { g_trackNoImu = true; continue; }
         if (QString(argv[i]) == "--track-dumpframe") { g_trackDumpFrame = true; continue; }
+        if (QString(argv[i]).startsWith("--track-points=")) { g_trackPoints = QString(argv[i]).mid(15).toInt(); continue; }
         if (QString(argv[i]).startsWith("--track-view=")) {
             const QStringList parts = QString(argv[i]).mid(13).split(',');
             if (parts.size() >= 3) {
@@ -3552,6 +3623,7 @@ int main(int argc, char *argv[])
         qInfo() << "--- Test 0f: object tracker (synthetic footage) ---";
         testTileTrackerGroundTruth();
         testTileTrackerRefusesFeatureless();
+        testTileTrackerDarkSubject();
         testTileTrackerLoss();
         testTileTrackerScale();
 

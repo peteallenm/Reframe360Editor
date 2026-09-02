@@ -192,6 +192,7 @@ class App : public QObject
     Q_PROPERTY(int trackCount READ trackCount NOTIFY tracksChanged)
     // True while the viewer is waiting for the user to point at something.
     Q_PROPERTY(bool trackArmed READ trackArmed WRITE setTrackArmed NOTIFY trackArmedChanged)
+    Q_PROPERTY(int trackPointCount READ trackPointCount NOTIFY trackPointsChanged)
 
 public:
     explicit App(QObject *parent = nullptr);
@@ -346,13 +347,20 @@ public:
     QString trackStatus() const { return m_trackStatus; }
     int trackCount() const { return m_tracks.size(); }
     bool trackArmed() const { return m_trackArmed; }
+    int trackPointCount() const { return m_pendingDirs.size(); }
     void setTrackArmed(bool armed);
 
     // Arm/pick: the viewer hands back where the user pointed, in NDC, plus the
     // aspect of the surface they pointed at (the framing must be resolved
     // against that, never against the live pane or the export size).
-    Q_INVOKABLE void startTrackAt(double ndcX, double ndcY, double aspect,
-                                  double sizeFraction = 0.15);
+    // Mark a patch on the subject. Several may be marked before tracking
+    // starts -- a head and a shirt, say -- and the pass follows whichever is
+    // matching best, retrying the others from where that one says they are.
+    Q_INVOKABLE void addTrackPoint(double ndcX, double ndcY, double aspect,
+                                   double sizeFraction = 0.10);
+    Q_INVOKABLE void beginTracking();
+    Q_INVOKABLE void clearTrackPoints();
+    Q_INVOKABLE QVariantList trackPointNdc(double aspect) const;
     Q_INVOKABLE void cancelTracking();
     Q_INVOKABLE void removeTrack(int index);
     Q_INVOKABLE void clearTracks();
@@ -469,6 +477,7 @@ signals:
     void trackProgressChanged();
     void trackStatusChanged();
     void trackArmedChanged();
+    void trackPointsChanged();
     void tracksChanged();
 
 private:
@@ -563,6 +572,10 @@ private:
     double m_trackProgress = 0.0;
     QString m_trackStatus;
     Track m_pendingTrack;          // being filled by the running pass
+    QVector<QVector3D> m_pendingDirs;    // marked patches, camera frame at t0
+    QVariantList m_pendingNdc;           // ... and where they were tapped
+    double m_pendingRadius = 0.05;
+    double m_pendingTime = 0.0;
     QString m_pendingTrackVideo;   // guards against a result for the old clip
 
     const QVector<Keyframe> &effectiveKeyframes() const;

@@ -98,9 +98,12 @@ Item {
             }
             onReleased: (mouse) => {
                 if (!app.trackArmed || moved) return
-                app.startTrackAt(mouse.x / Math.max(width, 1) * 2 - 1,
-                                 mouse.y / Math.max(height, 1) * 2 - 1,
-                                 width / Math.max(height, 1))
+                // Each tap adds a mark; tracking starts from the panel, so
+                // several parts of the same subject can be marked first.
+                app.addTrackPoint(mouse.x / Math.max(width, 1) * 2 - 1,
+                                  mouse.y / Math.max(height, 1) * 2 - 1,
+                                  width / Math.max(height, 1))
+                trackPointMarks.refresh()
             }
         }
 
@@ -139,6 +142,31 @@ Item {
             }
         }
 
+        // The marks placed so far, so it is clear what has been chosen.
+        Repeater {
+            id: trackPointMarks
+            property var marks: []
+            function refresh() { marks = app.trackPointNdc(1.0) }
+            model: marks
+            Connections {
+                target: app
+                function onTrackPointsChanged() { trackPointMarks.refresh() }
+            }
+            delegate: Item {
+                required property var modelData
+                x: (modelData.ndcX * 0.5 + 0.5) * lensViewer.width - 11
+                y: (modelData.ndcY * 0.5 + 0.5) * lensViewer.height - 11
+                width: 22; height: 22
+                Rectangle {
+                    anchors.fill: parent
+                    color: "transparent"
+                    border.color: "#ffd24d"
+                    border.width: 2
+                    radius: 3
+                }
+            }
+        }
+
         // Armed: say what to do, because a crosshair alone does not explain it.
         Rectangle {
             visible: app.trackArmed
@@ -152,7 +180,8 @@ Item {
             Label {
                 id: hint
                 anchors.centerIn: parent
-                text: qsTr("Tap what you want to follow")
+                text: app.trackPointCount === 0 ? qsTr("Tap what you want to follow")
+                      : qsTr("%1 marked — tap more, or press Track").arg(app.trackPointCount)
                 color: "white"
                 font.pixelSize: 13
             }

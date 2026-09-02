@@ -58,6 +58,7 @@ constexpr double kRunningUpdateMin  = 0.45;  // only learn from a good match
 // a fresh template there is what carries a track through that.
 constexpr int    kMaxReseeds        = 12;
 constexpr double kReseedMinGap      = 0.30;  // seconds between re-seeds
+constexpr double kRevivalScore      = 0.50;  // a retried patch must match this well
 constexpr double kMinValidFraction  = 0.80;  // of the tile inside a lens circle
 constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
 // Variance is not enough. A smooth gradient -- sky, a blurred wall, water --
@@ -141,6 +142,11 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
     const QVector3D tileUp = QVector3D::crossProduct(fwd, right).normalized();
 
     out.create(S, S, CV_8U);
+    // Validity needs its own mask. Marking invalid pixels by writing 0 into
+    // the tile treats every genuinely BLACK pixel as missing and replaces it
+    // with the tile mean -- which dissolves a dark subject (black trousers
+    // against a light background) into a flat blob that matches nothing.
+    cv::Mat valid8(S, S, CV_8U, cv::Scalar(0));
     const QQuaternion qInv = qAct.conjugated();
     const double half = S * 0.5;
     int valid = 0;
@@ -162,6 +168,7 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
 
     for (int j = 0; j < S; ++j) {
         uchar *row = out.ptr<uchar>(j);
+        uchar *vrow = valid8.ptr<uchar>(j);
         const double ty = -((j + 0.5) - half) * pTan;      // row 0 is the top
         for (int i = 0; i < S; ++i) {
             const double tx = ((i + 0.5) - half) * pTan;
@@ -172,9 +179,10 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
             const bool front = theta <= M_PI * 0.5;
             double u, v;
             proj::lensUv(front, theta, phi, front ? geomFront : geomRear, u, v);
-            if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) { row[i] = 0; continue; }
+            if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) continue;   // mask stays 0
             const double val = sampleY(Y, w, h, stride, u, proj::stackedV(front, v));
             row[i] = (uchar)clampd(val, 0.0, 255.0);
+            vrow[i] = 1;
             sum += val;
             ++valid;
         }
@@ -189,8 +197,9 @@ bool buildTile(const uchar *Y, int w, int h, int stride,
     const uchar mean = (uchar)clampd(sum / valid, 0.0, 255.0);
     for (int j = 0; j < S; ++j) {
         uchar *row = out.ptr<uchar>(j);
+        const uchar *vrow = valid8.ptr<uchar>(j);
         for (int i = 0; i < S; ++i)
-            if (row[i] == 0) row[i] = mean;
+            if (!vrow[i]) row[i] = mean;
     }
     return frac >= 0.10;
 }
@@ -612,6 +621,41 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     return Step::Ok;
 }
 
+// One frame's measurement, in the frame the tracker saw: a half-frame fisheye
+// coordinate plus the subject's extent, which is what the resolver
+// back-projects. Free-standing because with several patches the subject's
+// direction belongs to none of them.
+static TrackSample sampleFor(const QVector3D &dirWorld, const QQuaternion &qAct,
+                             const TrackLenses &lenses, double radiusRad, double score)
+{
+    const QVector3D cam = qAct.conjugated().rotatedVector(dirWorld.normalized());
+    double theta, phi;
+    proj::dirToThetaPhi(proj::Vec3{cam.x(), cam.y(), cam.z()}, theta, phi);
+    const bool front = theta <= M_PI * 0.5;
+    const auto &lp = front ? lenses.front : lenses.rear;
+    const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                                     lp.rotation, lp.hflip);
+    TrackSample smp;
+    smp.t = 0.0;
+    smp.lens = front ? 0 : 1;
+    proj::lensUv(front, theta, phi, geom, smp.u, smp.v);
+
+    QVector3D up(0.0f, 1.0f, 0.0f);
+    if (std::fabs(QVector3D::dotProduct(dirWorld.normalized(), up)) > 0.996f)
+        up = QVector3D(0.0f, 0.0f, 1.0f);
+    const QVector3D right = QVector3D::crossProduct(up, dirWorld.normalized()).normalized();
+    const QVector3D edge = (dirWorld.normalized() + right * (float)std::tan(radiusRad)).normalized();
+    const QVector3D edgeCam = qAct.conjugated().rotatedVector(edge);
+    double eTheta, ePhi;
+    proj::dirToThetaPhi(proj::Vec3{edgeCam.x(), edgeCam.y(), edgeCam.z()}, eTheta, ePhi);
+    double eu, ev;
+    proj::lensUv(front, eTheta, ePhi, geom, eu, ev);
+    smp.halfW = std::hypot(eu - smp.u, ev - smp.v);
+    smp.halfH = smp.halfW;
+    smp.conf = clampd(score, 0.0, 1.0);
+    return smp;
+}
+
 ObjectTracker::ObjectTracker(QObject *parent) : QObject(parent) {}
 
 ObjectTracker::~ObjectTracker()
@@ -661,17 +705,32 @@ void ObjectTracker::run(TrackRequest req)
     }
     reader.seek(req.t0);
 
-    TileTracker tracker;
+    // One tracker per patch the user marked. They follow the same subject, so
+    // each keeps its offset from the subject's direction: whichever patch is
+    // matching best drives the view, and a patch that fails is retried from
+    // where the survivors say it should be. That is what carries a subject
+    // through a turn -- the head may be unrecognisable while the shirt is not.
+    struct PointState {
+        TileTracker tracker;
+        QQuaternion offset;         // subject direction -> this patch
+        bool alive = false;
+        double score = 0.0;
+        bool okThisFrame = false;
+    };
+    QVector<PointState> points;
+    points.resize(qMax(1, req.seedDirsCam.size()));
+
     TileTracker::Config cfg;
     cfg.lenses = req.lenses;
-    cfg.seedDirCam = req.seedDirCam;
     cfg.seedRadiusRad = req.seedRadiusRad;
     cfg.maxWorldSpeedDeg = req.maxWorldSpeedDeg;
 
+    QVector3D subjectDir;
     int frames = 0;
     double scoreSum = 0.0;
     double lastTime = req.t0;
     QString endReason = QStringLiteral("?");
+    QString seedError;
 
     while (true) {
         if (m_cancel.loadRelaxed() != 0) {
@@ -684,43 +743,111 @@ void ObjectTracker::run(TrackRequest req)
         if (t > req.tEnd + 1e-6) { reader.release(); endReason = QStringLiteral("reached the end time"); break; }
 
         const QQuaternion qAct = orientationAt(req, t);
-        static const QByteArray frameDump = qgetenv("RENDER360_FRAME_DUMP");
-        if (!frameDump.isEmpty() && frames == 0) {
-            QFile f(QString::fromLatin1(frameDump));
-            if (f.open(QIODevice::WriteOnly)) {
-                f.write(QStringLiteral("P5\n%1 %2\n255\n")
-                            .arg(reader.width()).arg(reader.height()).toLatin1());
-                for (int r = 0; r < reader.height(); ++r)
-                    f.write(reinterpret_cast<const char *>(reader.y() + (qsizetype)r * reader.stride()),
-                            reader.width());
-            }
-        }
+
         if (frames == 0) {
-            QString seedErr;
-            if (!tracker.begin(cfg, reader.y(), reader.width(), reader.height(),
-                               reader.stride(), qAct, t, &seedErr)) {
+            // Seed every patch. One that will not take is dropped with a note
+            // rather than failing the whole track -- the others may be fine.
+            for (int i = 0; i < points.size(); ++i) {
+                cfg.seedDirCam = (i < req.seedDirsCam.size()) ? req.seedDirsCam[i]
+                                                              : req.seedDirsCam.value(0);
+                QString e;
+                points[i].alive = points[i].tracker.begin(cfg, reader.y(), reader.width(),
+                                                          reader.height(), reader.stride(),
+                                                          qAct, t, &e);
+                if (!points[i].alive && seedError.isEmpty())
+                    seedError = e;
+            }
+            int alive = 0;
+            for (const PointState &p : points) if (p.alive) ++alive;
+            result.pointsSeeded = alive;
+            if (alive == 0) {
                 reader.release();
                 m_running.storeRelaxed(0);
-                emit trackFailed(seedErr);
+                emit trackFailed(seedError.isEmpty()
+                    ? QObject::tr("Could not lock on to that") : seedError);
                 return;
             }
-            result.samples.append(tracker.lastSample());
+            for (const PointState &p : points)
+                if (p.alive) { subjectDir = p.tracker.worldDir(); break; }
+            for (PointState &p : points)
+                if (p.alive)
+                    p.offset = QQuaternion::rotationTo(subjectDir, p.tracker.worldDir());
+
+            result.samples.append(sampleFor(subjectDir, qAct, req.lenses,
+                                            req.seedRadiusRad, 1.0));
             scoreSum += 1.0;
-        } else {
-            const TileTracker::Step st = tracker.step(reader.y(), reader.width(),
-                                                      reader.height(), reader.stride(), qAct, t);
+            lastTime = t;
+            ++frames;
+            reader.release();
+            continue;
+        }
+
+        // Advance every live patch.
+        int aliveNow = 0;
+        for (PointState &p : points) {
+            p.okThisFrame = false;
+            if (!p.alive) continue;
+            const TileTracker::Step st = p.tracker.step(reader.y(), reader.width(),
+                                                        reader.height(), reader.stride(), qAct, t);
             if (st == TileTracker::Step::Lost) {
-                result.lost = true;
-                result.lossTime = t;
-                result.lossReason = tracker.lossReason();
-                reader.release();
-                break;
+                p.alive = false;                 // may come back below
+                continue;
             }
+            ++aliveNow;
             if (st == TileTracker::Step::Ok) {
-                result.samples.append(tracker.lastSample());
-                scoreSum += tracker.lastScore();
+                p.okThisFrame = true;
+                p.score = p.tracker.lastScore();
             }
         }
+
+        // The best patch this frame defines where the subject is.
+        int best = -1;
+        for (int i = 0; i < points.size(); ++i)
+            if (points[i].okThisFrame && (best < 0 || points[i].score > points[best].score))
+                best = i;
+
+        if (best < 0 && aliveNow == 0) {
+            result.lost = true;
+            result.lossTime = t;
+            // Report the reason of whichever patch held on longest.
+            for (const PointState &p : points)
+                if (!p.tracker.lossReason().isEmpty()) result.lossReason = p.tracker.lossReason();
+            if (result.lossReason.isEmpty()) result.lossReason = QStringLiteral("lost the subject");
+            reader.release();
+            break;
+        }
+
+        if (best >= 0) {
+            subjectDir = points[best].offset.conjugated().rotatedVector(
+                             points[best].tracker.worldDir()).normalized();
+            // Let the constellation breathe: the patches move relative to each
+            // other as the subject turns, so the offsets follow slowly.
+            for (PointState &p : points)
+                if (p.okThisFrame)
+                    p.offset = QQuaternion::slerp(
+                        p.offset, QQuaternion::rotationTo(subjectDir, p.tracker.worldDir()), 0.1f);
+
+            // Retry the failed patches where the survivors say they should be.
+            for (PointState &p : points) {
+                if (p.alive) continue;
+                const QVector3D expected = p.offset.rotatedVector(subjectDir).normalized();
+                p.tracker.setWorldDir(expected);
+                p.tracker.clearRuns();
+                if (p.tracker.step(reader.y(), reader.width(), reader.height(),
+                                   reader.stride(), qAct, t) == TileTracker::Step::Ok
+                    && p.tracker.lastScore() > kRevivalScore) {
+                    p.alive = true;
+                    p.score = p.tracker.lastScore();
+                    result.revivals++;
+                }
+            }
+
+            result.samples.append(sampleFor(subjectDir, qAct, req.lenses,
+                                            req.seedRadiusRad * points[best].tracker.scaleRatio(),
+                                            points[best].score));
+            scoreSum += points[best].score;
+        }
+
         lastTime = t;
         ++frames;
         reader.release();
@@ -733,13 +860,15 @@ void ObjectTracker::run(TrackRequest req)
         }
     }
 
+    for (const PointState &p : points) if (p.alive) result.pointsSurviving++;
     result.meanScore = frames > 0 ? scoreSum / frames : 0.0;
     result.msPerFrame = frames > 0 ? (double)clock.elapsed() / frames : 0.0;
-    qInfo().noquote() << "ObjectTracker: stopped because:" << (result.lost ? result.lossReason : endReason)
-                      << "at t =" << lastTime;
-    qInfo("ObjectTracker: %d frames in %lld ms (%.1f ms/frame, %s), mean score %.3f%s",
-          frames, clock.elapsed(), result.msPerFrame,
-          usingProxy ? "proxy" : "original", result.meanScore,
+    qInfo().noquote() << "ObjectTracker: stopped because:"
+                      << (result.lost ? result.lossReason : endReason) << "at t =" << lastTime;
+    qInfo("ObjectTracker: %d frames in %lld ms (%.1f ms/frame, %s), mean score %.3f, "
+          "%d/%d patches alive, %d revivals%s",
+          frames, clock.elapsed(), result.msPerFrame, usingProxy ? "proxy" : "original",
+          result.meanScore, result.pointsSurviving, result.pointsSeeded, result.revivals,
           result.lost ? qPrintable(QStringLiteral(", lost: ") + result.lossReason) : "");
 
     m_running.storeRelaxed(0);

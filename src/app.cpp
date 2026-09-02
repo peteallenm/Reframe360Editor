@@ -1236,11 +1236,17 @@ void App::setTrackArmed(bool armed)
     emit trackArmedChanged();
 }
 
-void App::startTrackAt(double ndcX, double ndcY, double aspect, double sizeFraction)
+void App::addTrackPoint(double ndcX, double ndcY, double aspect, double sizeFraction)
 {
-    setTrackArmed(false);
     if (m_videoPath.isEmpty() || m_trackRunning)
         return;
+    if (!m_pendingDirs.isEmpty() && !qFuzzyCompare(m_pendingTime + 1.0, m_currentTime + 1.0)) {
+        // Marks belong to one moment: if the user scrubbed between taps, the
+        // earlier ones no longer describe this frame.
+        m_pendingDirs.clear();
+        m_pendingNdc.clear();
+    }
+    m_pendingTime = m_currentTime;
 
     // Where the user pointed, as a direction in the stabilised frame the view
     // angles act in, then back into the camera frame the tracker measures in.
@@ -1250,13 +1256,50 @@ void App::startTrackAt(double ndcX, double ndcY, double aspect, double sizeFract
     const QVector3D worldDir((float)look.x, (float)look.y, (float)look.z);
     const QQuaternion qDisplay = imuOrientationAt(m_currentTime);
 
+    m_pendingDirs.append(qDisplay.conjugated().rotatedVector(worldDir).normalized());
+    QVariantMap m;
+    m.insert(QStringLiteral("ndcX"), ndcX);
+    m.insert(QStringLiteral("ndcY"), ndcY);
+    m_pendingNdc.append(m);
+    // Patches are deliberately small: a wide one on a moving subject is mostly
+    // background, and several small ones beat one big one.
+    m_pendingRadius = qBound(0.005, 0.5 * proj::degToRad(m_fov) * sizeFraction, 0.15);
+
+    m_trackStatus = m_pendingDirs.size() == 1
+        ? tr("1 mark — tap more of the subject, or press Track")
+        : tr("%1 marks — press Track").arg(m_pendingDirs.size());
+    emit trackPointsChanged();
+    emit trackStatusChanged();
+}
+
+void App::clearTrackPoints()
+{
+    if (m_pendingDirs.isEmpty())
+        return;
+    m_pendingDirs.clear();
+    m_pendingNdc.clear();
+    emit trackPointsChanged();
+}
+
+QVariantList App::trackPointNdc(double aspect) const
+{
+    Q_UNUSED(aspect);
+    return m_pendingNdc;
+}
+
+void App::beginTracking()
+{
+    setTrackArmed(false);
+    if (m_videoPath.isEmpty() || m_trackRunning || m_pendingDirs.isEmpty())
+        return;
+
     TrackRequest req;
     req.videoPath = m_videoPath;
     req.proxyOverride = m_proxyOverride.isEmpty() ? previewThumbnailPath() : m_proxyOverride;
     req.lenses = trackLenses();
-    req.t0 = m_currentTime;
-    req.seedDirCam = qDisplay.conjugated().rotatedVector(worldDir).normalized();
-    req.seedRadiusRad = qBound(0.005, 0.5 * proj::degToRad(m_fov) * sizeFraction, 0.5);
+    req.t0 = m_pendingTime;
+    req.seedDirsCam = m_pendingDirs;
+    req.seedRadiusRad = m_pendingRadius;
     // Only used as a minimum spacing between frames and to sample the
     // orientation chain (which is slerped anyway), so the camera's nominal
     // 29.97 is close enough; the tracker consumes whatever frames it decodes.
@@ -1297,9 +1340,10 @@ void App::startTrackAt(double ndcX, double ndcY, double aspect, double sizeFract
     m_pendingTrack = Track();
     m_pendingTrack.id = QStringLiteral("t%1").arg(QDateTime::currentMSecsSinceEpoch());
     m_pendingTrack.t0 = req.t0;
-    m_pendingTrack.framingNdcX = ndcX;
-    m_pendingTrack.framingNdcY = ndcY;
-    m_pendingTrack.framingAspect = aspect > 0.01 ? aspect : 16.0 / 9.0;
+    const QVariantMap first = m_pendingNdc.value(0).toMap();
+    m_pendingTrack.framingNdcX = first.value(QStringLiteral("ndcX")).toDouble();
+    m_pendingTrack.framingNdcY = first.value(QStringLiteral("ndcY")).toDouble();
+    m_pendingTrack.framingAspect = 16.0 / 9.0;
     m_pendingTrack.framingProjection = m_projection;
     m_pendingTrack.yaw0 = m_yaw;
     m_pendingTrack.pitch0 = m_pitch;
@@ -1315,6 +1359,7 @@ void App::startTrackAt(double ndcX, double ndcY, double aspect, double sizeFract
     emit trackProgressChanged();
     emit trackStatusChanged();
     m_objectTracker->track(req);
+    clearTrackPoints();
 }
 
 void App::cancelTracking()
