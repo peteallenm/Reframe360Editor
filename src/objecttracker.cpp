@@ -61,6 +61,14 @@ constexpr double kReseedMinGap      = 0.30;  // seconds between re-seeds
 constexpr double kRevivalScore      = 0.50;  // a retried patch must match this well
 constexpr double kMinValidFraction  = 0.80;  // of the tile inside a lens circle
 constexpr double kMinSeedStdDev     = 8.0;   // grey levels; below this, refuse
+// ... and the same sanity applied every frame, not only at seed time. A patch
+// with no structure in it cannot be the subject that was picked -- it is sky,
+// or a blown highlight. It has to be caught explicitly because it does not
+// look like failure: featureless matches featureless at 0.9+, and once the
+// running template has drifted into the sky the tracker reports a rock-solid
+// lock while sitting on nothing. Slightly below the seed threshold, so a
+// subject that merely loses contrast is not thrown away.
+constexpr double kMinTrackStdDev    = 5.0;
 // Variance is not enough. A smooth gradient -- sky, a blurred wall, water --
 // has plenty of it and still correlates just as well ANYWHERE along the
 // gradient, so the score stays high while the track slides (the aperture
@@ -74,7 +82,15 @@ constexpr double kAnchorStillGood   = 0.45;  // anchor match that vetoes an
 // A sanity gate against teleports, not a speed limit on the subject. Measured
 // world-frame motion on real handheld footage runs to 30 deg/s median with a
 // p95 near 110, so 40 was rejecting ordinary frames.
-constexpr double kMaxWorldSpeedDeg  = 150.0;
+// A sanity ceiling, NOT the teleport guard it was documented as. The gate is
+// applied to the whole step, and the step is the predicted motion plus a
+// residual the search window already bounds -- so this really only caps how
+// fast the tracker is willing to believe a subject moves, and 150 capped it
+// near 60 deg/s. That truncated ordinary handheld tracks (0830 died at 3.9 s)
+// and made a bullet-time orbit, where the subject sweeps 250-350 deg/s,
+// impossible: every frame was rejected and the tracker settled on background.
+constexpr double kMaxWorldSpeedDeg  = 400.0;
+constexpr int    kMaxTileSize       = 240;   // bounds the per-frame search cost
 constexpr double kMaxScaleStepLog   = 0.223; // log(1.25) per frame
 constexpr double kSeamThetaDeg      = 90.0;
 constexpr double kSeamHysteresisDeg = 4.0;
@@ -335,8 +351,8 @@ bool TileTracker::begin(const Config &cfg, const uchar *y, int w, int h, int str
     // does not then depend on how big the subject is.
     const double d0Deg = qMax(0.5, cfg.seedRadiusRad * 2.0 * 180.0 / M_PI);
     m_pDeg = clampd(1.3 * d0Deg / kTemplate, 0.125, 0.5);
-    const double searchHalfDeg = clampd(0.65 * d0Deg, 3.0, 12.0);
-    m_tileSize = (int)clampd(kTemplate + 2 * std::ceil(searchHalfDeg / m_pDeg), 80, 128);
+    m_searchHalfDeg = clampd(0.65 * d0Deg, 3.0, 12.0);
+    m_tileSize = (int)clampd(kTemplate + 2 * std::ceil(m_searchHalfDeg / m_pDeg), 80, 128);
 
     cv::Mat tile;
     double validFrac = 0.0;
@@ -438,6 +454,16 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
         predicted = QQuaternion::fromAxisAndAngle(m_omegaAxis, (float)(m_omegaRate * dt))
                         .rotatedVector(m_dirWorld).normalized();
 
+    // Hold the search window at a constant ANGULAR radius. The tile samples at
+    // m_pDeg * exp(m_scaleLog) per pixel, so a fixed pixel budget means the
+    // window silently shrinks as the subject's apparent size grows -- exactly
+    // when the subject is closest and sweeping fastest, which is when the
+    // window is needed most. Sized here instead, per frame.
+    {
+        const double perPx = m_pDeg * std::exp(m_scaleLog);
+        m_tileSize = (int)clampd(kTemplate + 2 * std::ceil(m_searchHalfDeg / qMax(1e-3, perPx)),
+                                 kTemplate + 16, kMaxTileSize);
+    }
     const double pTanBase = std::tan(m_pDeg * M_PI / 180.0) * std::exp(m_scaleLog);
     double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestPsr = 99.0;
     double anchorScore = -2.0;
@@ -487,8 +513,23 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     if (bestScore < -1.0) { m_lossReason = QStringLiteral("out of field"); return Step::Lost; }
     if (bestValid < kMinValidFraction) { m_lossReason = QStringLiteral("left the lens"); return Step::Lost; }
 
+    // Is there anything actually there? Measured at the matched position, not
+    // over the whole tile: a tile that is half subject and half sky has plenty
+    // of variance while the match sits on the empty half.
+    double patchStd = 999.0;
+    const bool patchInTile = !bestTile.empty() && bestLoc.x >= 0 && bestLoc.y >= 0
+                          && bestLoc.x + kTemplate <= bestTile.cols
+                          && bestLoc.y + kTemplate <= bestTile.rows;
+    if (patchInTile) {
+        cv::Scalar pMean, pStd;
+        cv::meanStdDev(bestTile(cv::Rect(bestLoc.x, bestLoc.y, kTemplate, kTemplate)),
+                       pMean, pStd);
+        patchStd = pStd[0];
+    }
+    const bool featureless = patchStd < kMinTrackStdDev;
+
     m_hardRun = (bestScore < kScoreHardFloor) ? m_hardRun + 1 : 0;
-    m_badRun = (bestScore < kScoreSoftFloor) ? m_badRun + 1 : 0;
+    m_badRun = (bestScore < kScoreSoftFloor || featureless) ? m_badRun + 1 : 0;
     // If the ORIGINAL patch still matches well, we are locked on by definition
     // and no amount of background similarity should end the track.
     const bool anchorHolds = anchorScore > kAnchorStillGood;
@@ -538,7 +579,9 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
             }
         }
         if (m_hardRun >= kHardRun) m_lossReason = QStringLiteral("lost the subject");
-        else if (m_badRun >= kBadRun) m_lossReason = QStringLiteral("match too weak");
+        else if (m_badRun >= kBadRun)
+            m_lossReason = featureless ? QStringLiteral("subject moved out of view")
+                                       : QStringLiteral("match too weak");
         else m_lossReason = QStringLiteral("subject blends into its surroundings");
         return Step::Lost;
     }
@@ -585,9 +628,10 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
 
     // Learn the subject's current appearance, slowly, and only from a match
     // worth learning from. The anchor stays untouched as the ground truth.
-    if (bestScore > kRunningUpdateMin && !bestTile.empty()
-        && bestLoc.x >= 0 && bestLoc.y >= 0
-        && bestLoc.x + kTemplate <= bestTile.cols && bestLoc.y + kTemplate <= bestTile.rows) {
+    // Never learn from a featureless patch, or the template dissolves into the
+    // background it happens to be sitting on and the track becomes a confident
+    // lock on nothing.
+    if (bestScore > kRunningUpdateMin && !featureless && patchInTile) {
         cv::Mat patch = bestTile(cv::Rect(bestLoc.x, bestLoc.y, kTemplate, kTemplate));
         cv::addWeighted(m_anchorHolder->running, 1.0 - kRunningBlend,
                         patch, kRunningBlend, 0.0, m_anchorHolder->running);

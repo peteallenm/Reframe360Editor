@@ -55,7 +55,7 @@ public:
         TrackLenses lenses;
         QVector3D seedDirCam;         // object bearing at the seed frame
         double seedRadiusRad = 0.02;
-        double maxWorldSpeedDeg = 150.0;
+        double maxWorldSpeedDeg = 400.0;
     };
     enum class Step { Ok, Rejected, Lost };
 
@@ -88,7 +88,8 @@ private:
     double m_omegaRate = 0.0;
     double m_scaleLog = 0.0;
     double m_pDeg = 0.25;
-    int m_tileSize = 96;
+    double m_searchHalfDeg = 3.0;   // angular search radius, held constant
+    int m_tileSize = 96;            // ... by resizing the tile each frame
     int m_badRun = 0;
     int m_hardRun = 0;
     int m_ambiguousRun = 0;
@@ -129,11 +130,13 @@ struct TrackRequest {
     QVector<double> camTimes;
 
     double fps = 30.0;
-    // Object angular-speed gate: a guard against teleports, not a speed limit
-    // on the subject. Measured world-frame motion on real handheld footage
-    // runs to ~30 deg/s median with a p95 near 110, so anything under about
-    // 150 rejects ordinary frames -- which is what kept ending good tracks.
-    double maxWorldSpeedDeg = 150.0;
+    // Object angular-speed ceiling. The earlier 150 was justified by measured
+    // world motion "~30 deg/s median, p95 near 110" -- but that measurement was
+    // taken from tracks the gate had already truncated, so it only ever
+    // confirmed itself. Gating the whole step caps the trackable speed at
+    // roughly this minus the search window per frame; 400 leaves room for a
+    // bullet-time orbit at 250-350 deg/s.
+    double maxWorldSpeedDeg = 400.0;
 };
 
 struct TrackResult {

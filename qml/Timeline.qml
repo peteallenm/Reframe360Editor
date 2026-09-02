@@ -319,19 +319,15 @@ Pane {
                         cursorShape: Qt.PointingHandCursor
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: (mouse) => {
-                            if (mouse.button === Qt.RightButton) {
-                                trackMenu.targetIndex = index
-                                trackMenu.popup()
-                            } else {
+                            if (mouse.button === Qt.RightButton)
+                                timeline.openItemMenu(mapToItem(markerRow, mouse.x, mouse.y).x)
+                            else
                                 app.currentTime = trackBar.liveStart
-                            }
                         }
                         // Touch has no right button (same reason as the
                         // keyframe markers).
-                        onPressAndHold: {
-                            trackMenu.targetIndex = index
-                            trackMenu.popup()
-                        }
+                        onPressAndHold: (mouse) =>
+                            timeline.openItemMenu(mapToItem(markerRow, mouse.x, mouse.y).x)
                         ToolTip.text: modelData.lost
                             ? qsTr("Track %1: %2 s to %3 s, then lost the subject — drag either bracket to trim")
                                   .arg(index + 1).arg(trackBar.liveStart.toFixed(1))
@@ -443,12 +439,10 @@ Pane {
                         cursorShape: Qt.PointingHandCursor
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: (mouse) => {
-                            if (mouse.button === Qt.RightButton) {
-                                kfContextMenu.targetIndex = index
-                                kfContextMenu.popup()
-                            } else {
+                            if (mouse.button === Qt.RightButton)
+                                timeline.openItemMenu(mapToItem(markerRow, mouse.x, mouse.y).x)
+                            else
                                 app.currentTime = kfTime
-                            }
                         }
                         onDoubleClicked: {
                             kfEditDialog.openFor(index)
@@ -456,10 +450,8 @@ Pane {
                         // Touch has no right button, so a long press opens the
                         // same menu: without this there was no way at all to
                         // delete a keyframe on Android.
-                        onPressAndHold: {
-                            kfContextMenu.targetIndex = index
-                            kfContextMenu.popup()
-                        }
+                        onPressAndHold: (mouse) =>
+                            timeline.openItemMenu(mapToItem(markerRow, mouse.x, mouse.y).x)
                     }
                 }
             }
@@ -499,42 +491,72 @@ Pane {
     }
     Component.onCompleted: trackSpanList = app.trackSpans()
 
+    // One menu for everything under the press. A keyframe dot and a track
+    // bracket routinely land on the same few pixels, and whichever happened to
+    // be on top swallowed the click -- so you could not delete a keyframe that
+    // sat on a track, or reach a track whose end a keyframe covered. Rather
+    // than make the user guess which one they hit, offer both.
     Menu {
-        id: trackMenu
-        property int targetIndex: -1
-        MenuItem {
-            text: qsTr("Delete this track")
-            onTriggered: if (trackMenu.targetIndex >= 0) app.removeTrack(trackMenu.targetIndex)
-        }
-        MenuItem {
-            text: qsTr("Go to start")
-            onTriggered: {
-                const spans = app.trackSpans()
-                if (trackMenu.targetIndex >= 0 && trackMenu.targetIndex < spans.length)
-                    app.currentTime = spans[trackMenu.targetIndex].start
+        id: itemMenu
+        property var entries: []
+
+        Instantiator {
+            model: itemMenu.entries
+            delegate: MenuItem {
+                text: modelData.label
+                onTriggered: itemMenu.run(modelData)
             }
+            onObjectAdded: (index, object) => itemMenu.insertItem(index, object)
+            onObjectRemoved: (index, object) => itemMenu.removeItem(object)
         }
-        MenuItem {
-            text: qsTr("Use the whole track again")
-            // Trimming never discards samples, so this always restores the
-            // full measured span. Disabled when there is nothing to restore.
-            enabled: {
-                const spans = app.trackSpans()
-                return trackMenu.targetIndex >= 0 && trackMenu.targetIndex < spans.length
-                       && spans[trackMenu.targetIndex].trimmed
-            }
-            onTriggered: if (trackMenu.targetIndex >= 0) app.resetTrackTrim(trackMenu.targetIndex)
+
+        function run(e) {
+            if (e.act === "kfEdit") kfEditDialog.openFor(e.idx)
+            else if (e.act === "kfDel") app.keyframes.removeKeyframe(e.idx)
+            else if (e.act === "kfGo") app.currentTime = e.time
+            else if (e.act === "trkGo") app.currentTime = e.time
+            else if (e.act === "trkReset") app.resetTrackTrim(e.idx)
+            else if (e.act === "trkDel") app.removeTrack(e.idx)
         }
     }
 
-    Menu {
-        id: kfContextMenu
-        property int targetIndex: -1
-
-        MenuItem {
-            text: qsTr("Delete Keyframe")
-            onClicked: app.keyframes.removeKeyframe(kfContextMenu.targetIndex)
+    // Everything whose marker is within a fingertip of `px`, as menu entries.
+    function itemsNear(px) {
+        const usable = Math.max(markerRow.width - 8, 1)
+        const t = px / usable * app.duration
+        const slop = 14 / usable * app.duration       // ~a fingertip, in seconds
+        let e = []
+        for (let i = 0; i < app.keyframes.count; ++i) {
+            const kt = app.keyframes.data(app.keyframes.index(i, 0), 0x0101)  // TimeRole
+            if (Math.abs(kt - t) > slop) continue
+            e.push({ label: qsTr("Keyframe %1 (%2 s) — edit…").arg(i + 1).arg(kt.toFixed(1)),
+                     act: "kfEdit", idx: i, time: kt })
+            e.push({ label: qsTr("Keyframe %1 — delete").arg(i + 1), act: "kfDel", idx: i, time: kt })
         }
+        const spans = app.trackSpans()
+        for (let i = 0; i < spans.length; ++i) {
+            const s = spans[i]
+            // The whole bar counts, not just its ends: a keyframe usually sits
+            // where a track stops, which is exactly where both are wanted.
+            if (t < s.start - slop || t > s.end + slop) continue
+            e.push({ label: qsTr("Track %1 (%2–%3 s) — go to start")
+                          .arg(i + 1).arg(s.start.toFixed(1)).arg(s.end.toFixed(1)),
+                     act: "trkGo", idx: i, time: s.start })
+            if (s.trimmed)
+                e.push({ label: qsTr("Track %1 — use the whole track again").arg(i + 1),
+                         act: "trkReset", idx: i, time: s.start })
+            e.push({ label: qsTr("Track %1 — delete").arg(i + 1), act: "trkDel", idx: i,
+                     time: s.start })
+        }
+        return e
+    }
+
+    function openItemMenu(px) {
+        const e = itemsNear(px)
+        if (e.length === 0)
+            return
+        itemMenu.entries = e
+        itemMenu.popup()
     }
 
     // Hidden dialog for editing keyframe

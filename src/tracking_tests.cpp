@@ -2757,6 +2757,10 @@ inline bool render(QVector<uchar> &buf, const QVector3D &worldDir, double radius
 
 } // namespace synth
 
+// How many frames the tracker may keep accepting after the subject has gone
+// before it must give up: the soft-floor run length, plus a frame of slack.
+static const int kBadRunAllowance = 9;
+
 static void testTileTrackerGroundTruth()
 {
     const TrackLenses lenses = synthLenses();
@@ -2818,6 +2822,129 @@ static void testTileTrackerGroundTruth()
                .arg(worstDeg, 0, 'f', 3).arg(msPerFrame, 0, 'f', 2)
                .arg(lost ? QStringLiteral(", LOST: ") + lossWhy : QString())
                .arg(seeded ? QString() : QStringLiteral(", seed failed: ") + err));
+}
+
+// A subject sweeping across the sky at bullet-time speed. Swinging the camera
+// around a child's head puts their bearing through a full circle per orbit --
+// 250-350 deg/s, measured off hand-placed keyframes on YIVR_0845 -- and the
+// speed ceiling used to be 150, which is applied to the whole step and so
+// capped the trackable speed near 60 deg/s. Every frame was rejected and the
+// tracker settled on whatever background it could still match.
+static void testTileTrackerFastSubject()
+{
+    const TrackLenses lenses = synthLenses();
+    const double radius = proj::degToRad(7.0);
+    const double rateDegPerSec = 250.0;
+    // The subject moves; the camera only shakes. That is the harder half of a
+    // bullet-time shot and the half the ceiling was blocking.
+    auto subjectAt = [&](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(rateDegPerSec * t))
+                   .rotatedVector(QVector3D(0.30f, 0.10f, -0.95f).normalized());
+    };
+    auto camAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(1, 0, 0,
+                   (float)(1.5 * std::sin(2 * M_PI * 10.0 * t)));
+    };
+
+    auto run = [&](double ceilingDeg, double *worstOut, int *trackedOut, QString *lossOut) {
+        QVector<uchar> buf(synth::kW * synth::kH);
+        TileTracker tracker;
+        TileTracker::Config cfg;
+        cfg.lenses = lenses;
+        cfg.seedRadiusRad = radius;
+        cfg.maxWorldSpeedDeg = ceilingDeg;
+        bool seeded = false;
+        double worst = 0.0;
+        int tracked = 0;
+        QString err;
+        for (int i = 0; i < 40; ++i) {
+            const double t = i / 30.0;
+            const QQuaternion q = camAt(t);
+            const QVector3D truth = subjectAt(t);
+            if (!synth::render(buf, truth, radius, q, lenses)) continue;
+            if (!seeded) {
+                cfg.seedDirCam = q.conjugated().rotatedVector(truth);
+                seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                       synth::kW, q, t, &err);
+                if (!seeded) { *lossOut = QStringLiteral("seed failed: ") + err; return; }
+                continue;
+            }
+            const TileTracker::Step st = tracker.step(buf.constData(), synth::kW, synth::kH,
+                                                      synth::kW, q, t);
+            if (st == TileTracker::Step::Lost) { *lossOut = tracker.lossReason(); break; }
+            if (st != TileTracker::Step::Ok) continue;
+            const double dot = qBound(-1.0f, QVector3D::dotProduct(
+                tracker.worldDir().normalized(), truth), 1.0f);
+            worst = qMax(worst, std::acos(dot) * 180.0 / M_PI);
+            ++tracked;
+        }
+        *worstOut = worst;
+        *trackedOut = tracked;
+    };
+
+    double worstNow = 0.0, worstOld = 0.0;
+    int trackedNow = 0, trackedOld = 0;
+    QString lossNow, lossOld;
+    run(400.0, &worstNow, &trackedNow, &lossNow);
+    run(150.0, &worstOld, &trackedOld, &lossOld);   // what shipped before
+
+    report("A subject sweeping at bullet-time speed is followed",
+           trackedNow > 25 && lossNow.isEmpty() && worstNow < 2.0,
+           QStringLiteral("ceiling 400: %1 frames, worst %2 deg%3  |  ceiling 150: "
+                          "%4 frames%5")
+               .arg(trackedNow).arg(worstNow, 0, 'f', 2)
+               .arg(lossNow.isEmpty() ? QString() : QStringLiteral(", LOST: ") + lossNow)
+               .arg(trackedOld)
+               .arg(lossOld.isEmpty() ? QString() : QStringLiteral(", lost: ") + lossOld));
+}
+
+// When the subject goes, the track must go. A tracker sitting on blank sky
+// reports a rock-solid match -- featureless correlates with featureless at
+// 0.9+ -- and once the running template has blended into that sky it will
+// happily follow it for the rest of the clip at a score that looks like a
+// perfect lock. On YIVR_0845 that produced a confident track a full 115 deg
+// away from where the subject actually was.
+static void testTileTrackerStopsOnEmptySky()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth = QVector3D(0.30f, 0.10f, -0.95f).normalized();
+    const double radius = proj::degToRad(7.0);
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = radius;
+    cfg.seedDirCam = truth;          // camera is identity, so cam dir == world dir
+    QString err;
+
+    synth::render(buf, truth, radius, QQuaternion(), lenses);
+    const bool seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                      synth::kW, QQuaternion(), 0.0, &err);
+
+    // Ten good frames, then the subject is simply not there any more.
+    int okBefore = 0, okAfterGone = 0;
+    bool lost = false;
+    QString why;
+    for (int i = 1; i < 60 && seeded; ++i) {
+        const double t = i / 30.0;
+        if (i < 10)
+            synth::render(buf, truth, radius, QQuaternion(), lenses);
+        else
+            buf.fill(118);                        // blank sky, nothing to lock onto
+        const TileTracker::Step st = tracker.step(buf.constData(), synth::kW, synth::kH,
+                                                  synth::kW, QQuaternion(), t);
+        if (st == TileTracker::Step::Lost) { lost = true; why = tracker.lossReason(); break; }
+        if (st == TileTracker::Step::Ok) { if (i < 10) ++okBefore; else ++okAfterGone; }
+    }
+
+    report("A track ends when the subject goes, instead of locking onto sky",
+           seeded && okBefore > 5 && lost && okAfterGone <= kBadRunAllowance,
+           QStringLiteral("%1 frames tracked while present, %2 accepted after it went, "
+                          "%3").arg(okBefore).arg(okAfterGone)
+               .arg(!seeded ? QStringLiteral("SEED FAILED: ") + err
+                            : lost ? QStringLiteral("ended: ") + why
+                                   : QStringLiteral("NEVER ENDED")));
 }
 
 // The guard that stops a doomed track before it starts: a patch with nothing
@@ -3006,7 +3133,8 @@ static double g_trackAt = 1.0;
 static double g_trackSecs = 8.0;
 static double g_trackNdcX = 0.0, g_trackNdcY = 0.0;
 static double g_trackSize = 0.15;
-static double g_trackGate = 150.0;
+static QString g_trackTruth;   // sidecar whose manual keyframes are the truth
+static double g_trackGate = 400.0;
 static bool g_trackNoImu = false;   // --track-noimu: is the chain doing anything?
 // --track-conv=N: which camera->world map to use. The conventions in this
 // codebase are subtle (the chain stores A*F, visual bearings live in the
@@ -3329,6 +3457,67 @@ static void trackRealClip(const QString &video)
     qInfo().noquote() << QStringLiteral("  world motion of the subject: median %1 deg/s, "
                                         "p95 %2 deg/s")
         .arg(medStep, 0, 'f', 1).arg(p95Step, 0, 'f', 1);
+    // Against hand-keyed ground truth, when there is any. Mean score cannot
+    // tell "following the subject" from "sitting on background with a
+    // confident-looking match" -- this can, and it is the question the user
+    // actually asks when they say a track is nowhere near.
+    if (!g_trackTruth.isEmpty()) {
+        QVector<Keyframe> manual;
+        QFile tf(g_trackTruth);
+        if (tf.open(QIODevice::ReadOnly)) {
+            const QJsonArray arr = QJsonDocument::fromJson(tf.readAll())
+                                       .object().value("keyframes").toArray();
+            for (const QJsonValue &v : arr) {
+                const QJsonObject o = v.toObject();
+                Keyframe k;
+                k.time = o.value("time").toDouble();
+                k.yaw = o.value("yaw").toDouble();
+                k.pitch = o.value("pitch").toDouble();
+                k.roll = o.value("roll").toDouble();
+                k.fov = o.value("fov").toDouble(90.0);
+                manual.append(k);
+            }
+        }
+        auto dirOf = [](double yawDeg, double pitchDeg) {
+            const double y = proj::degToRad(yawDeg), p = proj::degToRad(pitchDeg);
+            return QVector3D((float)(std::cos(p) * std::sin(y)), (float)std::sin(p),
+                             (float)(std::cos(p) * std::cos(y)));
+        };
+        // Sampled AT the hand-placed keyframes, interpolating the track to meet
+        // them -- never the other way round. The track is dense; the hand
+        // keyframes are 0.4-0.7 s apart across a sweep of 100 deg each, so
+        // interpolating THEM invents a straight line through a curve and
+        // reports tens of degrees of error against a track that is in fact
+        // sitting on the subject. (It did exactly that here.)
+        QVector<double> errs;
+        if (manual.size() >= 2 && kfs.size() >= 2) {
+            const double lo = kfs.first().time, hi = kfs.constLast().time;
+            for (const Keyframe &m : manual) {
+                if (m.time < lo || m.time > hi) continue;
+                double ky, kp, kr, kf;
+                KeyframeModel::interpolate(kfs, m.time, ky, kp, kr, kf);
+                const double dot = qBound(-1.0f, QVector3D::dotProduct(
+                    dirOf(ky, kp), dirOf(m.yaw, m.pitch)), 1.0f);
+                errs.append(std::acos(dot) * 180.0 / M_PI);
+                qInfo().noquote() << QStringLiteral(
+                    "    t=%1  track %2/%3  hand %4/%5  err %6 deg")
+                    .arg(m.time, 6, 'f', 2).arg(ky, 8, 'f', 1).arg(kp, 6, 'f', 1)
+                    .arg(m.yaw, 8, 'f', 1).arg(m.pitch, 6, 'f', 1)
+                    .arg(errs.constLast(), 6, 'f', 1);
+            }
+        }
+        std::sort(errs.begin(), errs.end());
+        if (errs.isEmpty()) {
+            qInfo().noquote() << QStringLiteral("  vs hand-keyed truth: no overlapping times");
+        } else {
+            qInfo().noquote() << QStringLiteral("  vs %1 hand-placed keyframes in range: "
+                                                "median %2 deg, p90 %3 deg, worst %4 deg")
+                .arg(errs.size()).arg(errs[errs.size() / 2], 0, 'f', 1)
+                .arg(errs[qMin(errs.size() - 1, (int)(errs.size() * 0.9))], 0, 'f', 1)
+                .arg(errs.constLast(), 0, 'f', 1);
+        }
+    }
+
     if (result.lost)
         qInfo().noquote() << QStringLiteral("  lost at %1 s: %2")
             .arg(result.lossTime, 0, 'f', 2).arg(result.lossReason);
@@ -3659,6 +3848,7 @@ int main(int argc, char *argv[])
         if (QString(argv[i]).startsWith("--track-at=")) { g_trackAt = QString(argv[i]).mid(11).toDouble(); continue; }
         if (QString(argv[i]).startsWith("--track-secs=")) { g_trackSecs = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]).startsWith("--track-size=")) { g_trackSize = QString(argv[i]).mid(13).toDouble(); continue; }
+        if (QString(argv[i]).startsWith("--track-truth=")) { g_trackTruth = QString(argv[i]).mid(14); continue; }
         if (QString(argv[i]).startsWith("--track-gate=")) { g_trackGate = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]) == "--track-noimu") { g_trackNoImu = true; continue; }
         if (QString(argv[i]) == "--track-dumpframe") { g_trackDumpFrame = true; continue; }
@@ -3834,7 +4024,9 @@ int main(int argc, char *argv[])
         qInfo() << "--- Test 0e: object-track resolver ---";
         testTrackResolve();
         testTrackFovFollow();
-        testTrackCompose();
+        testTileTrackerFastSubject();
+    testTileTrackerStopsOnEmptySky();
+    testTrackCompose();
         testTrackTrim();
         testTrackJson();
 
