@@ -1379,6 +1379,19 @@ QVariantList App::trackMarkerNdc(double aspect) const
     return out;
 }
 
+QVariantList App::trackSpans() const
+{
+    QVariantList out;
+    for (const Track &tr : m_tracks) {
+        QVariantMap m;
+        m.insert(QStringLiteral("start"), tr.t0);
+        m.insert(QStringLiteral("end"), tr.endTime());
+        m.insert(QStringLiteral("lost"), tr.lost);
+        out.append(m);
+    }
+    return out;
+}
+
 QVariantList App::trackSpan(int index) const
 {
     QVariantList out;

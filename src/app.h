@@ -358,6 +358,10 @@ public:
     Q_INVOKABLE void clearTracks();
     // Time span of a track, for the timeline: [start, end] or an empty list.
     Q_INVOKABLE QVariantList trackSpan(int index) const;
+    // Every track as {start, end, lost}, for the timeline to draw. A list of
+    // maps rather than a model: the timeline redraws them wholesale whenever
+    // tracksChanged fires, and there is nothing to select or edit in place.
+    Q_INVOKABLE QVariantList trackSpans() const;
     // Where the tracked subject is on screen right now, as {ndcX, ndcY};
     // empty when no track covers this time. Without this there is no way to
     // see that a track is holding rather than quietly drifting.

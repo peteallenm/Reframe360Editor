@@ -244,6 +244,82 @@ Pane {
             }
 
             // Keyframe markers
+            // Tracks, drawn under the keyframe dots and deliberately unlike
+            // them: a bar spanning what the track covers, with a bracket at
+            // each end. Keyframes are things you placed; a track is a stretch
+            // of time something else is driving, and the two should never be
+            // mistaken for each other.
+            Repeater {
+                id: trackBars
+                model: trackSpanList
+
+                Item {
+                    required property var modelData
+                    required property int index
+                    readonly property real x0: (parent.width - 8)
+                                               * (modelData.start / Math.max(app.duration, 0.001))
+                    readonly property real x1: (parent.width - 8)
+                                               * (modelData.end / Math.max(app.duration, 0.001))
+                    x: x0
+                    y: parent.height - 22
+                    width: Math.max(x1 - x0, 2) + 8
+                    height: 10
+
+                    // The span itself.
+                    Rectangle {
+                        x: 4
+                        y: 3
+                        width: Math.max(parent.width - 8, 2)
+                        height: 4
+                        radius: 2
+                        color: "#f0a030"
+                        opacity: 0.75
+                    }
+                    // Start bracket.
+                    Rectangle {
+                        x: 2; y: 0; width: 3; height: 10; radius: 1
+                        color: "#f0a030"
+                    }
+                    // End bracket: red when the tracker lost the subject there,
+                    // so a track that ran out is visibly different from one
+                    // that gave up.
+                    Rectangle {
+                        x: parent.width - 5; y: 0; width: 3; height: 10; radius: 1
+                        color: modelData.lost ? "#e05050" : "#f0a030"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        cursorShape: Qt.PointingHandCursor
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        onClicked: (mouse) => {
+                            if (mouse.button === Qt.RightButton) {
+                                trackMenu.targetIndex = index
+                                trackMenu.popup()
+                            } else {
+                                app.currentTime = modelData.start
+                            }
+                        }
+                        // Touch has no right button (same reason as the
+                        // keyframe markers).
+                        onPressAndHold: {
+                            trackMenu.targetIndex = index
+                            trackMenu.popup()
+                        }
+                        ToolTip.text: modelData.lost
+                            ? qsTr("Track %1: %2 s to %3 s, then lost the subject")
+                                  .arg(index + 1).arg(modelData.start.toFixed(1))
+                                  .arg(modelData.end.toFixed(1))
+                            : qsTr("Track %1: %2 s to %3 s")
+                                  .arg(index + 1).arg(modelData.start.toFixed(1))
+                                  .arg(modelData.end.toFixed(1))
+                        ToolTip.visible: containsMouse
+                        hoverEnabled: true
+                    }
+                }
+            }
+
             Repeater {
                 model: app.keyframes
                 Rectangle {
@@ -311,6 +387,32 @@ Pane {
     }
 
     // Context menu for keyframe markers (right-click)
+    // Refreshed wholesale on tracksChanged: a track is added or removed as a
+    // unit, never edited in place.
+    property var trackSpanList: []
+    Connections {
+        target: app
+        function onTracksChanged() { trackSpanList = app.trackSpans() }
+    }
+    Component.onCompleted: trackSpanList = app.trackSpans()
+
+    Menu {
+        id: trackMenu
+        property int targetIndex: -1
+        MenuItem {
+            text: qsTr("Delete this track")
+            onTriggered: if (trackMenu.targetIndex >= 0) app.removeTrack(trackMenu.targetIndex)
+        }
+        MenuItem {
+            text: qsTr("Go to start")
+            onTriggered: {
+                const spans = app.trackSpans()
+                if (trackMenu.targetIndex >= 0 && trackMenu.targetIndex < spans.length)
+                    app.currentTime = spans[trackMenu.targetIndex].start
+            }
+        }
+    }
+
     Menu {
         id: kfContextMenu
         property int targetIndex: -1
