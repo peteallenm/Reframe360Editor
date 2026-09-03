@@ -24,6 +24,20 @@ Pane {
     // desktop here builds against distro Qt 6.4: an unresolved attached
     // property makes the arithmetic NaN, which collapsed the whole footer.
     // The conditional short-circuits before SafeArea is ever looked up.
+    // Four things share this strip -- the export trim handles, the scrub
+    // slider, the track bars and the keyframe dots -- and a fingertip is wider
+    // than any of them. Rather than make the strip taller, each gets its own
+    // horizontal band of TOUCH area while the drawing stays exactly where it
+    // was: the bands are what the finger hits, the visuals are what the eye
+    // sees. Bands are declared here so they cannot drift apart and start
+    // overlapping again.
+    //
+    // The trim handles were the worst of them: 7x12 px with no padding at all,
+    // sitting on top of a slider that will happily take the press instead.
+    readonly property real grabPad: Qt.platform.os === "android" ? 12 : 7
+    readonly property real bandTrimBottom: 18   // trim handles own everything above
+    readonly property real bandTrackBottom: 30  // ... then track bars and their grips
+                                                // ... then keyframe dots, to the bottom
     readonly property real safeLeft: Qt.platform.os === "android" ? SafeArea.margins.left : 0
     readonly property real safeRight: Qt.platform.os === "android" ? SafeArea.margins.right : 0
     readonly property real safeBottom: Qt.platform.os === "android" ? SafeArea.margins.bottom : 0
@@ -204,7 +218,16 @@ Pane {
                     }
                     MouseArea {
                         id: dragIn
+                        // Up to the top of the strip and down to the trim
+                        // band's edge, and well past the handle sideways. The
+                        // slider underneath keeps everything this does not
+                        // claim, which is the whole timeline bar a fingertip's
+                        // width around each handle.
                         anchors.fill: parent
+                        anchors.topMargin: -8
+                        anchors.bottomMargin: -(timeline.bandTrimBottom - 14)
+                        anchors.leftMargin: -timeline.grabPad
+                        anchors.rightMargin: -timeline.grabPad
                         drag.target: parent
                         drag.axis: Drag.XAxis
                         drag.minimumX: -3
@@ -234,7 +257,16 @@ Pane {
                     }
                     MouseArea {
                         id: dragOut
+                        // Up to the top of the strip and down to the trim
+                        // band's edge, and well past the handle sideways. The
+                        // slider underneath keeps everything this does not
+                        // claim, which is the whole timeline bar a fingertip's
+                        // width around each handle.
                         anchors.fill: parent
+                        anchors.topMargin: -8
+                        anchors.bottomMargin: -(timeline.bandTrimBottom - 14)
+                        anchors.leftMargin: -timeline.grabPad
+                        anchors.rightMargin: -timeline.grabPad
                         drag.target: parent
                         drag.axis: Drag.XAxis
                         drag.minimumX: -3
@@ -315,7 +347,10 @@ Pane {
 
                     MouseArea {
                         anchors.fill: parent
-                        anchors.margins: -6
+                        anchors.topMargin: -(trackBar.y - timeline.bandTrimBottom)
+                        anchors.bottomMargin: -(timeline.bandTrackBottom - (trackBar.y + trackBar.height))
+                        anchors.leftMargin: -6
+                        anchors.rightMargin: -6
                         cursorShape: Qt.PointingHandCursor
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: (mouse) => {
@@ -361,9 +396,15 @@ Pane {
                         MouseArea {
                             id: startDrag
                             anchors.fill: parent
-                            // A 17 px target for a 3 px bracket: this gets
-                            // dragged with a fingertip on the phone.
-                            anchors.margins: -7
+                            // A 3 px bracket needs a fingertip's worth of
+                            // target. Bounded to the track band: a keyframe
+                            // very often sits exactly where a track ends, and
+                            // the dot -- drawn later, so on top -- used to take
+                            // the press and nothing would drag.
+                            anchors.topMargin: -(trackBar.y - timeline.bandTrimBottom)
+                            anchors.bottomMargin: -(timeline.bandTrackBottom - (trackBar.y + trackBar.height))
+                            anchors.leftMargin: -timeline.grabPad
+                            anchors.rightMargin: -timeline.grabPad
                             drag.target: parent
                             drag.axis: Drag.XAxis
                             drag.minimumX: 2
@@ -400,7 +441,10 @@ Pane {
                         MouseArea {
                             id: endDrag
                             anchors.fill: parent
-                            anchors.margins: -7
+                            anchors.topMargin: -(trackBar.y - timeline.bandTrimBottom)
+                            anchors.bottomMargin: -(timeline.bandTrackBottom - (trackBar.y + trackBar.height))
+                            anchors.leftMargin: -timeline.grabPad
+                            anchors.rightMargin: -timeline.grabPad
                             drag.target: parent
                             drag.axis: Drag.XAxis
                             drag.minimumX: Math.min(trackBar.width - 5,
@@ -432,10 +476,16 @@ Pane {
                     border.width: 1
 
                     MouseArea {
-                        // An 8 px marker is an impossible touch target; the
-                        // hit area extends well past the dot.
+                        // An 8 px marker is an impossible touch target, so the
+                        // hit area extends well past the dot -- but downwards
+                        // and sideways only. Reaching up as well is what let a
+                        // dot swallow the press meant for a track end sitting
+                        // at the same time.
                         anchors.fill: parent
-                        anchors.margins: -8
+                        anchors.topMargin: 0
+                        anchors.bottomMargin: -timeline.grabPad
+                        anchors.leftMargin: -timeline.grabPad
+                        anchors.rightMargin: -timeline.grabPad
                         cursorShape: Qt.PointingHandCursor
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: (mouse) => {
