@@ -115,6 +115,9 @@ struct TrackRequest {
 
     double t0 = 0.0;              // arm time
     double tEnd = 0.0;            // stop here (next keyframe / trim-out / end)
+    // What tEnd actually is, in words, so a pass that stops early can say why
+    // rather than leaving the user looking for a marker they cannot see.
+    QString endLabel;
     // One or more bearings on the SAME subject, camera frame at t0 -- e.g. a
     // head and a shirt. Each is followed independently and the best-matching
     // one drives the view, so a patch that fails does not end the track; a
@@ -144,6 +147,9 @@ struct TrackResult {
     bool lost = false;
     double lossTime = -1.0;
     QString lossReason;
+    // Why the pass finished when it was NOT a loss -- the keyframe, track,
+    // out-point or clip end that bounded it, in words.
+    QString endReason;
     // Diagnostics, printed by --track-stats and useful when a track goes wrong.
     double meanScore = 0.0;
     double msPerFrame = 0.0;

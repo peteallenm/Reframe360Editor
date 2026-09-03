@@ -3414,6 +3414,11 @@ static void trackRealClip(const QString &video)
         req.seedRadiusRad = 0.02;
     }
 
+    // What bounded the pass, carried back so the app can say so rather than
+    // reporting a bare "reached the end time" and leaving the user hunting the
+    // timeline for a marker they cannot see.
+    req.endLabel = QStringLiteral("the test's end time");
+
     ObjectTracker tracker;
     TrackResult result;
     bool failed = false;
@@ -3435,6 +3440,11 @@ static void trackRealClip(const QString &video)
         report("Track on real footage", false, failure);
         return;
     }
+
+    report("A pass that runs to its bound says what the bound was",
+           result.lost || result.endReason == req.endLabel,
+           result.lost ? QStringLiteral("(lost instead: %1)").arg(result.lossReason)
+                       : QStringLiteral("reported \"%1\"").arg(result.endReason));
 
     // Regression: every sample must carry the time it was taken at. They were
     // all left at 0 once the tracker went multi-patch, which made a track's

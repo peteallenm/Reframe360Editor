@@ -358,10 +358,19 @@ App::App(QObject *parent)
                 m_tracks.append(finished);
                 syncTracksToSidecar();          // emits tracksChanged -> saves
                 invalidateTrackCache();
-                m_trackStatus = result.lost
-                    ? tr("Tracked to %1 s, then lost it (%2)")
-                          .arg(result.lossTime, 0, 'f', 1).arg(result.lossReason)
-                    : tr("Tracked %1 s").arg(finished.endTime() - finished.t0, 0, 'f', 1);
+                const double span = finished.endTime() - finished.t0;
+                if (result.lost) {
+                    m_trackStatus = tr("Tracked to %1 s, then lost it (%2)")
+                                        .arg(result.lossTime, 0, 'f', 1).arg(result.lossReason);
+                } else if (!result.endReason.isEmpty()) {
+                    // Say what stopped it. A pass that ends at a keyframe a
+                    // fraction of a second ahead is indistinguishable from one
+                    // that failed, unless it names the thing it ran into.
+                    m_trackStatus = tr("Tracked %1 s — stopped at %2")
+                                        .arg(span, 0, 'f', 1).arg(result.endReason);
+                } else {
+                    m_trackStatus = tr("Tracked %1 s").arg(span, 0, 'f', 1);
+                }
                 emit trackStatusChanged();
                 emit tracksChanged();
             }, Qt::QueuedConnection);
@@ -1346,16 +1355,41 @@ void App::beginTracking()
     // 29.97 is close enough; the tracker consumes whatever frames it decodes.
     req.fps = 30.0;
 
-    // Stop at the first manual keyframe after this point, else the trim-out,
-    // else the end of the clip.
-    double tEnd = m_keyframes->trimOut() > 0.0 ? m_keyframes->trimOut() : duration();
+    // Stop at the first manual keyframe after this point, else the next track,
+    // else the trim-out, else the end of the clip. Whichever wins is NAMED:
+    // "reached the end time" told you a pass had stopped without telling you
+    // what stopped it, and a keyframe a fraction of a second ahead looks like
+    // nothing at all on a timeline of a whole clip.
+    double tEnd = duration();
+    QString endLabel = tr("the end of the clip");
+    if (m_keyframes->trimOut() > 0.0 && m_keyframes->trimOut() < tEnd) {
+        tEnd = m_keyframes->trimOut();
+        endLabel = tr("the export out-point at %1 s").arg(tEnd, 0, 'f', 2);
+    }
     for (const Keyframe &k : m_keyframes->keyframes())
-        if (k.time > req.t0 + 1e-6) { tEnd = qMin(tEnd, k.time); break; }
+        if (k.time > req.t0 + 1e-6) {
+            if (k.time < tEnd) {
+                tEnd = k.time;
+                endLabel = tr("your keyframe at %1 s").arg(tEnd, 0, 'f', 2);
+            }
+            break;
+        }
     for (const Track &t : m_tracks)
-        if (t.t0 > req.t0 + 1e-6) tEnd = qMin(tEnd, t.t0);
+        // activeStart, not t0: a track trimmed at the start no longer governs
+        // the view from where it was armed, and must not bound this one there.
+        if (t.activeStart() > req.t0 + 1e-6 && t.activeStart() < tEnd) {
+            tEnd = t.activeStart();
+            endLabel = tr("the next track at %1 s").arg(tEnd, 0, 'f', 2);
+        }
     req.tEnd = tEnd;
-    if (req.tEnd <= req.t0 + 0.05) {
-        m_trackStatus = tr("No room to track before the next keyframe");
+    req.endLabel = endLabel;
+    // Below about this there is nothing to follow -- and the reason is named,
+    // because "no room" on its own sends you hunting for something you cannot
+    // see. Raised from 0.05 s: a tenth of a second is four frames, which is a
+    // pass that looks like it did nothing.
+    if (req.tEnd <= req.t0 + kMinTrackSpan) {
+        m_trackStatus = tr("No room to track here — %1 is only %2 s away")
+                            .arg(endLabel).arg(req.tEnd - req.t0, 0, 'f', 2);
         emit trackStatusChanged();
         return;
     }

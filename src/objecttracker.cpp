@@ -873,8 +873,19 @@ void ObjectTracker::run(TrackRequest req)
         stage.start();
         const bool haveFrame = reader.next(minTime, &t);
         msDecode += stage.elapsed();
-        if (!haveFrame) { endReason = QStringLiteral("end of stream"); break; }
-        if (t > req.tEnd + 1e-6) { reader.release(); endReason = QStringLiteral("reached the end time"); break; }
+        if (!haveFrame) {
+            endReason = QStringLiteral("end of stream");
+            result.endReason = QObject::tr("the end of the video");
+            break;
+        }
+        if (t > req.tEnd + 1e-6) {
+            reader.release();
+            endReason = req.endLabel.isEmpty()
+                ? QStringLiteral("reached the end time")
+                : QStringLiteral("reached %1").arg(req.endLabel);
+            result.endReason = req.endLabel;      // the label alone, for the UI
+            break;
+        }
 
         const QQuaternion qAct = orientationAt(req, t);
 
