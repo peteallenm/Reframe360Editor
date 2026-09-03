@@ -3270,6 +3270,100 @@ static void testDespikeAndSmoothing()
                .arg(smoothRest, 0, 'f', 2).arg(rateDegPerSec, 0, 'f', 0));
 }
 
+// A subject that climbs high in the frame. Reported as "pitch going from -90 to
+// +90 as if it wraps... so it is pointing at the sky lots".
+//
+// Pitch does not wrap, and the resolver never claimed it did -- but its two
+// branches are raw angles that can land anywhere in +-2 pi, and it picked
+// between them on nearness alone, converted to degrees WITHOUT wrapping, and
+// clamped whatever came out to +-89.5. A branch at 200 deg is the upside-down
+// solution, valid only with a roll flip that a track never applies; clamped, it
+// aims at the zenith. Worse, the clamped value seeded the next frame's choice,
+// so once it went it stayed, flipping between the limits.
+//
+// Run twice. Up to about 73 deg of elevation the framing is reachable and must
+// be hit exactly; past that it genuinely is not -- an off-centre framing point
+// cannot be placed on a subject that high without rolling -- and the only thing
+// asked of the resolver is that it saturate quietly instead of flipping.
+static void testPitchDoesNotFlipWhenTheSubjectGoesHigh()
+{
+    const TrackLenses lenses = synthLenses();
+    auto imuAt = [](double) { return QQuaternion(); };
+
+    auto run = [&](double elevFrom, double elevTo, double *worstFrame, double *worstJump,
+                   int *atClamp, int *nkf) {
+        const int n = 80;
+        // Off-centre framing, so the framing ray is not the view axis and the
+        // two branches are genuinely distinct. Centred, the bug hides.
+        Track tr;
+        tr.t0 = 0.0; tr.yaw0 = 0.0; tr.pitch0 = elevFrom; tr.roll0 = 0.0; tr.fov0 = 80.0;
+        tr.framingNdcX = 0.35; tr.framingNdcY = -0.20;
+        tr.framingAspect = 16.0 / 9.0;
+        tr.framingProjection = 0;
+        tr.fovFollow = false;
+        tr.posSmoothSec = 0.0;
+        tr.sizeRad0 = proj::degToRad(4.0);
+
+        const auto &lp = lenses.front;
+        const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1,
+                                                        lp.k2, lp.rotation, lp.hflip);
+        QVector<QVector3D> truth;
+        for (int i = 0; i < n; ++i) {
+            const double el = proj::degToRad(elevFrom + (elevTo - elevFrom) * i / (n - 1.0));
+            const QVector3D dn = QVector3D((float)(0.25 * std::cos(el)), (float)std::sin(el),
+                                           (float)(-std::cos(el) * 0.968)).normalized();
+            double th, ph, u, v;
+            proj::dirToThetaPhi(proj::Vec3{dn.x(), dn.y(), dn.z()}, th, ph);
+            if (th > M_PI * 0.5) continue;
+            proj::lensUv(true, th, ph, geom, u, v);
+            if (u < 0.02 || u > 0.98 || v < 0.02 || v > 0.98) continue;
+            TrackSample smp;
+            smp.t = truth.size() / 30.0;
+            smp.u = u; smp.v = v; smp.lens = 0; smp.conf = 1.0;
+            smp.halfW = smp.halfH = proj::degToRad(2.0);
+            tr.samples.append(smp);
+            truth.append(dn);
+        }
+
+        const QVector<Keyframe> kfs = track::resolve(tr, lenses, imuAt, tr.endTime());
+        *worstFrame = 0.0; *worstJump = 0.0; *atClamp = 0; *nkf = kfs.size();
+        for (int i = 0; i < kfs.size(); ++i) {
+            const Keyframe &k = kfs[i];
+            if (std::fabs(k.pitch) > 89.0) ++(*atClamp);
+            if (i > 0) *worstJump = qMax(*worstJump, std::fabs(k.pitch - kfs[i - 1].pitch));
+            int nearest = 0;
+            for (int j = 1; j < tr.samples.size(); ++j)
+                if (std::fabs(tr.samples[j].t - k.time)
+                        < std::fabs(tr.samples[nearest].t - k.time))
+                    nearest = j;
+            if (std::fabs(tr.samples[nearest].t - k.time) > 1e-6) continue;
+            const proj::ViewBasis vb = proj::ViewBasis::make(k.yaw, k.pitch, k.roll, k.fov,
+                                                             tr.framingProjection,
+                                                             tr.framingAspect);
+            const proj::Vec3 aim = proj::applyEuler(
+                proj::rayForNdc(tr.framingNdcX, tr.framingNdcY, vb), vb);
+            const QVector3D a = QVector3D((float)aim.x, (float)aim.y, (float)aim.z).normalized();
+            const QVector3D b = truth[nearest];
+            *worstFrame = qMax(*worstFrame,
+                               std::atan2((double)QVector3D::crossProduct(a, b).length(),
+                                          (double)QVector3D::dotProduct(a, b)) * 180.0 / M_PI);
+        }
+    };
+
+    double fr1 = 0, jump1 = 0, fr2 = 0, jump2 = 0;
+    int clamp1 = 0, clamp2 = 0, n1 = 0, n2 = 0;
+    run(-60.0, 60.0, &fr1, &jump1, &clamp1, &n1);      // reachable throughout
+    run(-80.0, 80.0, &fr2, &jump2, &clamp2, &n2);      // past what framing can reach
+
+    report("Pitch does not flip when the subject climbs high",
+           n1 > 10 && fr1 < 0.5 && jump1 < 45.0 && clamp1 == 0   // reachable: exact
+               && n2 > 10 && jump2 < 45.0,                       // beyond: quiet, not flipping
+           QStringLiteral("+-60 deg: framing off by up to %1 deg, pitch jumps <= %2 deg, "
+                          "%3 clamped  |  +-80 deg (past reach): jumps <= %4 deg, %5 clamped")
+               .arg(fr1, 0, 'f', 2).arg(jump1, 0, 'f', 1).arg(clamp1)
+               .arg(jump2, 0, 'f', 1).arg(clamp2));
+}
+
 static void testTileTrackerConstantSize()
 {
     const TrackLenses lenses = synthLenses();
@@ -3715,6 +3809,22 @@ static void trackRealClip(const QString &video)
         }
         qInfo().noquote() << QStringLiteral("  fov along the track at 0/25/50/75/100%%: %1")
             .arg(trend);
+        QString ptrend;
+        double pmin = 999.0, pmax = -999.0;
+        int atClamp = 0, bigJump = 0;
+        for (int i = 0; i < kfs.size(); ++i) {
+            pmin = qMin(pmin, kfs[i].pitch);
+            pmax = qMax(pmax, kfs[i].pitch);
+            if (std::fabs(kfs[i].pitch) > 89.0) ++atClamp;
+            if (i > 0 && std::fabs(kfs[i].pitch - kfs[i - 1].pitch) > 45.0) ++bigJump;
+        }
+        for (double f : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+            const int i = qBound(0, (int)(f * (kfs.size() - 1)), kfs.size() - 1);
+            ptrend += QStringLiteral("%1 ").arg(kfs[i].pitch, 0, 'f', 1);
+        }
+        qInfo().noquote() << QStringLiteral("  pitch at 0/25/50/75/100%%: %1 (range %2..%3, "
+                                            "%4 at the +-89.5 clamp, %5 jumps over 45 deg)")
+            .arg(ptrend).arg(pmin, 0, 'f', 1).arg(pmax, 0, 'f', 1).arg(atClamp).arg(bigJump);
     }
     // Flicks: a frame that jumps off the path and comes straight back. For a
     // smooth path, going via the middle sample costs nothing over going direct;
@@ -4357,6 +4467,7 @@ int main(int argc, char *argv[])
         testTrackFovFollow();
         testFovHoldsWhileTheSubjectCrossesTheLens();
     testDespikeAndSmoothing();
+    testPitchDoesNotFlipWhenTheSubjectGoesHigh();
     testTileTrackerConstantSize();
     testTileTrackerFastSubject();
     testTileTrackerStopsOnEmptySky();

@@ -350,20 +350,39 @@ QVector<Keyframe> resolve(const Track &tr, const TrackLenses &lenses,
             const double alpha = std::atan2(vf.z, vf.y);
             const double c = qBound(-1.0, (double)W.y() / rho, 1.0);
             const double base = std::acos(c);
-            // Two branches solve it; take the one nearest the previous frame
-            // so the view does not flip when the object crosses the axis.
-            const double p1 = base - alpha, p2 = -base - alpha;
-            const double prevRad = proj::degToRad(prevPitch);
-            pitch = (std::fabs(wrap180((p1 - prevRad) * 180.0 / kPi))
-                     <= std::fabs(wrap180((p2 - prevRad) * 180.0 / kPi))) ? p1 : p2;
+            // Two branches solve it. They are raw angles and can land anywhere
+            // in +-2 pi, so wrap them into (-180, 180] BEFORE comparing or
+            // clamping. Skipping that was what put the view in the sky: a
+            // branch at, say, 200 deg is the upside-down solution -- correct
+            // only with a roll flip, which a track never applies -- and
+            // clamping it to 89.5 aims at the zenith. The clamped value then
+            // seeded the next frame's choice, so it stayed there, flipping
+            // between the two limits as the nearer branch swapped over.
+            const double c1 = wrap180((base - alpha) * 180.0 / kPi);
+            const double c2 = wrap180((-base - alpha) * 180.0 / kPi);
+            const bool ok1 = std::fabs(c1) <= 90.0;
+            const bool ok2 = std::fabs(c2) <= 90.0;
+            // Prefer a branch that is a REACHABLE pitch. Nearness only decides
+            // between two that both are -- otherwise "nearest" happily picks
+            // an unreachable one and the clamp turns it into nonsense.
+            double pDeg;
+            if (ok1 != ok2)
+                pDeg = ok1 ? c1 : c2;
+            else
+                pDeg = (std::fabs(c1 - prevPitch) <= std::fabs(c2 - prevPitch)) ? c1 : c2;
 
-            const double sp = std::sin(pitch), cp = std::cos(pitch);
+            const double pRad = proj::degToRad(pDeg);
+            const double sp = std::sin(pRad), cp = std::cos(pRad);
             const double A = vf.x;
             const double B = sp * vf.y + cp * vf.z;
-            yaw = std::atan2(W.x(), W.z()) - std::atan2(A, B);
-            pitch = pitch * 180.0 / kPi;
-            yaw = yaw * 180.0 / kPi;
+            yaw = (std::atan2(W.x(), W.z()) - std::atan2(A, B)) * 180.0 / kPi;
+            pitch = pDeg;
         }
+        // Carry the SOLVED pitch to the next frame, not the clamped one: if a
+        // frame does have to be clamped, seeding the next choice with the limit
+        // rather than the answer is what let one bad frame become a run of them.
+        prevPitch = pitch;
+        prevYaw = yaw;
         // Clamp here, not at the preview call site: applyKeyframeInterpolation
         // clamps pitch but ExportSnapshot::stateAt does not, so a track aimed
         // high would otherwise render differently in preview and export.
@@ -377,8 +396,6 @@ QVector<Keyframe> resolve(const Track &tr, const TrackLenses &lenses,
         kf.roll = tr.roll0;
         kf.fov = fov[i];
         dense.append(kf);
-        prevPitch = pitch;
-        prevYaw = yaw;
     }
 
     out = decimate(dense, 0.05);
