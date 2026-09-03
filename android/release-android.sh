@@ -90,6 +90,7 @@ build_arm64() {
         echo "missing $DEPS/ffmpeg-arm64 (run android/build-x264-ffmpeg.sh)" >&2; exit 1; }
     "$QT_ANDROID/bin/qt-cmake" -S "$SRC" -B "$BUILD_ARM64" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DQT_ANDROID_DEPLOYMENT_TYPE=Release \
         -DQT_HOST_PATH="$QT_HOST" \
         -DANDROID_ABI=arm64-v8a \
         -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
@@ -110,6 +111,7 @@ configure_universal() {
         echo "missing $DEPS/ffmpeg/x86_64 (run android/build-x264-ffmpeg.sh)" >&2; exit 1; }
     "$QT_ANDROID/bin/qt-cmake" -S "$SRC" -B "$BUILD_UNIVERSAL" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DQT_ANDROID_DEPLOYMENT_TYPE=Release \
         -DQT_HOST_PATH="$QT_HOST" \
         -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
         -DQT_ANDROID_ABIS="arm64-v8a;x86_64" \
@@ -139,8 +141,25 @@ build_bundle() {
     configure_universal
     "$CMAKE" --build "$BUILD_UNIVERSAL" --target aab -j"$(nproc)"
     local aab
-    aab=$(find "$BUILD_UNIVERSAL/android-build/build/outputs/bundle" -name '*.aab' | head -1)
-    [ -n "$aab" ] || { echo "no .aab produced" >&2; exit 1; }
+    # From the RELEASE directory specifically. Gradle keeps debug and release
+    # bundles side by side under outputs/bundle/<variant>/, and a bare find
+    # would happily return whichever the filesystem listed first -- a debug
+    # bundle carries android:debuggable="true" and Play refuses it outright.
+    aab=$(find "$BUILD_UNIVERSAL/android-build/build/outputs/bundle/release" \
+               -name '*.aab' 2>/dev/null | head -1)
+    if [ -z "$aab" ]; then
+        echo "no RELEASE .aab in $BUILD_UNIVERSAL/android-build/build/outputs/bundle/release" >&2
+        find "$BUILD_UNIVERSAL/android-build/build/outputs/bundle" -name '*.aab' 2>/dev/null \
+            | sed 's/^/  found instead: /' >&2
+        exit 1
+    fi
+    # Belt and braces: whatever the build system did, refuse to ship a bundle
+    # Play will reject. This is cheap and the failure it catches is expensive --
+    # you find out after uploading, not after building.
+    if unzip -p "$aab" base/manifest/AndroidManifest.xml | grep -qa 'debuggable'; then
+        echo "REFUSING: $aab is debuggable -- Play will not accept it" >&2
+        exit 1
+    fi
     if [ ! -f "$KEYSTORE" ]; then
         # NOT actually unsigned: androiddeployqt has already signed it with the
         # Android debug key. sign-release.sh strips that before signing

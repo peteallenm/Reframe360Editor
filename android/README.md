@@ -11,7 +11,7 @@ installed on this machine); it produces a **72 MB APK**, arm64-v8a only, with
 Confirmed present in the binary: 3125 OpenCV symbols incl. ORB and BFMatcher,
 FFmpeg's `ff_h264_mediacodec_encoder`/`decoder`, and `libmediandk/libandroid/
 libEGL/libGLESv2` in DT_NEEDED. `aapt dump badging`: package
-`uk.co.overview.render360`, minSdk 28, targetSdk 36, compileSdk 36.
+`com.peteallen.reframe360editor`, minSdk 28, targetSdk 36, compileSdk 36.
 
 **Exact toolchain that works** (several of these differ from the guesses in the
 sections below, which were written before anything was installed):
@@ -424,7 +424,7 @@ RSA prompt.
 ```bash
 adb devices                       # the Edge 40 must show as "device", not "unauthorized"
 adb install -r "$(find build-android -name '*.apk' | head -1)"
-adb shell am start -n uk.co.overview.render360/org.qtproject.qt.android.bindings.QtActivity
+adb shell am start -n com.peteallen.reframe360editor/org.qtproject.qt.android.bindings.QtActivity
 ```
 
 Watch the log. Qt's messages come out under the tag `Qt`; native crashes under
@@ -455,7 +455,7 @@ which QtActivity base64-decodes and splits on tabs:
 ```bash
 # QSG_INFO=1 (tab) QSG_RHI_BACKEND=opengl
 ENVB64=$(printf 'QSG_INFO=1\tQSG_RHI_BACKEND=opengl' | base64 -w0)
-adb shell am start -n uk.co.overview.render360/org.qtproject.qt.android.bindings.QtActivity \
+adb shell am start -n com.peteallen.reframe360editor/org.qtproject.qt.android.bindings.QtActivity \
     -e extraenvvars "$ENVB64"
 ```
 

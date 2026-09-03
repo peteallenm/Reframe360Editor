@@ -10,7 +10,7 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="uk.co.overview.render360"
+    package="com.peteallen.reframe360editor"
     android:installLocation="auto"
     android:versionCode="-- %%INSERT_VERSION_CODE%% --"
     android:versionName="-- %%INSERT_VERSION_NAME%% --">
@@ -217,7 +217,7 @@
             https://wiki.qt.io/AndroidServices for the QtService bindings.
 
         <service
-            android:name="uk.co.overview.render360.ExportService"
+            android:name="com.peteallen.reframe360editor.ExportService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
             android:process=":qt">
