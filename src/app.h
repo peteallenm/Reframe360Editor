@@ -378,6 +378,15 @@ public:
     // so a handle dragged back out restores the track exactly.
     Q_INVOKABLE void setTrackTrim(int index, double tIn, double tOut);
     Q_INVOKABLE void resetTrackTrim(int index);
+    // The track's reference zoom: the fov the framing was picked at. Changing
+    // it re-frames the whole track, because the subject is held at a fraction
+    // of the frame rather than at a fixed angle -- so this is "how close do you
+    // want to be", and the track keeps the subject in the same spot either way.
+    Q_INVOKABLE void setTrackZoom(int index, double fovDeg);
+    // Whether the view chases the subject's apparent size at all. The size
+    // estimate is the least reliable part of a track; being able to switch it
+    // off is the difference between a usable track and a deleted one.
+    Q_INVOKABLE void setTrackFollowSize(int index, bool on);
     // Time span of a track, for the timeline: [start, end] or an empty list.
     Q_INVOKABLE QVariantList trackSpan(int index) const;
     // Every track as {start, end, lost}, for the timeline to draw. A list of

@@ -516,6 +516,8 @@ Pane {
             else if (e.act === "kfGo") app.currentTime = e.time
             else if (e.act === "trkGo") app.currentTime = e.time
             else if (e.act === "trkReset") app.resetTrackTrim(e.idx)
+            else if (e.act === "trkZoom") app.setTrackZoom(e.idx, app.fov)
+            else if (e.act === "trkFollow") app.setTrackFollowSize(e.idx, e.on)
             else if (e.act === "trkDel") app.removeTrack(e.idx)
         }
     }
@@ -545,6 +547,13 @@ Pane {
             if (s.trimmed)
                 e.push({ label: qsTr("Track %1 — use the whole track again").arg(i + 1),
                          act: "trkReset", idx: i, time: s.start })
+            e.push({ label: qsTr("Track %1 — zoom: use this view (%2° now, track is %3°)")
+                          .arg(i + 1).arg(Math.round(app.fov)).arg(Math.round(s.zoom)),
+                     act: "trkZoom", idx: i, time: s.start })
+            e.push({ label: s.followSize
+                        ? qsTr("Track %1 — stop following the subject's size").arg(i + 1)
+                        : qsTr("Track %1 — follow the subject's size").arg(i + 1),
+                     act: "trkFollow", idx: i, time: s.start, on: !s.followSize })
             e.push({ label: qsTr("Track %1 — delete").arg(i + 1), act: "trkDel", idx: i,
                      time: s.start })
         }

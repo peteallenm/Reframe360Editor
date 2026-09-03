@@ -230,12 +230,19 @@ QVector<Keyframe> resolve(const Track &tr, const TrackLenses &lenses,
 
         double fov = tr.fov0;
         if (tr.fovFollow && s.halfW > 0.0 && s.halfH > 0.0 && tr.sizeRad0 > 1e-4) {
-            const QVector3D br = VisualRotationComputer::pixelToBearing(s.u + s.halfW, s.v, lp);
-            const QVector3D bd = VisualRotationComputer::pixelToBearing(s.u, s.v + s.halfH, lp);
             // Geometric mean of the two half-axes, so a box that changes
             // aspect does not read as a size change.
-            const double sigma = 2.0 * std::sqrt(qMax(1e-9, angleBetween(cam, br))
-                                               * qMax(1e-9, angleBetween(cam, bd)));
+            double sigma;
+            if (tr.sizeIsAngular) {
+                sigma = 2.0 * std::sqrt(qMax(1e-9, s.halfW) * qMax(1e-9, s.halfH));
+            } else {
+                // A v1 track: the size is a uv distance, so it still has to be
+                // turned back into an angle the old way, position error and all.
+                const QVector3D br = VisualRotationComputer::pixelToBearing(s.u + s.halfW, s.v, lp);
+                const QVector3D bd = VisualRotationComputer::pixelToBearing(s.u, s.v + s.halfH, lp);
+                sigma = 2.0 * std::sqrt(qMax(1e-9, angleBetween(cam, br))
+                                      * qMax(1e-9, angleBetween(cam, bd)));
+            }
             fov = 2.0 * std::atan(std::tan(qMax(1e-5, sigma) * 0.5) / qMax(1e-9, k));
             fov = qBound(10.0, fov * 180.0 / kPi, 170.0);
         }
@@ -396,15 +403,17 @@ QByteArray packSamples(const QVector<TrackSample> &samples, double t0)
         qToLittleEndian(dt, p); p += 4;
         put16(s.u);
         put16(s.v);
-        put16(s.halfW);
-        put16(s.halfH);
+        // Angles, scaled into the 0..1 field: 1/65535 of pi is 0.003 deg, far
+        // finer than the tracker can measure.
+        put16(s.halfW / kPi);
+        put16(s.halfH / kPi);
         *p++ = (uchar)qBound(0, s.lens, 255);
         *p++ = (uchar)qBound(0, (int)qRound(s.conf * 255.0), 255);
     }
     return blob;
 }
 
-QVector<TrackSample> unpackSamples(const QByteArray &blob, double t0)
+QVector<TrackSample> unpackSamples(const QByteArray &blob, double t0, bool angularSize)
 {
     QVector<TrackSample> out;
     const int n = blob.size() / kSampleBytes;
@@ -420,6 +429,7 @@ QVector<TrackSample> unpackSamples(const QByteArray &blob, double t0)
         s.v = get16();
         s.halfW = get16();
         s.halfH = get16();
+        if (angularSize) { s.halfW *= kPi; s.halfH *= kPi; }
         s.lens = *p++;
         s.conf = *p++ / 255.0;
         out.append(s);
@@ -448,7 +458,7 @@ QJsonArray toJson(const QVector<Track> &tracks)
                 {"on", t.fovFollow}, {"smoothSec", t.fovSmoothSec},
                 {"deadband", t.fovDeadband}, {"maxRatePerSec", t.fovMaxRatePerSec},
                 {"range", t.fovRange}}},
-            {"samplesFormat", QStringLiteral("packed14v1")},
+            {"samplesFormat", QStringLiteral("packed14v2")},
             {"sampleCount", t.samples.size()},
             {"samples", QString::fromLatin1(packSamples(t.samples, t.t0).toBase64())},
         };
@@ -466,7 +476,8 @@ QVector<Track> fromJson(const QJsonArray &arr)
     QVector<Track> out;
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
-        if (o.value("samplesFormat").toString() != QStringLiteral("packed14v1"))
+        const QString fmt = o.value("samplesFormat").toString();
+        if (fmt != QStringLiteral("packed14v1") && fmt != QStringLiteral("packed14v2"))
             continue;                        // a format this build cannot read
         Track t;
         t.id = o.value("id").toString();
@@ -489,9 +500,13 @@ QVector<Track> fromJson(const QJsonArray &arr)
         t.fovSmoothSec = ff.value("smoothSec").toDouble(0.75);
         t.fovDeadband = ff.value("deadband").toDouble(0.06);
         t.fovMaxRatePerSec = ff.value("maxRatePerSec").toDouble(0.22);
-        t.fovRange = ff.value("range").toDouble(2.0);
+        t.fovRange = ff.value("range").toDouble(1.5);
+        // v1 stored the subject's size as a distance in uv; v2 stores the
+        // angle directly. Old tracks keep resolving through the old path, so
+        // one that was framed to taste stays framed the way it was.
+        t.sizeIsAngular = (fmt == QStringLiteral("packed14v2"));
         t.samples = unpackSamples(QByteArray::fromBase64(
-            o.value("samples").toString().toLatin1()), t.t0);
+            o.value("samples").toString().toLatin1()), t.t0, t.sizeIsAngular);
         // Absent means untrimmed. activeStart/activeEnd clamp these to the
         // measured span, so a hand-edited sidecar cannot widen a track.
         t.trimIn = o.value("trimIn").toDouble(-1.0);

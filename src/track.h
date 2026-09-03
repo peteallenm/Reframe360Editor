@@ -43,7 +43,12 @@ struct TrackSample {
     double t = 0.0;          // frame PTS
     double u = 0.5, v = 0.5; // normalised HALF-frame fisheye coords
     int lens = 0;            // 0 = front (top half), 1 = rear (bottom half)
-    double halfW = 0.0;      // box half-extent, same units, for angular size
+    // The subject's angular half-extent, in RADIANS, as measured in the camera
+    // frame. Deliberately not a distance in uv: the fisheye map is anisotropic
+    // and non-uniform, so a magnitude written along one direction and read back
+    // along the u and v axes comes out up to 19 % wrong, varying with where on
+    // the lens the subject happens to be. That turned a pan into a slow zoom.
+    double halfW = 0.0;
     double halfH = 0.0;
     double conf = 1.0;       // 0..1 match confidence
 };
@@ -74,9 +79,17 @@ struct Track {
     double fovSmoothSec = 0.75;
     double fovDeadband = 0.06;        // 6 %: below this, fov does not move
     double fovMaxRatePerSec = 0.22;   // ~25 %/s
-    double fovRange = 2.0;            // clamp to fov0 * [1/range, range]
+    // Clamp to fov0 * [1/range, range]. Deliberately tight: the size estimate
+    // has a small systematic bias, and the deadband below is hysteresis rather
+    // than a bound, so a slow drift walks straight through it. This is what
+    // stops that becoming "it just keeps zooming in".
+    double fovRange = 1.5;
 
     QVector<TrackSample> samples;     // sorted by t
+    // False for tracks read from a "packed14v1" sidecar, whose halfW/halfH are
+    // distances in uv rather than angles. Those resolve through the old path so
+    // an existing track keeps behaving exactly as it did.
+    bool sizeIsAngular = true;
 
     // How much of the measured span actually drives the view. Trimming is
     // recorded here and NEVER applied to `samples`: dragging a handle back out

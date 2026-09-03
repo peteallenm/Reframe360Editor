@@ -1479,6 +1479,8 @@ QVariantList App::trackSpans() const
         m.insert(QStringLiteral("fullEnd"), tr.endTime());
         m.insert(QStringLiteral("trimmed"), tr.trimIn >= 0.0 || tr.trimOut >= 0.0);
         m.insert(QStringLiteral("lost"), tr.endsAtLoss());
+        m.insert(QStringLiteral("zoom"), tr.fov0);
+        m.insert(QStringLiteral("followSize"), tr.fovFollow);
         out.append(m);
     }
     return out;
@@ -1524,6 +1526,31 @@ void App::setTrackTrim(int index, double tIn, double tOut)
     invalidateTrackCache();
     emit tracksChanged();
     // The view at the playhead may be governed by the part just trimmed away.
+    applyKeyframeInterpolation();
+}
+
+void App::setTrackZoom(int index, double fovDeg)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    const double f = qBound(10.0, fovDeg, 170.0);
+    if (qFuzzyCompare(m_tracks[index].fov0, f))
+        return;
+    m_tracks[index].fov0 = f;
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
+    applyKeyframeInterpolation();
+}
+
+void App::setTrackFollowSize(int index, bool on)
+{
+    if (index < 0 || index >= m_tracks.size() || m_tracks[index].fovFollow == on)
+        return;
+    m_tracks[index].fovFollow = on;
+    syncTracksToSidecar();
+    invalidateTrackCache();
+    emit tracksChanged();
     applyKeyframeInterpolation();
 }
 

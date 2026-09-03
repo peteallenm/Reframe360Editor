@@ -2385,8 +2385,10 @@ static void testTrackFovFollow()
         tr.framingNdcX = 0.0; tr.framingNdcY = 0.0;
         tr.framingProjection = 0; tr.framingAspect = 16.0 / 9.0;
         tr.fovFollow = true;
-        const double halfBase = 0.02;
-        tr.sizeRad0 = 2.0 * halfBase * (M_PI * 0.5) / 0.5 * 0.5;   // matches lensUv scale
+        // Sizes are angles now, so the fixture says what it means: a 2 deg
+        // half-extent, and a reference size that matches it exactly.
+        const double halfBase = proj::degToRad(2.0);
+        tr.sizeRad0 = 2.0 * halfBase;
         QRandomGenerator rng(99);
         for (int i = 0; i < 180; ++i) {
             const double t = i / 30.0;
@@ -2398,12 +2400,6 @@ static void testTrackFovFollow()
             s.conf = 1.0;
             tr.samples.append(s);
         }
-        // sizeRad0 must be the angular size the FIRST sample implies, or the
-        // track starts already wanting a different fov.
-        const QVector3D c = VisualRotationComputer::pixelToBearing(0.5, 0.5, lenses.front);
-        const QVector3D r = VisualRotationComputer::pixelToBearing(0.5 + halfBase, 0.5, lenses.front);
-        const double dot = qBound(-1.0f, QVector3D::dotProduct(c.normalized(), r.normalized()), 1.0f);
-        tr.sizeRad0 = 2.0 * std::acos(dot);
         return tr;
     };
 
@@ -2425,11 +2421,7 @@ static void testTrackFovFollow()
         for (const TrackSample &sm : grow.samples)
             if (!best || std::fabs(sm.t - k.time) < std::fabs(best->t - k.time)) best = &sm;
         if (!best) continue;
-        const QVector3D c = VisualRotationComputer::pixelToBearing(best->u, best->v, lenses.front);
-        const QVector3D r = VisualRotationComputer::pixelToBearing(best->u + best->halfW,
-                                                                   best->v, lenses.front);
-        const double dot = qBound(-1.0f, QVector3D::dotProduct(c.normalized(), r.normalized()), 1.0f);
-        const double sigma = 2.0 * std::acos(dot);
+        const double sigma = 2.0 * best->halfW;
         const double frac = std::tan(sigma * 0.5) / std::tan(proj::degToRad(k.fov) * 0.5);
         if (frac0 <= 0.0) frac0 = frac;
         worstFrac = qMax(worstFrac, std::fabs(frac / frac0 - 1.0));
@@ -3084,6 +3076,141 @@ static void testTileTrackerLoss()
                .arg(lostAt, 0, 'f', 2).arg(after));
 }
 
+// The other half of the scale test, and the one that was missing: a subject
+// that does NOT change size must not appear to. Reported as "it seems to mostly
+// zoom in on the subject more and more" -- the scale estimate had no restoring
+// force, so noise accumulated into a trend and the resolver narrowed the fov to
+// hold a subject that was only apparently growing. Ten seconds is long enough
+// for a ratchet to show: the old code drifted to the fov clamp in about that.
+// A subject of unchanging size, carried right across the lens. The resolved
+// fov must not move: panning is not zooming.
+//
+// The size used to make a round trip through fisheye uv -- written as a
+// distance along whatever direction world "right" mapped to, and read back
+// along the u and v axes, which are neither that direction nor each other and
+// carry different local scales that change across the frame. The same subject
+// measured up to 19 % bigger for being further off axis, so a pan read as the
+// subject growing and the view closed in to hold it. The size is now stored as
+// the angle it always was.
+static void testFovHoldsWhileTheSubjectCrossesTheLens()
+{
+    const TrackLenses lenses = synthLenses();
+    const double trueRadius = proj::degToRad(6.0);
+    auto imuAt = [](double) { return QQuaternion(); };
+
+    // The same track built both ways: sizes as angles (what is stored now) and
+    // as uv distances (what a v1 sidecar holds), so the old path stays covered.
+    Track angular, legacy;
+    for (Track *tr : {&angular, &legacy}) {
+        tr->t0 = 0.0;
+        tr->fov0 = 90.0;
+        tr->roll0 = 0.0;
+        tr->framingNdcX = 0.0;
+        tr->framingNdcY = 0.0;
+        tr->framingAspect = 16.0 / 9.0;
+        tr->framingProjection = 0;
+        tr->sizeRad0 = 2.0 * trueRadius;     // so a correct read gives exactly fov0
+        tr->fovFollow = true;
+    }
+    angular.sizeIsAngular = true;
+    legacy.sizeIsAngular = false;
+
+    const auto &lp = lenses.front;
+    const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                                    lp.rotation, lp.hflip);
+    int n = 0;
+    for (int ti = 1; ti <= 30; ++ti) {
+        const double theta = ti * proj::degToRad(2.6);        // 2.6 .. 78 deg off axis
+        const QVector3D dir((float)std::sin(theta), 0.0f, (float)(-std::cos(theta)));
+        double th, ph, u, v;
+        proj::dirToThetaPhi(proj::Vec3{dir.x(), dir.y(), dir.z()}, th, ph);
+        proj::lensUv(true, th, ph, geom, u, v);
+        if (u < 0.03 || u > 0.97 || v < 0.03 || v > 0.97) continue;
+
+        TrackSample a;
+        a.t = n / 30.0;
+        a.u = u; a.v = v; a.lens = 0; a.conf = 1.0;
+        a.halfW = a.halfH = trueRadius;                 // the angle, straight in
+        angular.samples.append(a);
+
+        // The same subject as v1 would have stored it.
+        QVector3D up(0.0f, 1.0f, 0.0f);
+        if (std::fabs(QVector3D::dotProduct(dir, up)) > 0.996f) up = QVector3D(0, 0, 1);
+        const QVector3D right = QVector3D::crossProduct(up, dir).normalized();
+        const QVector3D edge = (dir + right * (float)std::tan(trueRadius)).normalized();
+        double eth, eph, eu, ev;
+        proj::dirToThetaPhi(proj::Vec3{edge.x(), edge.y(), edge.z()}, eth, eph);
+        proj::lensUv(true, eth, eph, geom, eu, ev);
+        TrackSample b = a;
+        b.halfW = b.halfH = std::hypot(eu - u, ev - v);
+        legacy.samples.append(b);
+        ++n;
+    }
+
+    auto fovSpread = [&](const Track &tr) {
+        const QVector<Keyframe> kfs = track::resolve(tr, lenses, imuAt, tr.endTime());
+        if (kfs.isEmpty()) return 999.0;
+        double lo = 1e9, hi = -1e9;
+        for (const Keyframe &k : kfs) { lo = qMin(lo, k.fov); hi = qMax(hi, k.fov); }
+        return (hi - lo) / qMax(1e-6, lo) * 100.0;      // per cent
+    };
+    const double spreadNew = fovSpread(angular);
+    const double spreadOld = fovSpread(legacy);
+
+    report("The fov holds while the subject crosses the lens",
+           n > 20 && spreadNew < 2.0,
+           QStringLiteral("fov varies %1 %% over %2 positions (a v1 track, stored in uv, "
+                          "varies %3 %%)")
+               .arg(spreadNew, 0, 'f', 1).arg(n).arg(spreadOld, 0, 'f', 1));
+}
+
+static void testTileTrackerConstantSize()
+{
+    const TrackLenses lenses = synthLenses();
+    const QVector3D truth = QVector3D(0.0f, 0.0f, -1.0f);
+    const double radius = proj::degToRad(6.0);
+    // A little camera shake, so the tile is resampled differently every frame
+    // and the estimator is fed real noise rather than the identical picture.
+    auto camAt = [](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(0.8 * std::sin(2 * M_PI * 3.0 * t)))
+             * QQuaternion::fromAxisAndAngle(1, 0, 0, (float)(0.6 * std::sin(2 * M_PI * 7.0 * t)));
+    };
+
+    QVector<uchar> buf(synth::kW * synth::kH);
+    TileTracker tracker;
+    TileTracker::Config cfg;
+    cfg.lenses = lenses;
+    cfg.seedRadiusRad = radius;
+    QString err, lossWhy;
+    bool seeded = false, lost = false;
+    double worstRatio = 1.0;
+
+    for (int i = 0; i < 300; ++i) {                 // 10 s at 30 fps
+        const double t = i / 30.0;
+        if (!synth::render(buf, truth, radius, camAt(t), lenses)) continue;
+        if (!seeded) {
+            cfg.seedDirCam = camAt(t).conjugated().rotatedVector(truth);
+            seeded = tracker.begin(cfg, buf.constData(), synth::kW, synth::kH,
+                                   synth::kW, camAt(t), t, &err);
+            continue;
+        }
+        if (tracker.step(buf.constData(), synth::kW, synth::kH, synth::kW,
+                         camAt(t), t) == TileTracker::Step::Lost) {
+            lost = true; lossWhy = tracker.lossReason(); break;
+        }
+        const double r = tracker.scaleRatio();
+        if (std::fabs(std::log(r)) > std::fabs(std::log(worstRatio))) worstRatio = r;
+    }
+
+    const double endRatio = tracker.scaleRatio();
+    report("A subject that does not change size does not appear to",
+           seeded && !lost && endRatio > 0.88 && endRatio < 1.14
+                 && worstRatio > 0.80 && worstRatio < 1.25,
+           QStringLiteral("after 10 s measured x%1 (worst excursion x%2)%3")
+               .arg(endRatio, 0, 'f', 3).arg(worstRatio, 0, 'f', 3)
+               .arg(lost ? QStringLiteral(", LOST: ") + lossWhy : QString()));
+}
+
 static void testTileTrackerScale()
 {
     const TrackLenses lenses = synthLenses();
@@ -3415,6 +3542,11 @@ static void trackRealClip(const QString &video)
         },
         tr.endTime());
 
+    if (!result.samples.isEmpty())
+        qInfo("  size check: seedRadius %.5f rad, sizeRad0 %.5f, halfW first %.5f last %.5f",
+              req.seedRadiusRad, tr.sizeRad0, result.samples.first().halfW,
+              result.samples.constLast().halfW);
+
     // How fast the subject moved in the WORLD frame, per frame. A subject that
     // is actually static should sit near zero however the camera moved; a
     // steady non-zero median is either real motion or the template sliding.
@@ -3454,6 +3586,18 @@ static void trackRealClip(const QString &video)
                                         "fov %4..%5 deg")
         .arg(kfs.size()).arg(yawSpan, 0, 'f', 1).arg(pitchSpan, 0, 'f', 1)
         .arg(fovMin, 0, 'f', 1).arg(fovMax, 0, 'f', 1);
+    // The measured apparent size along the track. A subject that is not
+    // actually approaching should not grow: any steady trend here is the
+    // scale estimator ratcheting, and it comes out as the view zooming in.
+    if (kfs.size() >= 5) {
+        QString trend;
+        for (double f : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+            const int i = qBound(0, (int)(f * (kfs.size() - 1)), kfs.size() - 1);
+            trend += QStringLiteral("%1 ").arg(kfs[i].fov, 0, 'f', 1);
+        }
+        qInfo().noquote() << QStringLiteral("  fov along the track at 0/25/50/75/100%%: %1")
+            .arg(trend);
+    }
     qInfo().noquote() << QStringLiteral("  world motion of the subject: median %1 deg/s, "
                                         "p95 %2 deg/s")
         .arg(medStep, 0, 'f', 1).arg(p95Step, 0, 'f', 1);
@@ -4024,7 +4168,9 @@ int main(int argc, char *argv[])
         qInfo() << "--- Test 0e: object-track resolver ---";
         testTrackResolve();
         testTrackFovFollow();
-        testTileTrackerFastSubject();
+        testFovHoldsWhileTheSubjectCrossesTheLens();
+    testTileTrackerConstantSize();
+    testTileTrackerFastSubject();
     testTileTrackerStopsOnEmptySky();
     testTrackCompose();
         testTrackTrim();

@@ -16,7 +16,9 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QSemaphore>
 #include <QThread>
+#include <QThreadPool>
 #include <QtMath>
 
 #include <opencv2/core.hpp>
@@ -92,6 +94,12 @@ constexpr double kAnchorStillGood   = 0.45;  // anchor match that vetoes an
 constexpr double kMaxWorldSpeedDeg  = 400.0;
 constexpr int    kMaxTileSize       = 240;   // bounds the per-frame search cost
 constexpr double kMaxScaleStepLog   = 0.223; // log(1.25) per frame
+constexpr double kScaleBlend        = 0.06;  // ~1 s to settle: fast enough to follow a
+                                             // subject that really is approaching, slow
+                                             // enough that a small bias in the estimate
+                                             // cannot become a visible zoom
+constexpr double kScaleTrustScore   = 0.35;  // only read scale off a believable anchor match
+constexpr double kMaxScaleLog       = 1.099; // the subject may look 3x bigger or smaller
 constexpr double kSeamThetaDeg      = 90.0;
 constexpr double kSeamHysteresisDeg = 4.0;
 
@@ -420,20 +428,16 @@ void TileTracker::recordSample(const QQuaternion &qAct, double t, double score)
     smp.lens = front ? 0 : 1;
     proj::lensUv(front, theta, phi, geom, smp.u, smp.v);
 
-    // The subject's edge, in the same coordinates, so the resolver can turn
-    // it back into an angular size.
-    QVector3D up(0.0f, 1.0f, 0.0f);
-    if (std::fabs(QVector3D::dotProduct(m_dirWorld, up)) > 0.996f)
-        up = QVector3D(0.0f, 0.0f, 1.0f);
-    const QVector3D right = QVector3D::crossProduct(up, m_dirWorld).normalized();
-    const double radRad = m_cfg.seedRadiusRad * std::exp(m_scaleLog);
-    const QVector3D edgeWorld = (m_dirWorld + right * (float)std::tan(radRad)).normalized();
-    const QVector3D edgeCam = qAct.conjugated().rotatedVector(edgeWorld);
-    double eTheta, ePhi;
-    proj::dirToThetaPhi(toV(edgeCam), eTheta, ePhi);
-    double eu, ev;
-    proj::lensUv(front, eTheta, ePhi, geom, eu, ev);
-    smp.halfW = std::hypot(eu - smp.u, ev - smp.v);
+    // The subject's angular half-extent, stored as an angle. It used to be
+    // projected out to an edge point and stored as a uv distance for the
+    // resolver to turn back into an angle -- but the resolver read that
+    // magnitude back along the u and v axes, which are neither the direction it
+    // was written along nor each other, and on a fisheye they carry different
+    // local scales that change across the frame. The same subject measured up
+    // to 19 % bigger simply for being further off axis, so panning across the
+    // lens read as the subject growing and the view zoomed in to hold it.
+    // Nothing needs projecting: the tracker already knows the angle.
+    smp.halfW = m_cfg.seedRadiusRad * std::exp(m_scaleLog);
     smp.halfH = smp.halfW;
     smp.conf = clampd(score, 0.0, 1.0);
     m_last = smp;
@@ -468,46 +472,85 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     double bestScore = -2.0, bestDx = 0.0, bestDy = 0.0, bestValid = 0.0, bestPsr = 99.0;
     double anchorScore = -2.0;
     double scores[3] = {-2.0, -2.0, -2.0};
+    double aScores[3] = {-2.0, -2.0, -2.0};
     cv::Point bestLoc;
     cv::Mat bestTile;
     int bestK = 1;
 
-    for (int k = 0; k < 3; ++k) {
-        const double pTan = pTanBase * std::pow(kScaleStep, k - 1);
+    // The three scales are independent -- each builds its own tile and
+    // correlates two templates against it -- and matching is essentially all of
+    // the per-frame cost (measured at 98-99 %; the decode is a rounding error).
+    // So they run on the pool and are reduced afterwards, which is the whole
+    // of "make tracking multi-core": there is nothing else worth threading.
+    struct Probe {
+        bool ok = false;
+        double useScore = -2.0, anchorScore = -2.0, validFrac = 0.0, pTan = 0.0;
+        cv::Point useLoc;
+        cv::Mat tile, useMap;
+    };
+    Probe probes[3];
+
+    auto runProbe = [&](int k) {
+        Probe &r = probes[k];
+        r.pTan = pTanBase * std::pow(kScaleStep, k - 1);
         cv::Mat tile;
         double validFrac = 0.0;
-        if (!buildTile(y, w, h, stride, m_cfg.lenses, qAct, predicted, pTan,
+        if (!buildTile(y, w, h, stride, m_cfg.lenses, qAct, predicted, r.pTan,
                        m_tileSize, m_preferRear, tile, &validFrac))
-            continue;
+            return;
         double minV, maxV;
         cv::Point minL, maxL;
         cv::Mat scoreMap;
         cv::matchTemplate(tile, m_anchorHolder->anchor, scoreMap, cv::TM_CCOEFF_NORMED);
         cv::minMaxLoc(scoreMap, &minV, &maxV, &minL, &maxL);
-        double useScore = maxV;
-        cv::Point useLoc = maxL;
-        const cv::Mat *useMap = &scoreMap;
-        anchorScore = qMax(anchorScore, maxV);
 
         cv::Mat runMap;
         cv::matchTemplate(tile, m_anchorHolder->running, runMap, cv::TM_CCOEFF_NORMED);
         double rMin, rMax;
         cv::Point rMinL, rMaxL;
         cv::minMaxLoc(runMap, &rMin, &rMax, &rMinL, &rMaxL);
-        if (rMax > useScore) { useScore = rMax; useLoc = rMaxL; useMap = &runMap; }
 
-        scores[k] = useScore;
-        if (useScore > bestScore) {
-            bestScore = useScore;
+        r.ok = true;
+        r.validFrac = validFrac;
+        r.anchorScore = maxV;
+        r.tile = tile;
+        if (rMax > maxV) { r.useScore = rMax; r.useLoc = rMaxL; r.useMap = runMap; }
+        else             { r.useScore = maxV; r.useLoc = maxL;  r.useMap = scoreMap; }
+    };
+
+    // The caller takes one of them itself rather than waiting on three, so a
+    // machine with nothing spare is no worse off than before.
+    if (QThreadPool::globalInstance()->maxThreadCount() > 1) {
+        QSemaphore done;
+        QThreadPool::globalInstance()->start([&]{ runProbe(0); done.release(); });
+        QThreadPool::globalInstance()->start([&]{ runProbe(2); done.release(); });
+        runProbe(1);
+        done.acquire(2);
+    } else {
+        for (int k = 0; k < 3; ++k) runProbe(k);
+    }
+
+    for (int k = 0; k < 3; ++k) {
+        const Probe &r = probes[k];
+        if (!r.ok) continue;
+        anchorScore = qMax(anchorScore, r.anchorScore);
+        scores[k] = r.useScore;
+        aScores[k] = r.anchorScore;     // anchor only: the absolute scale reference
+        if (r.useScore > bestScore) {
+            bestScore = r.useScore;
             bestK = k;
-            bestValid = validFrac;
-            bestPsr = peakSidelobeRatio(*useMap, useLoc, kTemplate / 2);
-            bestLoc = useLoc;
-            bestTile = tile;
-            bestDx = (useLoc.x + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
-            bestDy = -(useLoc.y + kTemplate * 0.5 - m_tileSize * 0.5) * pTan;
+            bestValid = r.validFrac;
+            bestLoc = r.useLoc;
+            bestTile = r.tile;
+            bestDx = (r.useLoc.x + kTemplate * 0.5 - m_tileSize * 0.5) * r.pTan;
+            bestDy = -(r.useLoc.y + kTemplate * 0.5 - m_tileSize * 0.5) * r.pTan;
         }
     }
+    // Only the winner's peak needs measuring, so this is now done once rather
+    // than for every scale that happened to be leading at the time.
+    if (bestScore > -1.0 && probes[bestK].ok)
+        bestPsr = peakSidelobeRatio(probes[bestK].useMap, bestLoc, kTemplate / 2);
+
     m_lastScore = bestScore;
 
     if (bestScore < -1.0) { m_lossReason = QStringLiteral("out of field"); return Step::Lost; }
@@ -608,17 +651,37 @@ TileTracker::Step TileTracker::step(const uchar *y, int w, int h, int stride,
     }
     m_rejectRun = 0;
 
-    // Scale, from a parabola through the three scores.
-    if (bestK == 1 && scores[0] > -1.0 && scores[2] > -1.0
-        && scores[1] > scores[0] && scores[1] > scores[2]) {
-        const double denom = scores[0] - 2.0 * scores[1] + scores[2];
-        if (std::fabs(denom) > 1e-6) {
-            const double delta = 0.5 * (scores[0] - scores[2]) / denom;
-            m_scaleLog += clampd(delta * std::log(kScaleStep), -kMaxScaleStepLog, kMaxScaleStepLog);
+    // Scale, from a parabola through the three ANCHOR scores.
+    //
+    // Measuring it against the best of anchor-and-running cannot work, and was
+    // the reason a track zoomed steadily in until it hit the fov clamp. The
+    // running template is re-learnt from the tile at whatever scale the
+    // estimator currently believes, so it matches best at that scale by
+    // construction -- the parabola then reports "no change needed" for every
+    // scale alike. m_scaleLog became a pure integrator: every bit of noise was
+    // kept for good, nothing ever pulled it back, and the resolver dutifully
+    // narrowed the fov to hold a subject that only appeared to be growing.
+    //
+    // The anchor is the seed appearance at the seed scale and never moves, so
+    // it is the one absolute reference available. Read against it the estimate
+    // is a measurement rather than an accumulation, and a wrong step is
+    // corrected on the next frame instead of kept.
+    if (aScores[0] > -1.0 && aScores[1] > -1.0 && aScores[2] > -1.0
+        && aScores[qBound(0, bestK, 2)] > kScaleTrustScore) {
+        double deltaSteps = 0.0;
+        if (aScores[1] >= aScores[0] && aScores[1] >= aScores[2]) {
+            const double denom = aScores[0] - 2.0 * aScores[1] + aScores[2];
+            if (std::fabs(denom) > 1e-6)
+                deltaSteps = clampd(0.5 * (aScores[0] - aScores[2]) / denom, -1.0, 1.0);
+        } else {
+            deltaSteps = (aScores[2] > aScores[0]) ? 1.0 : -1.0;
         }
-    } else if (bestK != 1) {
-        m_scaleLog += clampd((bestK - 1) * std::log(kScaleStep),
+        // Eased rather than applied outright: a subject's size changes over
+        // seconds, and letting one frame move it 25 % is how noise turned into
+        // a trend in the first place.
+        m_scaleLog += clampd(kScaleBlend * deltaSteps * std::log(kScaleStep),
                              -kMaxScaleStepLog, kMaxScaleStepLog);
+        m_scaleLog = clampd(m_scaleLog, -kMaxScaleLog, kMaxScaleLog);
     }
 
     if (stepDeg > 1e-4) {
@@ -685,18 +748,13 @@ static TrackSample sampleFor(double t, const QVector3D &dirWorld, const QQuatern
     smp.lens = front ? 0 : 1;
     proj::lensUv(front, theta, phi, geom, smp.u, smp.v);
 
-    QVector3D up(0.0f, 1.0f, 0.0f);
-    if (std::fabs(QVector3D::dotProduct(dirWorld.normalized(), up)) > 0.996f)
-        up = QVector3D(0.0f, 0.0f, 1.0f);
-    const QVector3D right = QVector3D::crossProduct(up, dirWorld.normalized()).normalized();
-    const QVector3D edge = (dirWorld.normalized() + right * (float)std::tan(radiusRad)).normalized();
-    const QVector3D edgeCam = qAct.conjugated().rotatedVector(edge);
-    double eTheta, ePhi;
-    proj::dirToThetaPhi(proj::Vec3{edgeCam.x(), edgeCam.y(), edgeCam.z()}, eTheta, ePhi);
-    double eu, ev;
-    proj::lensUv(front, eTheta, ePhi, geom, eu, ev);
-    smp.halfW = std::hypot(eu - smp.u, ev - smp.v);
-    smp.halfH = smp.halfW;
+    // The angular half-extent, stored as the angle it is. Projecting it out to
+    // an edge point and storing a uv distance -- which the resolver then read
+    // back along the u and v axes, neither of which is the direction it was
+    // written along -- made the same subject measure up to 19 % bigger for
+    // being further off axis, so a pan read as a zoom.
+    smp.halfW = radiusRad;
+    smp.halfH = radiusRad;
     smp.conf = clampd(score, 0.0, 1.0);
     return smp;
 }
@@ -800,6 +858,10 @@ void ObjectTracker::run(TrackRequest req)
     double lastTime = req.t0;
     QString endReason = QStringLiteral("?");
     QString seedError;
+    // Where the time goes. Worth keeping: which stage dominates decides
+    // whether threading the matcher or the decoder is worth anything at all.
+    qint64 msDecode = 0, msTrack = 0;
+    QElapsedTimer stage;
 
     while (true) {
         if (m_cancel.loadRelaxed() != 0) {
@@ -808,7 +870,10 @@ void ObjectTracker::run(TrackRequest req)
         }
         double t = 0.0;
         const double minTime = (frames == 0) ? req.t0 : lastTime + 0.5 / qMax(1.0, req.fps);
-        if (!reader.next(minTime, &t)) { endReason = QStringLiteral("end of stream"); break; }
+        stage.start();
+        const bool haveFrame = reader.next(minTime, &t);
+        msDecode += stage.elapsed();
+        if (!haveFrame) { endReason = QStringLiteral("end of stream"); break; }
         if (t > req.tEnd + 1e-6) { reader.release(); endReason = QStringLiteral("reached the end time"); break; }
 
         const QQuaternion qAct = orientationAt(req, t);
@@ -853,6 +918,7 @@ void ObjectTracker::run(TrackRequest req)
 
         // Advance every live patch.
         int aliveNow = 0;
+        stage.start();
         for (PointState &p : points) {
             p.okThisFrame = false;
             if (!p.alive) continue;
@@ -868,6 +934,7 @@ void ObjectTracker::run(TrackRequest req)
                 p.score = p.tracker.lastScore();
             }
         }
+        msTrack += stage.elapsed();
 
         // The best patch this frame defines where the subject is.
         int best = -1;
@@ -932,6 +999,9 @@ void ObjectTracker::run(TrackRequest req)
         }
     }
 
+    qInfo("ObjectTracker: decode %lld ms, track %lld ms (%.0f %% tracking)",
+          msDecode, msTrack,
+          (msDecode + msTrack) > 0 ? 100.0 * msTrack / (msDecode + msTrack) : 0.0);
     for (const PointState &p : points) if (p.alive) result.pointsSurviving++;
     result.meanScore = frames > 0 ? scoreSum / frames : 0.0;
     result.msPerFrame = frames > 0 ? (double)clock.elapsed() / frames : 0.0;
