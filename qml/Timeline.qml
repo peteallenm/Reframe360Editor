@@ -595,11 +595,14 @@ Pane {
             anchors.fill: parent
             spacing: 8
 
-            RowLayout { Label { text: "Time:"; Layout.preferredWidth: 60 } TextField { id: timeField; Layout.fillWidth: true } }
-            RowLayout { Label { text: "Yaw:"; Layout.preferredWidth: 60 } TextField { id: yawField; Layout.fillWidth: true } }
-            RowLayout { Label { text: "Pitch:"; Layout.preferredWidth: 60 } TextField { id: pitchField; Layout.fillWidth: true } }
-            RowLayout { Label { text: "Roll:"; Layout.preferredWidth: 60 } TextField { id: rollField; Layout.fillWidth: true } }
-            RowLayout { Label { text: "FOV:"; Layout.preferredWidth: 60 } TextField { id: fovField; Layout.fillWidth: true } }
+            // Numbers only: on Android this brings up a numeric keypad instead
+            // of a full keyboard, and stops the keyboard trying to
+            // autocapitalise and autocorrect a decimal.
+            RowLayout { Label { text: "Time:"; Layout.preferredWidth: 60 } TextField { id: timeField; Layout.fillWidth: true; inputMethodHints: Qt.ImhFormattedNumbersOnly } }
+            RowLayout { Label { text: "Yaw:"; Layout.preferredWidth: 60 } TextField { id: yawField; Layout.fillWidth: true; inputMethodHints: Qt.ImhFormattedNumbersOnly } }
+            RowLayout { Label { text: "Pitch:"; Layout.preferredWidth: 60 } TextField { id: pitchField; Layout.fillWidth: true; inputMethodHints: Qt.ImhFormattedNumbersOnly } }
+            RowLayout { Label { text: "Roll:"; Layout.preferredWidth: 60 } TextField { id: rollField; Layout.fillWidth: true; inputMethodHints: Qt.ImhFormattedNumbersOnly } }
+            RowLayout { Label { text: "FOV:"; Layout.preferredWidth: 60 } TextField { id: fovField; Layout.fillWidth: true; inputMethodHints: Qt.ImhFormattedNumbersOnly } }
         }
 
         onAccepted: {

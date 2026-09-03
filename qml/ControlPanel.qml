@@ -653,6 +653,10 @@ Item {
                                 TextField {
                                     id: presetNameField
                                     Layout.fillWidth: true
+                                    // Same reason as the export file name: a
+                                    // keyboard that re-derives its own shift
+                                    // state cancels the one you just pressed.
+                                    inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                                     placeholderText: qsTr("Profile name")
                                 }
                                 Button {
