@@ -133,6 +133,8 @@ build_universal() {
 # Bundles are signed with jarsigner: apksigner only handles APKs. This key is
 # the *upload* key; whether Play then serves APKs signed with this same key or
 # one Google generates is decided once, when the app is created in the Console.
+# The signing itself lives in sign-release.sh so that an artifact built without
+# the keystore can be signed later by exactly the same code.
 build_bundle() {
     configure_universal
     "$CMAKE" --build "$BUILD_UNIVERSAL" --target aab -j"$(nproc)"
@@ -140,15 +142,21 @@ build_bundle() {
     aab=$(find "$BUILD_UNIVERSAL/android-build/build/outputs/bundle" -name '*.aab' | head -1)
     [ -n "$aab" ] || { echo "no .aab produced" >&2; exit 1; }
     if [ ! -f "$KEYSTORE" ]; then
+        # NOT actually unsigned: androiddeployqt has already signed it with the
+        # Android debug key. sign-release.sh strips that before signing
+        # properly, which is why signing later is a separate step and not just
+        # a jarsigner call.
         cp "$aab" "$OUT/reframe360-release-unsigned.aab"
-        echo "NO KEYSTORE at $KEYSTORE -- left unsigned: $OUT/reframe360-release-unsigned.aab"
+        echo "NO KEYSTORE at $KEYSTORE -- left debug-signed: $OUT/reframe360-release-unsigned.aab"
+        echo "sign it later with: android/sign-release.sh $OUT/reframe360-release-unsigned.aab"
         return
     fi
-    "$JAVA_HOME/bin/jarsigner" -keystore "$KEYSTORE" \
-        -storepass "$KEYSTORE_PASS" \
-        -signedjar "$OUT/reframe360-release.aab" "$aab" "$KEY_ALIAS"
-    "$JAVA_HOME/bin/jarsigner" -verify "$OUT/reframe360-release.aab" > /dev/null
-    echo "signed: $OUT/reframe360-release.aab ($(du -h "$OUT/reframe360-release.aab" | cut -f1))"
+    # One signing path, shared with the after-the-fact case, so a fix to either
+    # cannot miss the other. It strips the debug signature first: jarsigner on
+    # its own would leave that in place and ADD to it, and Play rejects a
+    # bundle carrying a signer it did not expect.
+    cp -f "$aab" "$OUT/reframe360-release.aab"
+    "$SRC/android/sign-release.sh" "$OUT/reframe360-release.aab" "$OUT/reframe360-release.aab"
     echo "versionCode $VERSION_CODE -- Play rejects an upload that does not increase it"
 }
 
