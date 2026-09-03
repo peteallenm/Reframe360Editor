@@ -19,6 +19,7 @@
 #include <QImage>
 #include <QSettings>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QTimer>
 #include <QThread>
 #include <QQuaternion>
