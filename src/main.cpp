@@ -129,8 +129,10 @@ int main(int argc, char *argv[])
     parser.addOption(exportEndOption);
     QCommandLineOption exportBackendOption("export-backend", "Render backend: gpu, cpu or auto (default auto)", "backend");
     QCommandLineOption exportSphericalOption("export-spherical", "Tag the export as a 360 equirectangular video (requires --projection 1)");
+    QCommandLineOption exportNoAudioOption("export-no-audio", "Leave the clip's audio out of the export (it is copied in by default)");
     parser.addOption(exportBackendOption);
     parser.addOption(exportSphericalOption);
+    parser.addOption(exportNoAudioOption);
     QCommandLineOption exportCodecOption("export-codec", "Encoder: libx264, libx265 or hevc_nvenc (default libx264)", "codec");
     parser.addOption(exportCodecOption);
     QCommandLineOption exportCrfOption("export-crf", "CRF quality for CPU codecs, 0..51 (default 19)", "crf");
@@ -224,13 +226,15 @@ int main(int argc, char *argv[])
                 QTimer *wait = new QTimer(&app);
                 wait->setInterval(100);
                 const bool exportSpherical = parser.isSet(exportSphericalOption);
-                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab, vidstabInformed, exportSpherical]() {
+                const bool exportAudio = !parser.isSet(exportNoAudioOption);
+                QObject::connect(wait, &QTimer::timeout, &app, [&app, &appController, wait, outPath, w, h, fps, start, end, gpu, codec, crf, bitrate, vidstab, vidstabInformed, exportSpherical, exportAudio]() {
                     if (appController.duration() <= 0.0)
                         return;   // keep waiting for the decoder
                     wait->stop();
                     const double startTime = start;
                     const double endTime = (end >= 0.0) ? end : appController.duration();
-                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, vidstabInformed, gpu, exportSpherical);
+                    appController.exportVideo(outPath, w, h, fps, startTime, endTime, codec, crf, bitrate, vidstab, vidstabInformed, gpu, exportSpherical,
+                                              exportAudio);
 
                     // Poll until the export finishes, then exit with a code
                     // that reflects success/failure.

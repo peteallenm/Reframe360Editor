@@ -146,6 +146,13 @@ Dialog {
             TextField {
                 id: outputField
                 Layout.fillWidth: true
+                // Android: with no hint at all Qt asks the keyboard for
+                // sentence capitalisation, and the keyboard then re-derives its
+                // shift state whenever the field updates -- cancelling a shift
+                // the moment it is pressed, so a capital letter cannot be typed
+                // at all. A file name is not a sentence: no auto-capitalisation
+                // and no autocorrect, and shift then stays where it is put.
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                 placeholderText: Qt.platform.os === "android" ? qsTr("Output file name")
                                                               : qsTr("Output MP4 path")
             }
@@ -277,6 +284,26 @@ Dialog {
             Layout.fillWidth: true
         }
 
+        // ---- audio ----
+        ColumnLayout {
+            spacing: 2
+            CheckBox {
+                id: audioCheck
+                text: qsTr("Keep the original audio")
+                checked: true
+            }
+            Label {
+                text: qsTr("Copies the clip's own sound into the export, cut to the same range. Copied rather than re-encoded, so it costs nothing and loses nothing.")
+                font.pixelSize: 11
+                color: Material.secondaryTextColor
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                Layout.leftMargin: 8
+            }
+        }
+
+        Rectangle { Layout.fillWidth: true; height: 1; color: "#444" }
+
         // ---- 360 metadata (equirectangular renders only) ----
         ColumnLayout {
             visible: app.projection === 1
@@ -401,7 +428,8 @@ Dialog {
                         app.exportVidstab,
                         app.exportVidstabInformed,
                         true,
-                        app.projection === 1 && sphericalCheck.checked)
+                        app.projection === 1 && sphericalCheck.checked,
+                        audioCheck.checked)
     }
 
     FileDialog {

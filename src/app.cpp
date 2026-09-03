@@ -592,7 +592,9 @@ void App::setVideoPath(const QString &path)
         }
         if (!m_imuOverride.isEmpty() || QFileInfo::exists(imuPath)) {
             setLoadStage(0.60, tr("Reading motion data…"));
+            QElapsedTimer loadClock; loadClock.start();
             m_imuParser->loadFile(imuPath);
+            const qint64 msParse = loadClock.restart();
 
             // IMU<->video drift: a value tuned for this video and stored in
             // its keyframe sidecar wins; otherwise use the auto-calculated
@@ -616,7 +618,9 @@ void App::setVideoPath(const QString &path)
             }
 
             setLoadStage(0.80, tr("Working out the camera's motion…"));
+            loadClock.restart();
             integrateImu();
+            qInfo("Load timing: parse %lld ms, integrate %lld ms", msParse, loadClock.elapsed());
         }
 
         setLoadStage(0.98, tr("Almost there…"));
@@ -1771,7 +1775,7 @@ void App::exportFrame(const QString &path, int width, int height)
                             snap.stateAt(m_currentTime));
 }
 
-void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend, bool spherical360)
+void App::exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend, bool spherical360, bool copyAudio)
 {
     if (m_videoPath.isEmpty()) {
         m_exportStatus = tr("Export failed: no video loaded");
@@ -1821,6 +1825,7 @@ void App::exportVideo(const QString &path, int width, int height, double fps, do
     // Only an equirectangular render is actually a sphere; tagging any other
     // projection would make players warp a flat picture around one.
     settings.spherical = spherical360 && m_projection == 1;
+    settings.copyAudio = copyAudio;
 
     ExportSnapshot snap = buildExportSnapshot();
     m_exporter->exportVideo(m_videoPath, writePath, settings, startTime, endTime,

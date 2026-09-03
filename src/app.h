@@ -323,7 +323,7 @@ public:
     void setExportFileName(const QString &name);
 
     Q_INVOKABLE void exportFrame(const QString &path, int width, int height);
-    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend = true, bool spherical360 = false);
+    Q_INVOKABLE void exportVideo(const QString &path, int width, int height, double fps, double startTime, double endTime, const QString &codec, int crf, int bitrateMbps, bool vidstab, bool vidstabInformed, bool gpuBackend = true, bool spherical360 = false, bool copyAudio = true);
     Q_INVOKABLE QString grabStill(int lens);
 
     // Open a clip together with explicitly supplied sidecars. On Android the

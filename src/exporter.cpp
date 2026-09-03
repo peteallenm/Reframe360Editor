@@ -595,15 +595,143 @@ bool DecodeReader::readFrameAt(double targetSec, DecodedFrame *out)
 // H.264 / MPEG-4 encoder + MP4 muxer
 // ---------------------------------------------------------------------------
 
+// Copies the source's audio track into the export, unencoded.
+//
+// Stream copy, not re-encode: the samples are already in a form MP4 holds, and
+// decoding and re-encoding them would only lose quality and time for nothing.
+// The track is cut to the same range as the video and rebased to start at zero.
+//
+// Every failure here is soft. An export without sound is a disappointment; an
+// export that refuses to run because the audio could not be arranged is a lost
+// render, and the video is the expensive part.
+class AudioCopier
+{
+public:
+    ~AudioCopier() { close(); }
+
+    // Adds a matching audio stream to `out`. Must be called BEFORE
+    // avformat_write_header. False with a reason when there is nothing usable.
+    bool open(const QString &src, AVFormatContext *out, double startSec, double endSec,
+              QString *why)
+    {
+        if (m_in.open(src) < 0 || !m_in.fmt) {
+            if (why) *why = QObject::tr("could not reopen the source for audio");
+            return false;
+        }
+        m_fmt = m_in.fmt;
+        if (avformat_find_stream_info(m_fmt, nullptr) < 0) {
+            if (why) *why = QObject::tr("no stream info"); return false;
+        }
+        m_srcIdx = av_find_best_stream(m_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (m_srcIdx < 0) {
+            if (why) *why = QObject::tr("the clip has no audio track"); return false;
+        }
+        const AVStream *in = m_fmt->streams[m_srcIdx];
+        // Can this container hold this codec at all? Asking is cheaper than
+        // finding out from avformat_write_header, which fails the whole export.
+        if (out->oformat
+            && avformat_query_codec(out->oformat, in->codecpar->codec_id,
+                                    FF_COMPLIANCE_NORMAL) <= 0) {
+            if (why) *why = QObject::tr("the output format cannot hold %1 audio")
+                                .arg(QString::fromLatin1(
+                                    avcodec_get_name(in->codecpar->codec_id)));
+            return false;
+        }
+        m_stream = avformat_new_stream(out, nullptr);
+        if (!m_stream || avcodec_parameters_copy(m_stream->codecpar, in->codecpar) < 0) {
+            if (why) *why = QObject::tr("could not add an audio stream");
+            m_stream = nullptr;
+            return false;
+        }
+        // The tag belongs to the source container. Left in place, the muxer
+        // either refuses it or writes a file players do not recognise.
+        m_stream->codecpar->codec_tag = 0;
+        m_stream->time_base = in->time_base;
+
+        m_srcTb = in->time_base;
+        m_startTs = (int64_t)(startSec / av_q2d(m_srcTb));
+        m_endTs = (endSec > startSec) ? (int64_t)(endSec / av_q2d(m_srcTb)) : INT64_MAX;
+        m_pkt = av_packet_alloc();
+        av_seek_frame(m_fmt, m_srcIdx, m_startTs, AVSEEK_FLAG_BACKWARD);
+        return true;
+    }
+
+    bool active() const { return m_stream != nullptr; }
+
+    // Write whatever audio is due by `videoSec` (seconds since the export
+    // start). Called as the video is written so the muxer never has to hold a
+    // whole track's worth of packets waiting for its partner stream.
+    void pumpUntil(double videoSec, AVFormatContext *out)
+    {
+        if (!active() || m_eof) return;
+        while (true) {
+            if (!m_have) {
+                if (av_read_frame(m_fmt, m_pkt) < 0) { m_eof = true; return; }
+                if (m_pkt->stream_index != m_srcIdx) { av_packet_unref(m_pkt); continue; }
+                m_have = true;
+            }
+            const int64_t pts = (m_pkt->pts != AV_NOPTS_VALUE) ? m_pkt->pts : m_pkt->dts;
+            if (pts == AV_NOPTS_VALUE || pts < m_startTs) {   // before the cut
+                av_packet_unref(m_pkt); m_have = false; continue;
+            }
+            if (pts > m_endTs) { m_eof = true; return; }      // past it
+            const double sec = (pts - m_startTs) * av_q2d(m_srcTb);
+            if (sec > videoSec) return;                       // not due yet
+            writeCurrent(out);
+        }
+    }
+
+    // The remainder of the range, once the video is done.
+    void drain(AVFormatContext *out) { pumpUntil(1e18, out); }
+
+    void close()
+    {
+        if (m_pkt) { av_packet_free(&m_pkt); m_pkt = nullptr; }
+        m_in.close();
+        m_fmt = nullptr;
+        m_stream = nullptr;
+    }
+
+private:
+    void writeCurrent(AVFormatContext *out)
+    {
+        // Rebase so the kept range starts at zero, then convert to the output
+        // stream's units.
+        if (m_pkt->pts != AV_NOPTS_VALUE) m_pkt->pts -= m_startTs;
+        if (m_pkt->dts != AV_NOPTS_VALUE) m_pkt->dts -= m_startTs;
+        av_packet_rescale_ts(m_pkt, m_srcTb, m_stream->time_base);
+        m_pkt->stream_index = m_stream->index;
+        m_pkt->pos = -1;
+        av_interleaved_write_frame(out, m_pkt);   // soft: a dropped packet is
+        av_packet_unref(m_pkt);                   // not worth losing a render
+        m_have = false;
+    }
+
+    AvInput m_in;
+    AVFormatContext *m_fmt = nullptr;
+    AVStream *m_stream = nullptr;      // in the OUTPUT
+    AVPacket *m_pkt = nullptr;
+    bool m_have = false;               // m_pkt holds a packet not yet written
+    bool m_eof = false;
+    int m_srcIdx = -1;
+    AVRational m_srcTb{1, 1};
+    int64_t m_startTs = 0;
+    int64_t m_endTs = INT64_MAX;
+};
+
 class VideoWriter
 {
 public:
     VideoWriter() = default;
     ~VideoWriter();
 
+    // audioSource empty = no audio. It is the ORIGINAL clip, reopened: the
+    // render pass has its own decoder positioned wherever the video is, and
+    // sharing it would mean seeking the video reader about to fetch sound.
     bool open(const QString &path, int w, int h, double fps,
               const QString &codecName, int crf, int bitrateMbps,
               const QString &title, const QString &comment, bool spherical,
+              const QString &audioSource, double audioStart, double audioEnd,
               QString *error);
     bool writeFrame(const QImage &rgb, QString *error);
     bool finish(QString *error);
@@ -615,6 +743,8 @@ private:
     AVCodecContext *m_enc = nullptr;
     AVStream *m_stream = nullptr;
     AvOutput m_output;              // owns m_fmt and its I/O
+    AudioCopier m_audio;
+    double m_fps = 30.0;
     SwsContext *m_conv = nullptr;
     AVFrame *m_yuv = nullptr;
     AVRational m_tb{1000, 30000};  // 1/fps in units of 1/1000s
@@ -633,10 +763,12 @@ VideoWriter::~VideoWriter()
 bool VideoWriter::open(const QString &path, int w, int h, double fps,
                        const QString &codecName, int crf, int bitrateMbps,
                        const QString &title, const QString &comment, bool spherical,
+                       const QString &audioSource, double audioStart, double audioEnd,
                        QString *error)
 {
     const int den = qMax(1, qRound(fps * 1000.0));
     m_tb = AVRational{1000, den};
+    m_fps = qMax(1.0, fps);
 
     // Allocate and open the sink together: on Android the destination is a
     // document in the granted folder addressed by content://, which
@@ -815,6 +947,16 @@ bool VideoWriter::open(const QString &path, int w, int h, double fps,
     // normal MP4: the muxer rewinds to patch the header once the moov size is
     // known. Fragmented MP4 is written strictly forwards. Passed as a muxer
     // option to write_header, which is where movflags is actually read.
+    // Before write_header: streams cannot be added afterwards. A failure here
+    // is reported and stepped over -- the render still happens, without sound.
+    if (!audioSource.isEmpty()) {
+        QString why;
+        if (m_audio.open(audioSource, m_fmt, audioStart, audioEnd, &why))
+            qInfo().noquote() << "Export: copying the original audio track";
+        else
+            qInfo().noquote() << "Export: no audio in the output --" << why;
+    }
+
     AVDictionary *muxOpts = nullptr;
     // Custom I/O as well as an outright unseekable sink: a content:// document
     // accepted the seek probe but still could not be rewound at the end, and
@@ -871,7 +1013,13 @@ bool VideoWriter::writeFrame(const QImage &rgb, QString *error)
         return false;
     }
     m_frameIdx++;
-    return flushPackets(error);
+    if (!flushPackets(error))
+        return false;
+    // Keep the audio roughly level with the video, a little ahead. Writing it
+    // all at the end instead would make the muxer hold every video packet
+    // while it waited for a partner stream to interleave against.
+    m_audio.pumpUntil((double)m_frameIdx / m_fps + 0.5, m_fmt);
+    return true;
 }
 
 bool VideoWriter::flushPackets(QString *error)
@@ -906,6 +1054,7 @@ bool VideoWriter::finish(QString *error)
     avcodec_send_frame(m_enc, nullptr);
     if (!flushPackets(error))
         return false;
+    m_audio.drain(m_fmt);
     const int trailerRet = av_write_trailer(m_fmt);
     if (trailerRet < 0) {
         char tb[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -1148,8 +1297,11 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
         const QString trfPath = tmpDir.filePath(QStringLiteral("transforms.trf"));
 
         VideoWriter aw;
+        // No audio on the vidstab analysis pass: it is a throwaway file that
+        // exists only to be measured, and is deleted straight afterwards.
         if (aw.open(analysisPath, aW, aH, fpsd, QStringLiteral("libx264"),
-                    23, 4, QString(), QString(), /*spherical*/ false, &err)) {
+                    23, 4, QString(), QString(), /*spherical*/ false,
+                    QString(), 0.0, 0.0, &err)) {
             const int aFrames = renderPass(aw, aW, aH, /*withFlow*/ false, 0.0, 0.25);
             QString ferr;
             aw.finish(&ferr);
@@ -1212,7 +1364,8 @@ void Exporter::runVideo(const QString &videoPath, const QString &outPath,
     VideoWriter writer;
     if (!writer.open(outFile, width, height, fpsd, settings.codec,
                      settings.crf, settings.bitrateMbps,
-                     srcInfo.fileName(), comment, settings.spherical, &err)) {
+                     srcInfo.fileName(), comment, settings.spherical,
+                     settings.copyAudio ? videoPath : QString(), start, end, &err)) {
         fail(err);
         return;
     }

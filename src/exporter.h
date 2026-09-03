@@ -117,6 +117,8 @@ struct ExportSettings {
     bool vidstab = false;       // FFmpeg vidstab post-processing stabilization
     bool vidstabInformed = false;  // Hybrid: vidstab-detected residuals folded
                                    // into the native per-frame orientation
+    bool copyAudio = true;      // carry the clip's own audio into the export,
+                                // stream-copied and cut to the same range
     bool spherical = false;     // tag the MP4 as a 360 equirectangular video
                                 // (Spatial Media V2 sv3d box) so players show
                                 // it as an interactive sphere
