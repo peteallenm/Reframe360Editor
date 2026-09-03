@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <iostream>
 
 // Mahony-style complementary filter gains. accelKp is the proportional gain
@@ -507,6 +508,7 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
     // contamination averages out while genuine slow drift is still followed.
     // Each orientation is left-multiplied by the rotation taking the smoothed
     // world-frame gravity onto +Y at its own time.
+    QElapsedTimer relevelClock; relevelClock.start();
     if (!m_relevel) {
         qDebug() << "IMU world re-level: disabled (reproduction mode)";
     } else {
@@ -531,25 +533,57 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
             qWarning() << "IMU world re-level: only" << trustedSeconds
                        << "s of trusted gravity in the clip; keeping the seed as measured";
         } else {
-            // Gaussian-smoothed gravity direction at each orientation's time.
+            // Gaussian-smoothed gravity direction.
+            //
+            // Smoothed ON THE GRAVITY SAMPLES' OWN GRID (~10 Hz) and then
+            // interpolated to each orientation, rather than evaluated afresh
+            // for every one of them. The window is thirty seconds wide, so the
+            // smoothed direction is band-limited to about 1/30 Hz -- sampling
+            // it at the IMU's 400 Hz asks for a thousand times more detail than
+            // it contains, and doing so was the whole cost of opening a clip
+            // (1541 ms of a 1575 ms integrate on a 139 s clip). On the coarse
+            // grid it is a few milliseconds, and linear interpolation between
+            // points a tenth of a second apart is far finer than the signal.
             const double sigma = kRelevelSigmaSec;
             const double inv2s2 = 1.0 / (2.0 * sigma * sigma);
+            QVector<QVector3D> smoothed(gs.size());
+            {
+                int lo = 0;
+                for (int j = 0; j < gs.size(); ++j) {
+                    const double t = gs[j].t;
+                    while (lo < gs.size() && gs[lo].t < t - 3.0 * sigma) lo++;
+                    QVector3D acc(0, 0, 0); double aw = 0.0;
+                    for (int k = lo; k < gs.size() && gs[k].t <= t + 3.0 * sigma; k++) {
+                        const double dt = gs[k].t - t;
+                        const double w = gs[k].w * std::exp(-dt * dt * inv2s2);
+                        acc += gs[k].g * (float)w; aw += w;
+                    }
+                    // Every point has at least itself in its own window, so aw
+                    // is only ever zero for a zero-weight sample.
+                    smoothed[j] = (aw > 1e-6 && acc.length() > 1e-4f) ? acc.normalized()
+                                                                     : gs[j].g;
+                }
+            }
+
             int lo = 0;
             double maxTilt = 0.0, meanTilt = 0.0; int nt = 0;
             for (int i = 0; i < n; i++) {
                 const double t = (*workSamples)[i].timestamp;
-                while (lo < gs.size() && gs[lo].t < t - 3.0 * sigma) lo++;
-                QVector3D acc(0, 0, 0); double aw = 0.0;
-                for (int k = lo; k < gs.size() && gs[k].t <= t + 3.0 * sigma; k++) {
-                    const double dt = gs[k].t - t;
-                    const double w = gs[k].w * std::exp(-dt * dt * inv2s2);
-                    acc += gs[k].g * (float)w; aw += w;
+                // Bracketing pair on the coarse grid; the cursor only moves
+                // forward because both series are sorted by time.
+                while (lo + 1 < gs.size() && gs[lo + 1].t < t) lo++;
+                QVector3D acc;
+                if (t <= gs.first().t) {
+                    acc = smoothed.first();          // before the trusted span
+                } else if (t >= gs.last().t) {
+                    acc = smoothed.last();           // after it
+                } else {
+                    const double span = gs[lo + 1].t - gs[lo].t;
+                    const double f = (span > 1e-9) ? qBound(0.0, (t - gs[lo].t) / span, 1.0) : 0.0;
+                    acc = smoothed[lo] * (float)(1.0 - f) + smoothed[lo + 1] * (float)f;
                 }
-                if (aw < 1e-6 || acc.length() < 1e-4f) {
-                    // No trusted gravity within +-3 sigma: hold the nearest.
-                    const GSample &nearest = (lo < gs.size()) ? gs[lo] : gs.last();
-                    acc = nearest.g;
-                }
+                if (acc.length() < 1e-4f)
+                    acc = smoothed[qBound(0, lo, smoothed.size() - 1)];
                 acc.normalize();
                 const double tilt = std::acos(qBound(-1.0,
                     (double)QVector3D::dotProduct(acc, kWorldUp), 1.0)) * 180.0 / M_PI;
@@ -576,6 +610,7 @@ void GyroscopeIntegrator::integrate(const QVector<ImuSample> &samples, double sa
     }
 
 
+    qInfo("IMU timing: re-level %lld ms", relevelClock.elapsed());
     qDebug() << "Gyro integrator (single pass):" << m_orientations.size() << "keyframes";
 }
 
