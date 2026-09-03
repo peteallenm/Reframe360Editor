@@ -193,6 +193,12 @@ class App : public QObject
     // True while the viewer is waiting for the user to point at something.
     Q_PROPERTY(bool trackArmed READ trackArmed WRITE setTrackArmed NOTIFY trackArmedChanged)
     Q_PROPERTY(int trackPointCount READ trackPointCount NOTIFY trackPointsChanged)
+    // Smoothing applied to the tracked direction, in seconds. Applies to every
+    // track at once and to new ones: it is a taste setting, not a per-subject
+    // one, and a track re-resolves from its stored samples so it can be
+    // changed long after the pass was run.
+    Q_PROPERTY(double trackSmoothing READ trackSmoothing WRITE setTrackSmoothing
+               NOTIFY trackSmoothingChanged)
 
     // Opening a clip is slow enough to look like a hang -- a 2 GB file over
     // SAF on the phone especially -- so it reports where it has got to.
@@ -354,6 +360,8 @@ public:
     int trackCount() const { return m_tracks.size(); }
     bool trackArmed() const { return m_trackArmed; }
     int trackPointCount() const { return m_pendingDirs.size(); }
+    double trackSmoothing() const { return m_trackSmoothing; }
+    void setTrackSmoothing(double seconds);
     bool loading() const { return m_loading; }
     double loadProgress() const { return m_loadProgress; }
     QString loadStatus() const { return m_loadStatus; }
@@ -501,6 +509,7 @@ signals:
     void trackStatusChanged();
     void trackArmedChanged();
     void trackPointsChanged();
+    void trackSmoothingChanged();
     void loadingChanged();
     void loadProgressChanged();
     void tracksChanged();
@@ -595,6 +604,7 @@ private:
     bool m_trackRunning = false;
     bool m_trackArmed = false;
     double m_trackProgress = 0.0;
+    double m_trackSmoothing = 0.10;   // seconds; see Track::posSmoothSec
     QString m_trackStatus;
     Track m_pendingTrack;          // being filled by the running pass
     QVector<QVector3D> m_pendingDirs;    // marked patches, camera frame at t0

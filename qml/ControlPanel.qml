@@ -324,6 +324,43 @@ Item {
                                 Layout.fillWidth: true
                             }
 
+                            // Applies to tracks already made, not just new
+                            // ones: a track keeps its measurements, so this
+                            // re-resolves rather than re-tracks.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Label {
+                                    text: qsTr("Smoothing:")
+                                    Layout.preferredWidth: 78
+                                }
+                                Slider {
+                                    id: trackSmoothSlider
+                                    from: 0.0
+                                    to: 0.4
+                                    stepSize: 0.01
+                                    value: app.trackSmoothing
+                                    enabled: !app.trackRunning
+                                    Layout.fillWidth: true
+                                    onMoved: app.trackSmoothing = value
+                                }
+                                Label {
+                                    text: trackSmoothSlider.value < 0.005
+                                          ? qsTr("off")
+                                          : qsTr("%1 s").arg(trackSmoothSlider.value.toFixed(2))
+                                    Layout.preferredWidth: 44
+                                    horizontalAlignment: Text.AlignRight
+                                }
+                            }
+
+                            Label {
+                                Layout.fillWidth: true
+                                wrapMode: Text.Wrap
+                                font.pixelSize: 11
+                                color: "#888"
+                                text: qsTr("Smoothing steadies the tracked view. It is applied to tracks you have already made, so you can change it afterwards without tracking again.")
+                            }
+
                             Label {
                                 Layout.fillWidth: true
                                 wrapMode: Text.Wrap

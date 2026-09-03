@@ -73,6 +73,13 @@ struct Track {
     double yaw0 = 0.0, pitch0 = 0.0, roll0 = 0.0, fov0 = 90.0;
     double sizeRad0 = 0.0;   // apparent angular diameter when picked
 
+    // How hard the tracked DIRECTION is smoothed, as the sigma of a zero-phase
+    // Gaussian in seconds. Zero-phase matters: a causal filter would lag, and
+    // a backward scrub would then disagree with a forward export. Nothing
+    // smoothed the position at all before, so a single frame that matched
+    // slightly wrong went straight into the keyframes as a visible flick.
+    double posSmoothSec = 0.10;
+
     // How hard fov chases the subject's size. Defaults are the filter that
     // stops it pumping; see resolve().
     bool fovFollow = true;

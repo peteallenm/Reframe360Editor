@@ -2493,6 +2493,10 @@ static void testTrackTrim()
 
     Track tr;
     tr.id = "trim"; tr.t0 = 1.0; tr.fov0 = 60.0; tr.fovFollow = false;
+    // No position smoothing: this case is about what trimming does to the
+    // framing, and a smoothed path deliberately no longer sits exactly on each
+    // raw sample. Smoothing has its own test.
+    tr.posSmoothSec = 0.0;
     tr.framingProjection = 0; tr.framingAspect = 16.0 / 9.0;
     tr.sizeRad0 = proj::degToRad(4.0);
     tr.lost = true; tr.lossTime = 6.0;               // runs out at the far end
@@ -3164,6 +3168,108 @@ static void testFovHoldsWhileTheSubjectCrossesTheLens()
                .arg(spreadNew, 0, 'f', 1).arg(n).arg(spreadOld, 0, 'f', 1));
 }
 
+// One frame that matches slightly wrong must not reach the view, and removing
+// it must not cost anything on a subject that is genuinely sweeping fast.
+// Reported as "it does flick position for a frame then flick back quite
+// regularly" -- nothing smoothed the tracked DIRECTION at all, so a single bad
+// match went straight into the keyframes.
+static void testDespikeAndSmoothing()
+{
+    const TrackLenses lenses = synthLenses();
+    auto imuAt = [](double) { return QQuaternion(); };
+    // Fast, but kept inside the front lens: a 250 deg/s sweep leaves it in a
+    // third of a second, and samples that fall off the edge are not what this
+    // test is about.
+    const double rateDegPerSec = 120.0;
+    const int n = 30;
+    const int spikeAt = 15;
+    const double spikeDeg = 5.0;
+    const double tMid = (n / 2) / 30.0;
+
+    auto trueDirAt = [&](double t) {
+        return QQuaternion::fromAxisAndAngle(0, 1, 0, (float)(rateDegPerSec * (t - tMid)))
+                   .rotatedVector(QVector3D(0.0f, 0.0f, -1.0f));
+    };
+
+    auto build = [&](double smoothSec) {
+        Track tr;
+        tr.t0 = 0.0; tr.yaw0 = 0.0; tr.pitch0 = 0.0; tr.roll0 = 0.0; tr.fov0 = 90.0;
+        tr.framingNdcX = 0.0; tr.framingNdcY = 0.0;      // subject at frame centre,
+        tr.framingAspect = 16.0 / 9.0;                   // so the view IS the subject
+        tr.framingProjection = 0;
+        tr.fovFollow = false;
+        tr.sizeRad0 = proj::degToRad(4.0);
+        tr.posSmoothSec = smoothSec;
+        const auto &lp = lenses.front;
+        const proj::LensGeom geom = proj::LensGeom::make(lp.cx, lp.cy, lp.radius, lp.k1, lp.k2,
+                                                        lp.rotation, lp.hflip);
+        for (int i = 0; i < n; ++i) {
+            const double t = i / 30.0;
+            QVector3D d = trueDirAt(t);
+            if (i == spikeAt)                    // one frame, off and straight back
+                d = QQuaternion::fromAxisAndAngle(1, 0, 0, (float)spikeDeg).rotatedVector(d);
+            double th, ph, u, v;
+            proj::dirToThetaPhi(proj::Vec3{d.x(), d.y(), d.z()}, th, ph);
+            if (th > M_PI * 0.5) continue;       // stay on the front lens
+            proj::lensUv(true, th, ph, geom, u, v);
+            TrackSample smp;
+            smp.t = t; smp.u = u; smp.v = v; smp.lens = 0; smp.conf = 1.0;
+            smp.halfW = smp.halfH = proj::degToRad(2.0);
+            tr.samples.append(smp);
+        }
+        return tr;
+    };
+
+    auto measure = [&](const Track &tr, double *atSpike, double *elsewhere) {
+        const QVector<Keyframe> kfs = track::resolve(tr, lenses, imuAt, tr.endTime());
+        *atSpike = 0.0;
+        *elsewhere = 0.0;
+        for (const TrackSample &smp : tr.samples) {
+            double y, p, r, f;
+            KeyframeModel::interpolate(kfs, smp.t, y, p, r, f);
+            // Where the CENTRE of that view points, built the way the resolver
+            // builds it -- guessing a yaw/pitch convention here just produced a
+            // uniform 180 deg error.
+            const proj::ViewBasis vb = proj::ViewBasis::make(y, p, r, f, tr.framingProjection,
+                                                             tr.framingAspect);
+            const proj::Vec3 c = proj::applyEuler(proj::rayForNdc(0.0, 0.0, vb), vb);
+            const QVector3D got = QVector3D((float)c.x, (float)c.y, (float)c.z).normalized();
+            const QVector3D want = trueDirAt(smp.t).normalized();
+            const double err = std::atan2((double)QVector3D::crossProduct(got, want).length(),
+                                          (double)QVector3D::dotProduct(got, want)) * 180.0 / M_PI;
+            if (std::fabs(smp.t - spikeAt / 30.0) < 1e-6) *atSpike = err;
+            else *elsewhere = qMax(*elsewhere, err);
+        }
+    };
+
+    // How far the planted sample actually sits off the true path. Measured on
+    // the SAMPLE, not through resolve(): despiking is outlier rejection and is
+    // always on, so there is no "before" to resolve -- the fixture has to prove
+    // itself directly or the test proves nothing.
+    const Track probe = build(0.10);
+    double plantedDeg = 0.0;
+    for (const TrackSample &smp : probe.samples) {
+        if (std::fabs(smp.t - spikeAt / 30.0) > 1e-6) continue;
+        const QVector3D got = VisualRotationComputer::pixelToBearing(smp.u, smp.v,
+                                                                     lenses.front).normalized();
+        const QVector3D want = trueDirAt(smp.t).normalized();
+        plantedDeg = std::atan2((double)QVector3D::crossProduct(got, want).length(),
+                                (double)QVector3D::dotProduct(got, want)) * 180.0 / M_PI;
+    }
+
+    double smoothSpike = 0.0, smoothRest = 0.0;
+    measure(probe, &smoothSpike, &smoothRest);
+
+    report("A one-frame flick is removed, and a fast sweep is not dragged",
+           plantedDeg > 3.0               // the fixture really does contain a flick
+               && smoothSpike < 1.0       // ... and it does not reach the view
+               && smoothRest < 0.6,       // ... while the sweep passes through, ends included
+           QStringLiteral("planted %1 deg off; view is %2 deg off there, worst %3 deg "
+                          "anywhere (subject sweeping %4 deg/s)")
+               .arg(plantedDeg, 0, 'f', 2).arg(smoothSpike, 0, 'f', 2)
+               .arg(smoothRest, 0, 'f', 2).arg(rateDegPerSec, 0, 'f', 0));
+}
+
 static void testTileTrackerConstantSize()
 {
     const TrackLenses lenses = synthLenses();
@@ -3260,6 +3366,7 @@ static double g_trackAt = 1.0;
 static double g_trackSecs = 8.0;
 static double g_trackNdcX = 0.0, g_trackNdcY = 0.0;
 static double g_trackSize = 0.15;
+static double g_trackSmooth = -1.0;   // --track-smooth=SEC overrides the default
 static QString g_trackTruth;   // sidecar whose manual keyframes are the truth
 static double g_trackGate = 400.0;
 static bool g_trackNoImu = false;   // --track-noimu: is the chain doing anything?
@@ -3542,6 +3649,7 @@ static void trackRealClip(const QString &video)
     tr.framingProjection = 0;
     tr.fov0 = 90.0;
     tr.sizeRad0 = 2.0 * req.seedRadiusRad;
+    if (g_trackSmooth >= 0.0) tr.posSmoothSec = g_trackSmooth;
     tr.samples = result.samples;
     tr.lost = result.lost;
     const QVector<Keyframe> kfs = track::resolve(
@@ -3607,6 +3715,74 @@ static void trackRealClip(const QString &video)
         }
         qInfo().noquote() << QStringLiteral("  fov along the track at 0/25/50/75/100%%: %1")
             .arg(trend);
+    }
+    // Flicks: a frame that jumps off the path and comes straight back. For a
+    // smooth path, going via the middle sample costs nothing over going direct;
+    // for a one-frame spike it costs twice the excursion. That detour is the
+    // thing that reads as a twitch in the viewer.
+    {
+        auto dirOfSample = [&](const TrackSample &smp) {
+            const auto &lp = (smp.lens == 1) ? req.lenses.rear : req.lenses.front;
+            const QVector3D cam = VisualRotationComputer::pixelToBearing(smp.u, smp.v, lp);
+            QQuaternion q = kFlipRollQ();
+            if (hasImu)
+                q = camToWorld(gi.orientationAtTimeUnsmoothed(smp.t * (1.0 + drift) + syncOffset));
+            return q.rotatedVector(cam).normalized();
+        };
+        QVector<double> detour;
+        for (int i = 1; i + 1 < result.samples.size(); ++i) {
+            const QVector3D a = dirOfSample(result.samples[i - 1]);
+            const QVector3D b = dirOfSample(result.samples[i]);
+            const QVector3D c = dirOfSample(result.samples[i + 1]);
+            auto ang = [](const QVector3D &x, const QVector3D &y) {
+                return std::atan2((double)QVector3D::crossProduct(x, y).length(),
+                                  (double)QVector3D::dotProduct(x, y)) * 180.0 / M_PI;
+            };
+            detour.append(ang(a, b) + ang(b, c) - ang(a, c));
+        }
+        std::sort(detour.begin(), detour.end());
+        if (!detour.isEmpty()) {
+            int over1 = 0, over3 = 0;
+            for (double d : detour) { if (d > 1.0) ++over1; if (d > 3.0) ++over3; }
+        // The same measure on the VIEW the user actually gets: the resolved
+        // keyframes evaluated at each frame time. This is the number that
+        // matters -- the raw one above is only where it comes from.
+        QVector<double> vdetour;
+        auto viewDir = [&](double t) {
+            double y, pch, r, f;
+            KeyframeModel::interpolate(kfs, t, y, pch, r, f);
+            const double yr = proj::degToRad(y), pr = proj::degToRad(pch);
+            return QVector3D((float)(std::cos(pr) * std::sin(yr)), (float)std::sin(pr),
+                             (float)(std::cos(pr) * std::cos(yr)));
+        };
+        if (kfs.size() >= 2) {
+            for (int i = 1; i + 1 < result.samples.size(); ++i) {
+                const QVector3D a = viewDir(result.samples[i - 1].t);
+                const QVector3D b = viewDir(result.samples[i].t);
+                const QVector3D c = viewDir(result.samples[i + 1].t);
+                auto ang = [](const QVector3D &x, const QVector3D &y) {
+                    return std::atan2((double)QVector3D::crossProduct(x, y).length(),
+                                      (double)QVector3D::dotProduct(x, y)) * 180.0 / M_PI;
+                };
+                vdetour.append(ang(a, b) + ang(b, c) - ang(a, c));
+            }
+            std::sort(vdetour.begin(), vdetour.end());
+            int vover1 = 0;
+            for (double d : vdetour) if (d > 1.0) ++vover1;
+            if (!vdetour.isEmpty())
+                qInfo().noquote() << QStringLiteral("  as rendered: median %1 deg, p95 %2 deg, "
+                                                    "worst %3 deg; %4 over 1 deg (of %5)")
+                    .arg(vdetour[vdetour.size() / 2], 0, 'f', 2)
+                    .arg(vdetour[(int)(vdetour.size() * 0.95)], 0, 'f', 2)
+                    .arg(vdetour.constLast(), 0, 'f', 2).arg(vover1).arg(vdetour.size());
+        }
+            qInfo().noquote() << QStringLiteral("  one-frame flicks: median detour %1 deg, "
+                                                "p95 %2 deg, worst %3 deg; %4 over 1 deg, "
+                                                "%5 over 3 deg (of %6)")
+                .arg(detour[detour.size() / 2], 0, 'f', 2)
+                .arg(detour[(int)(detour.size() * 0.95)], 0, 'f', 2)
+                .arg(detour.constLast(), 0, 'f', 2).arg(over1).arg(over3).arg(detour.size());
+        }
     }
     qInfo().noquote() << QStringLiteral("  world motion of the subject: median %1 deg/s, "
                                         "p95 %2 deg/s")
@@ -4003,6 +4179,7 @@ int main(int argc, char *argv[])
         if (QString(argv[i]).startsWith("--track-secs=")) { g_trackSecs = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]).startsWith("--track-size=")) { g_trackSize = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]).startsWith("--track-truth=")) { g_trackTruth = QString(argv[i]).mid(14); continue; }
+        if (QString(argv[i]).startsWith("--track-smooth=")) { g_trackSmooth = QString(argv[i]).mid(15).toDouble(); continue; }
         if (QString(argv[i]).startsWith("--track-gate=")) { g_trackGate = QString(argv[i]).mid(13).toDouble(); continue; }
         if (QString(argv[i]) == "--track-noimu") { g_trackNoImu = true; continue; }
         if (QString(argv[i]) == "--track-dumpframe") { g_trackDumpFrame = true; continue; }
@@ -4179,6 +4356,7 @@ int main(int argc, char *argv[])
         testTrackResolve();
         testTrackFovFollow();
         testFovHoldsWhileTheSubjectCrossesTheLens();
+    testDespikeAndSmoothing();
     testTileTrackerConstantSize();
     testTileTrackerFastSubject();
     testTileTrackerStopsOnEmptySky();

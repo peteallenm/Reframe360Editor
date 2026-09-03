@@ -44,6 +44,75 @@ double angleBetween(const QVector3D &a, const QVector3D &b)
 // symmetric. Offline, so every stage is zero-phase: a causal filter would lag
 // the subject, and would make a backward scrub in the preview disagree with a
 // forward export over the same frames.
+// How far a single frame may sit off the path its neighbours describe before
+// it is treated as a bad match rather than as motion. Measured on real tracks
+// the detour is 0.03-0.24 deg typically, with a tail to 9.6 deg -- that tail is
+// the flicking.
+constexpr double kDespikeDeg = 1.0;
+
+double angleBetweenDeg(const QVector3D &a, const QVector3D &b)
+{
+    return std::atan2((double)QVector3D::crossProduct(a, b).length(),
+                      (double)QVector3D::dotProduct(a, b)) * 180.0 / kPi;
+}
+
+// Replace a frame that jumps off the path and straight back with the midpoint
+// of its neighbours.
+//
+// A median, not an average, because this is impulse noise: averaging smears one
+// bad frame across its neighbours instead of removing it. And a midpoint rather
+// than picking a neighbour outright, because the subject is usually moving --
+// on a straight run the midpoint IS the missing sample, so a 250 deg/s sweep
+// passes through untouched while the spike on top of it does not.
+QVector<QVector3D> despike(const QVector<QVector3D> &in)
+{
+    if (in.size() < 3) return in;
+    QVector<QVector3D> out = in;
+    for (int i = 1; i + 1 < in.size(); ++i) {
+        // Read neighbours from the INPUT, so a run of bad frames cannot drag
+        // the correction along behind it.
+        const QVector3D &a = in[i - 1], &b = in[i], &c = in[i + 1];
+        const double detour = angleBetweenDeg(a, b) + angleBetweenDeg(b, c)
+                            - angleBetweenDeg(a, c);
+        if (detour > kDespikeDeg)
+            out[i] = (a + c).normalized();
+    }
+    return out;
+}
+
+// Zero-phase Gaussian over the directions themselves. Averaging unit vectors
+// and renormalising keeps a straight sweep straight -- for symmetric weights
+// the average lands on the bisector, which is the point being smoothed -- so
+// this takes the jitter off without dragging the subject behind the motion.
+QVector<QVector3D> smoothDirs(const QVector<QVector3D> &in, const QVector<double> &times,
+                              double sigmaSec)
+{
+    const int n = in.size();
+    if (n < 3 || sigmaSec <= 1e-4) return in;
+    QVector<QVector3D> out(n);
+    for (int i = 0; i < n; ++i) {
+        // The window has to stay SYMMETRIC about i, so it is narrowed at the
+        // ends rather than truncated. A one-sided window on a moving subject
+        // averages only what is behind (or ahead) of it and drags the result
+        // that way -- worth 8 deg at the start of a 120 deg/s sweep, which is
+        // a track that begins visibly off its subject. Narrowing keeps every
+        // window balanced, so a straight sweep passes through untouched and
+        // smoothing simply eases off over the last few frames.
+        const int room = qMin(i, n - 1 - i);
+        QVector3D acc(0, 0, 0);
+        double wsum = 0.0;
+        for (int j = i - room; j <= i + room; ++j) {
+            const double dt = times[j] - times[i];
+            if (std::fabs(dt) > 3.0 * sigmaSec) continue;
+            const double w = std::exp(-0.5 * (dt * dt) / (sigmaSec * sigmaSec));
+            acc += in[j] * (float)w;
+            wsum += w;
+        }
+        out[i] = (wsum > 0.0 && acc.lengthSquared() > 1e-12) ? acc.normalized() : in[i];
+    }
+    return out;
+}
+
 QVector<double> filterFov(const QVector<double> &rawFov, const QVector<double> &times,
                           const Track &tr)
 {
@@ -162,7 +231,8 @@ bool Track::operator==(const Track &o) const
     // no-op-load early return treats a reload as "nothing changed" and quietly
     // keeps the trims from whichever clip was open before.
     if (!qFuzzyCompare(trimIn + 1.0, o.trimIn + 1.0)
-        || !qFuzzyCompare(trimOut + 1.0, o.trimOut + 1.0))
+        || !qFuzzyCompare(trimOut + 1.0, o.trimOut + 1.0)
+        || !qFuzzyCompare(posSmoothSec + 1.0, o.posSmoothSec + 1.0))
         return false;
     if (!qFuzzyCompare(framingNdcX + 1.0, o.framingNdcX + 1.0)
         || !qFuzzyCompare(framingNdcY + 1.0, o.framingNdcY + 1.0)
@@ -249,6 +319,11 @@ QVector<Keyframe> resolve(const Track &tr, const TrackLenses &lenses,
         rawFov.append(fov);
     }
     if (world.isEmpty()) return out;
+
+    // Take the spikes out before smoothing: a Gaussian applied to impulse noise
+    // spreads one bad frame over its neighbours instead of removing it.
+    world = despike(world);
+    world = smoothDirs(world, times, tr.posSmoothSec);
 
     const QVector<double> fov = tr.fovFollow ? filterFov(rawFov, times, tr)
                                              : QVector<double>(times.size(), tr.fov0);
@@ -454,6 +529,7 @@ QJsonArray toJson(const QVector<Track> &tracks)
             {"ref", QJsonObject{
                 {"yaw", t.yaw0}, {"pitch", t.pitch0}, {"roll", t.roll0},
                 {"fov", t.fov0}, {"sizeRad", t.sizeRad0}}},
+            {"posSmoothSec", t.posSmoothSec},
             {"fovFollow", QJsonObject{
                 {"on", t.fovFollow}, {"smoothSec", t.fovSmoothSec},
                 {"deadband", t.fovDeadband}, {"maxRatePerSec", t.fovMaxRatePerSec},
@@ -495,6 +571,7 @@ QVector<Track> fromJson(const QJsonArray &arr)
         t.roll0 = rf.value("roll").toDouble();
         t.fov0 = rf.value("fov").toDouble(90.0);
         t.sizeRad0 = rf.value("sizeRad").toDouble();
+        t.posSmoothSec = o.value("posSmoothSec").toDouble(0.10);
         const QJsonObject ff = o.value("fovFollow").toObject();
         t.fovFollow = ff.value("on").toBool(true);
         t.fovSmoothSec = ff.value("smoothSec").toDouble(0.75);

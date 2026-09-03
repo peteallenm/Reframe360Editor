@@ -174,6 +174,13 @@ App::App(QObject *parent)
     connect(m_keyframes, &KeyframeModel::trimChanged, this, &App::invalidateTrackCache);
     connect(m_keyframes, &KeyframeModel::tracksChanged, this, [this]() {
         m_tracks = track::fromJson(m_keyframes->tracksJson());
+        // Adopt the smoothing the clip's tracks were made with, so the slider
+        // shows what is actually in force rather than the app's default.
+        if (!m_tracks.isEmpty()
+            && !qFuzzyCompare(m_trackSmoothing + 1.0, m_tracks.first().posSmoothSec + 1.0)) {
+            m_trackSmoothing = m_tracks.first().posSmoothSec;
+            emit trackSmoothingChanged();
+        }
         invalidateTrackCache();
         emit tracksChanged();
     });
@@ -1425,6 +1432,7 @@ void App::beginTracking()
     m_pendingTrack.roll0 = m_roll;
     m_pendingTrack.fov0 = m_fov;
     m_pendingTrack.sizeRad0 = 2.0 * req.seedRadiusRad;
+    m_pendingTrack.posSmoothSec = m_trackSmoothing;
     m_pendingTrackVideo = m_videoPath;
 
     m_trackRunning = true;
@@ -1561,6 +1569,27 @@ void App::setTrackTrim(int index, double tIn, double tOut)
     emit tracksChanged();
     // The view at the playhead may be governed by the part just trimmed away.
     applyKeyframeInterpolation();
+}
+
+void App::setTrackSmoothing(double seconds)
+{
+    const double v = qBound(0.0, seconds, 0.5);
+    if (qFuzzyCompare(m_trackSmoothing + 1.0, v + 1.0))
+        return;
+    m_trackSmoothing = v;
+    // Applied to every existing track, not just to new ones. A track keeps its
+    // measurements, so this re-resolves rather than re-tracks -- which is the
+    // whole point of storing samples instead of baking keyframes.
+    bool touched = false;
+    for (Track &t : m_tracks)
+        if (!qFuzzyCompare(t.posSmoothSec + 1.0, v + 1.0)) { t.posSmoothSec = v; touched = true; }
+    emit trackSmoothingChanged();
+    if (touched) {
+        syncTracksToSidecar();
+        invalidateTrackCache();
+        emit tracksChanged();
+        applyKeyframeInterpolation();
+    }
 }
 
 void App::setTrackZoom(int index, double fovDeg)
