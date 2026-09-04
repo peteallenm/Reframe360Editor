@@ -9,6 +9,7 @@
 // FOR A PARTICULAR PURPOSE.
 
 #include <QGuiApplication>
+#include <QtEnvironmentVariables>
 #include <QSettings>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
@@ -32,6 +33,22 @@ extern "C" {
 
 int main(int argc, char *argv[])
 {
+#ifdef Q_OS_ANDROID
+    // The window is locked to landscape, which leaves too little height for a
+    // keyboard, so Android puts the IME in fullscreen "extract" mode: its own
+    // editor covering the screen. In that mode the shift key does not stick --
+    // press it and the letters stay lower case, so a capital cannot be typed
+    // at all. It is not an input-hint problem; the field was already asking for
+    // TYPE_CLASS_TEXT and being answered correctly.
+    //
+    // Qt reads this variable in QtEditText.onCreateInputConnection and, when it
+    // is set, adds IME_FLAG_NO_FULLSCREEN to the EditorInfo, which keeps the
+    // keyboard as an ordinary panel. Set before QGuiApplication so it is in the
+    // environment well before any text field is focused -- Android's
+    // System.getenv(String) reads the live environment rather than a snapshot,
+    // so this reaches the Java side.
+    qputenv("QT_ANDROID_NO_FULLSCREEN_KEYBOARD", "1");
+#endif
     // Register the types queued to the optical-flow worker thread.
     qRegisterMetaType<DecodedFrame>();
     qRegisterMetaType<FlowCalibration>();
