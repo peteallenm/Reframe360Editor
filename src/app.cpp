@@ -561,8 +561,16 @@ void App::setVideoPath(const QString &path)
             m_decoder->loadVideo(androidProxy);
         } else
 #endif
-        setLoadStage(0.25, tr("Opening video…"));
-        m_decoder->loadVideo(path);
+        {
+            // Braces matter here. Without them the `else` bound to the
+            // setLoadStage call alone and loadVideo(path) ran unconditionally,
+            // so on Android the proxy was opened and then immediately replaced
+            // by the 5.7K original -- while m_usePreview said "proxy" and the
+            // toolbar agreed. Every phone preview has been software-decoding
+            // the full-resolution video at a few frames a second.
+            setLoadStage(0.25, tr("Opening video…"));
+            m_decoder->loadVideo(path);
+        }
 
         // loadVideo() resets the decoder clock to 0 without emitting
         // currentTimeChanged, so sync our clock and apply the restored

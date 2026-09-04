@@ -35,8 +35,11 @@ Pane {
     // The trim handles were the worst of them: 7x12 px with no padding at all,
     // sitting on top of a slider that will happily take the press instead.
     readonly property real grabPad: Qt.platform.os === "android" ? 12 : 7
-    readonly property real bandTrimBottom: 18   // trim handles own everything above
-    readonly property real bandTrackBottom: 30  // ... then track bars and their grips
+    // The grips are the hardest of the three to hit -- a 3 px bracket, where a
+    // trim handle is 7 px and a dot 8 -- so they get the widest band. The trim
+    // handles can spare it: they have the whole area above the strip as well.
+    readonly property real bandTrimBottom: 14   // trim handles own everything above
+    readonly property real bandTrackBottom: 34  // ... then track bars and their grips
                                                 // ... then keyframe dots, to the bottom
     readonly property real safeLeft: Qt.platform.os === "android" ? SafeArea.margins.left : 0
     readonly property real safeRight: Qt.platform.os === "android" ? SafeArea.margins.right : 0
@@ -482,7 +485,9 @@ Pane {
                         // dot swallow the press meant for a track end sitting
                         // at the same time.
                         anchors.fill: parent
-                        anchors.topMargin: 0
+                        // Starts at the band edge, not at the dot: the track
+                        // grips above need the room more than the dots do.
+                        anchors.topMargin: timeline.bandTrackBottom - parent.y
                         anchors.bottomMargin: -timeline.grabPad
                         anchors.leftMargin: -timeline.grabPad
                         anchors.rightMargin: -timeline.grabPad
