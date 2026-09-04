@@ -800,6 +800,7 @@ void App::setImuStabilize(bool stabilize)
     // imuOrientation switches between the stabilized chain and the bare video
     // un-flip, so the viewer has to re-read it.
     emit imuOrientationChanged();
+    imuChainChanged();
 }
 
 double App::imuSmoothing() const
@@ -814,6 +815,7 @@ void App::setImuSmoothing(double smoothing)
 
     m_imuSmoothing = smoothing;
     emit imuSmoothingChanged();
+    imuChainChanged();
 }
 
 double App::imuSyncOffset() const
@@ -828,6 +830,7 @@ void App::setImuSyncOffset(double offset)
 
     m_imuSyncOffset = offset;
     emit imuSyncOffsetChanged();
+    imuChainChanged();
 }
 
 double App::imuDrift() const
@@ -850,6 +853,7 @@ void App::setImuDrift(double drift)
         m_keyframes->setImuDrift(drift);
         saveKeyframes();
     }
+    imuChainChanged();
 }
 
 double App::imuAccelKi() const
@@ -1012,6 +1016,9 @@ void App::integrateImu()
     // Mahony gains live after AutoSync instead of being shadowed by a stale
     // fused chain.
     applyVisualFusion();
+
+    // The chain the tracks resolve through has just been replaced.
+    imuChainChanged();
 }
 
 void App::applyVisualFusion()
@@ -1283,6 +1290,24 @@ const QVector<Keyframe> &App::effectiveKeyframes() const
 // they imply -- but only if the cache is dropped. Miss one of these and the
 // preview shows a track resolved against a stale chain while the next export
 // rebuilds against the fresh one.
+void App::imuChainChanged()
+{
+    // Anything that changes what imuOrientationAt() returns has to drop the
+    // resolved tracks with it. A track stores where the subject was ON THE
+    // SENSOR and turns that into a view THROUGH the chain, so a cache built
+    // against a different chain aims somewhere else entirely.
+    //
+    // This is what made a reopened clip start looking the wrong way: opening a
+    // clip applies the restored keyframes -- resolving and caching the tracks
+    // -- before integrateImu() has built the chain for the new clip, so they
+    // were resolved against the previous clip's orientations, or none at all.
+    // Nothing then invalidated them, so the wrong view stood until something
+    // unrelated happened to clear the cache. Adding a keyframe did, which is
+    // why that appeared to "fix" it.
+    invalidateTrackCache();
+    applyKeyframeInterpolation();
+}
+
 void App::invalidateTrackCache()
 {
     m_effectiveDirty = true;

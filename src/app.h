@@ -623,6 +623,9 @@ private:
 
     const QVector<Keyframe> &effectiveKeyframes() const;
     void invalidateTrackCache();
+    // Call after anything that changes imuOrientationAt(): the resolved tracks
+    // are only valid for the chain they were built against.
+    void imuChainChanged();
     void syncTracksToSidecar();
     TrackLenses trackLenses() const;
     SyncSolver *m_syncSolver = nullptr;

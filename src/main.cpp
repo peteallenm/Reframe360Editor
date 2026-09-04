@@ -9,7 +9,8 @@
 // FOR A PARTICULAR PURPOSE.
 
 #include <QGuiApplication>
-#include <QtEnvironmentVariables>
+#include <QtGlobal>   // qputenv; QtEnvironmentVariables is Qt 6.5+ and the
+                      // desktop here builds against distro Qt 6.4
 #include <QSettings>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
